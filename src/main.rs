@@ -23,7 +23,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use uuid::Uuid;
 
 use crate::agent::Agent;
+use crate::channel::photon::{self, Photon};
 use crate::channel::telegram::Telegram;
+use crate::channel::{Channel, Inbound};
 use crate::claude::{ClaudeSession, Config};
 use crate::core::Core;
 use crate::event::{AgentEvent, Decision};
@@ -47,6 +49,11 @@ enum Mode {
         /// State database. Defaults to $XDG_STATE_HOME/switchboard/state.db.
         #[arg(long)]
         state: Option<PathBuf>,
+
+        /// The Photon sidecar directory. Defaults to the copy vendored beside
+        /// this binary's source.
+        #[arg(long)]
+        photon_sidecar: Option<PathBuf>,
     },
 
     /// Drive one agent session from this terminal.
@@ -81,7 +88,11 @@ async fn main() -> Result<()> {
         .init();
 
     match Args::parse().command {
-        Mode::Serve { dir, state } => serve(dir, state).await,
+        Mode::Serve {
+            dir,
+            state,
+            photon_sidecar,
+        } => serve(dir, state, photon_sidecar).await,
         Mode::Repl {
             dir,
             permission_mode,
@@ -94,24 +105,11 @@ async fn main() -> Result<()> {
 
 // ---- serve -------------------------------------------------------------
 
-async fn serve(dir: PathBuf, state: Option<PathBuf>) -> Result<()> {
-    let token = std::env::var("SWITCHBOARD_TELEGRAM_TOKEN").context(
-        "SWITCHBOARD_TELEGRAM_TOKEN is not set. Create a bot with @BotFather — \
-         a separate one from any other bot you run, because getUpdates is exclusive \
-         and two pollers on one token steal each other's messages.",
-    )?;
-
-    let allowed: Vec<String> = std::env::var("SWITCHBOARD_TELEGRAM_ALLOWED_USERS")
-        .context(
-            "SWITCHBOARD_TELEGRAM_ALLOWED_USERS is not set. A bot token in a chat is \
-             a shell on this machine — list the Telegram user ids allowed to use it, \
-             comma separated.",
-        )?
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
+async fn serve(
+    dir: PathBuf,
+    state: Option<PathBuf>,
+    photon_sidecar: Option<PathBuf>,
+) -> Result<()> {
     let dir = dir.canonicalize().unwrap_or(dir);
     if !dir.is_dir() {
         bail!("--dir is not a directory: {}", dir.display());
@@ -120,19 +118,123 @@ async fn serve(dir: PathBuf, state: Option<PathBuf>) -> Result<()> {
     let state_path = state.unwrap_or_else(default_state_path);
     let store = Store::open(&state_path)?;
 
+    // Every channel's inbound stream funnels into one receiver, so the core
+    // selects over a single source no matter how many channels are configured.
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Inbound>(64);
+    let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
+
+    if let Some(telegram) = start_telegram().await? {
+        merge(telegram.clone().start_polling(), inbound_tx.clone());
+        channels.push(telegram);
+    }
+
+    if let Some(photon) = start_photon(photon_sidecar).await? {
+        merge(photon.clone().start_streaming(), inbound_tx.clone());
+        channels.push(photon);
+    }
+
+    if channels.is_empty() {
+        bail!(
+            "no channels configured. Set SWITCHBOARD_TELEGRAM_TOKEN (with \
+             SWITCHBOARD_TELEGRAM_ALLOWED_USERS), or SWITCHBOARD_PHOTON_PROJECT_ID \
+             (with _SECRET and SWITCHBOARD_PHOTON_ALLOWED_USERS), or both."
+        );
+    }
+
+    tracing::info!("default dir {}", dir.display());
+    tracing::info!("state {}", state_path.display());
+
+    Core::new(store, channels, dir).run(inbound_rx).await
+}
+
+/// Telegram is configured when a token is present; absent is not an error.
+async fn start_telegram() -> Result<Option<Arc<Telegram>>> {
+    let token = match std::env::var("SWITCHBOARD_TELEGRAM_TOKEN") {
+        Ok(token) => token,
+        Err(_) => return Ok(None),
+    };
+
+    let allowed = allowlist("SWITCHBOARD_TELEGRAM_ALLOWED_USERS").context(
+        "SWITCHBOARD_TELEGRAM_ALLOWED_USERS is not set. A bot token in a chat is \
+         a shell on this machine — list the Telegram user ids allowed to use it, \
+         comma separated.",
+    )?;
+
     let telegram = Arc::new(Telegram::new(&token, allowed.clone())?);
     let username = telegram
         .whoami()
         .await
         .context("could not reach Telegram — check the token")?;
 
-    tracing::info!("bot @{username}");
-    tracing::info!("default dir {}", dir.display());
-    tracing::info!("state {}", state_path.display());
-    tracing::info!("allowed users {}", allowed.join(", "));
+    tracing::info!("telegram @{username}, allowed: {}", allowed.join(", "));
+    Ok(Some(telegram))
+}
 
-    let inbound = telegram.clone().start_polling();
-    Core::new(store, telegram, dir).run(inbound).await
+/// Photon is configured when a project id is present.
+async fn start_photon(sidecar: Option<PathBuf>) -> Result<Option<Arc<Photon>>> {
+    let project_id = match std::env::var("SWITCHBOARD_PHOTON_PROJECT_ID") {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+
+    let project_secret = std::env::var("SWITCHBOARD_PHOTON_PROJECT_SECRET")
+        .context("SWITCHBOARD_PHOTON_PROJECT_SECRET is not set")?;
+
+    let allowed = allowlist("SWITCHBOARD_PHOTON_ALLOWED_USERS").context(
+        "SWITCHBOARD_PHOTON_ALLOWED_USERS is not set — list the phone numbers \
+         allowed to message this bridge, comma separated.",
+    )?;
+
+    let port: u16 = std::env::var("SWITCHBOARD_PHOTON_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8789);
+
+    let sidecar_dir = sidecar.unwrap_or_else(default_sidecar_dir);
+
+    let photon = Arc::new(
+        Photon::start(photon::Config {
+            sidecar_dir,
+            project_id,
+            project_secret,
+            port,
+            allowed_users: allowed.clone(),
+        })
+        .await?,
+    );
+
+    tracing::info!("photon ready, allowed: {}", allowed.join(", "));
+    Ok(Some(photon))
+}
+
+fn allowlist(var: &str) -> Result<Vec<String>> {
+    let raw = std::env::var(var)?;
+    let entries: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entries.is_empty() {
+        bail!("{var} is empty");
+    }
+    Ok(entries)
+}
+
+/// Pump one channel's inbound stream into the shared receiver.
+fn merge(mut source: tokio::sync::mpsc::Receiver<Inbound>, sink: tokio::sync::mpsc::Sender<Inbound>) {
+    tokio::spawn(async move {
+        while let Some(message) = source.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn default_sidecar_dir() -> PathBuf {
+    // Beside the source tree this binary was built from, so a `cargo run`
+    // during development and an installed binary both find it.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/photon-sidecar")
 }
 
 fn default_state_path() -> PathBuf {

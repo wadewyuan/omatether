@@ -1,15 +1,21 @@
 //! Seam A: the interface every messaging channel implements.
 //!
 //! Kept deliberately small. A channel receives text and taps, sends a message,
-//! and edits one it already sent — that is the whole vocabulary a streaming
-//! bridge needs, and it is the subset every platform supports.
+//! and — if the platform allows it — edits one it already sent.
+//!
+//! That "if" is load-bearing. Telegram edits messages, so a turn can stream
+//! into one message that grows. iMessage cannot edit anything, ever, so a turn
+//! there has to arrive whole. [`Channel::can_edit`] is how the core learns
+//! which world it is in without knowing which channel it is talking to.
 
+pub mod photon;
 pub mod telegram;
 
 use anyhow::Result;
+use async_trait::async_trait;
 
 /// A message id as the channel understands it, kept as a string so seam A does
-/// not inherit Telegram's i64.
+/// not inherit Telegram's i64 or Photon's opaque handle.
 pub type MessageId = String;
 
 /// Identifies one conversation. A Telegram forum topic is a distinct thread
@@ -46,16 +52,31 @@ pub enum InboundKind {
     Decision { allow: bool, token: String },
 }
 
-pub trait Channel {
-    /// Post a new message and return its id, so it can be edited later.
+#[async_trait]
+pub trait Channel: Send + Sync {
+    /// The name this channel puts in a [`ThreadKey`].
+    fn name(&self) -> &'static str;
+
+    /// Whether a sent message can be rewritten.
+    ///
+    /// `true` lets the core stream a turn into one message on a debounce.
+    /// `false` means every flush would be a new message, so the core holds the
+    /// turn back and delivers it once, complete.
+    fn can_edit(&self) -> bool;
+
+    /// Post a new message and return its id.
     async fn send(&self, thread: &ThreadKey, text: &str) -> Result<MessageId>;
 
-    /// Replace the text of a message this channel sent.
+    /// Replace the text of a message this channel sent. Only called when
+    /// [`Channel::can_edit`] is true.
     async fn edit(&self, thread: &ThreadKey, id: &MessageId, text: &str) -> Result<()>;
 
-    /// Post a message carrying allow/deny buttons.
+    /// Ask for a decision. Channels with buttons should use them; channels
+    /// without should say how to answer in words.
     async fn ask_permission(&self, thread: &ThreadKey, text: &str) -> Result<MessageId>;
 
-    /// Acknowledge a button tap. Channels without buttons can do nothing.
-    async fn ack_decision(&self, token: &str, note: &str) -> Result<()>;
+    /// Acknowledge a button tap. A no-op where there are no buttons.
+    async fn ack_decision(&self, _token: &str, _note: &str) -> Result<()> {
+        Ok(())
+    }
 }

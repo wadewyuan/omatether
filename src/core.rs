@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use crate::agent::Agent;
-use crate::channel::telegram::Telegram;
 use crate::channel::{Channel, Inbound, InboundKind, ThreadKey};
 use crate::claude::{ClaudeSession, Config};
 use crate::command::{self, Command};
@@ -50,7 +49,9 @@ struct PendingPermission {
 
 pub struct Core {
     store: Store,
-    channel: Arc<Telegram>,
+    /// Every channel this instance serves, keyed by the name it puts in a
+    /// [`ThreadKey`]. The core never names a concrete channel.
+    channels: HashMap<&'static str, Arc<dyn Channel>>,
     default_cwd: PathBuf,
     threads: HashMap<ThreadKey, Thread>,
     agent_tx: mpsc::Sender<(ThreadKey, AgentEvent)>,
@@ -58,11 +59,11 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn new(store: Store, channel: Arc<Telegram>, default_cwd: PathBuf) -> Self {
+    pub fn new(store: Store, channels: Vec<Arc<dyn Channel>>, default_cwd: PathBuf) -> Self {
         let (agent_tx, agent_rx) = mpsc::channel(256);
         Self {
             store,
-            channel,
+            channels: channels.into_iter().map(|c| (c.name(), c)).collect(),
             default_cwd,
             threads: HashMap::new(),
             agent_tx,
@@ -243,8 +244,8 @@ impl Core {
         let pending = match self.threads.get_mut(key).and_then(|t| t.pending.take()) {
             Some(pending) => pending,
             None => {
-                if let Some(token) = token {
-                    self.channel.ack_decision(token, "Nothing pending").await.ok();
+                if let (Some(token), Some(channel)) = (token, self.channel(key)) {
+                    channel.ack_decision(token, "Nothing pending").await.ok();
                 }
                 return self.say(key, "Nothing waiting for a decision.").await;
             }
@@ -256,17 +257,25 @@ impl Core {
         thread.session.decide(&pending.request_id, decision).await?;
 
         let verdict = if allowed { "Allowed" } else { "Denied" };
+
+        let channel = match self.channel(key) {
+            Some(channel) => channel.clone(),
+            None => return Ok(()),
+        };
+
         if let Some(token) = token {
-            self.channel.ack_decision(token, verdict).await.ok();
+            channel.ack_decision(token, verdict).await.ok();
         }
 
-        // Rewrite the question so the buttons are no longer live and the
-        // transcript records what was decided.
+        // Where messages can be rewritten, retire the buttons and record the
+        // outcome in place. Where they cannot, say it in a new message —
+        // otherwise a tap looks like it did nothing.
         let settled = format!("{} {}", verdict, pending.tool);
-        self.channel
-            .edit(key, &pending.message_id, &settled)
-            .await
-            .ok();
+        if channel.can_edit() {
+            channel.edit(key, &pending.message_id, &settled).await.ok();
+        } else {
+            channel.send(key, &settled).await.ok();
+        }
 
         Ok(())
     }
@@ -346,9 +355,14 @@ impl Core {
         // Show the pending work before asking, so the question has context.
         self.flush(key).await?;
 
+        let channel = match self.channel(key) {
+            Some(channel) => channel.clone(),
+            None => return Ok(()),
+        };
+
         let detail = serde_json::to_string_pretty(&input).unwrap_or_default();
         let question = format!("Run {tool}?\n\n{detail}");
-        let message_id = self.channel.ask_permission(key, &question).await?;
+        let message_id = channel.ask_permission(key, &question).await?;
 
         if let Some(thread) = self.threads.get_mut(key) {
             thread.pending = Some(PendingPermission {
@@ -362,6 +376,12 @@ impl Core {
 
     // ---- output --------------------------------------------------------
 
+    /// The channel a thread belongs to. Absent only if a thread outlives the
+    /// channel that created it, which would be a configuration change.
+    fn channel(&self, key: &ThreadKey) -> Option<&Arc<dyn Channel>> {
+        self.channels.get(key.channel)
+    }
+
     async fn flush_all(&mut self) -> Result<()> {
         let keys: Vec<ThreadKey> = self.threads.keys().cloned().collect();
         for key in keys {
@@ -370,20 +390,35 @@ impl Core {
         Ok(())
     }
 
-    /// Push a thread's pending text, editing the turn's message in place.
+    /// Push a thread's pending text.
+    ///
+    /// On a channel that can edit, this grows one message as the turn runs. On
+    /// one that cannot — iMessage — mid-turn flushes are skipped entirely and
+    /// the turn arrives as a single finished message, because the alternative
+    /// is a stream of fragments nobody wants to read on a phone.
     async fn flush(&mut self, key: &ThreadKey) -> Result<()> {
+        let channel = match self.channel(key) {
+            Some(channel) => channel.clone(),
+            None => return Ok(()),
+        };
+
         let (text, message_id) = match self.threads.get_mut(key) {
-            Some(thread) => match thread.renderer.take_pending() {
-                Some(text) => (text, thread.renderer.message_id.clone()),
-                None => return Ok(()),
-            },
+            Some(thread) => {
+                if !channel.can_edit() && !thread.renderer.is_finished() {
+                    return Ok(());
+                }
+                match thread.renderer.take_pending() {
+                    Some(text) => (text, thread.renderer.message_id.clone()),
+                    None => return Ok(()),
+                }
+            }
             None => return Ok(()),
         };
 
         match message_id {
-            Some(id) => self.channel.edit(key, &id, &text).await?,
+            Some(id) => channel.edit(key, &id, &text).await?,
             None => {
-                let id = self.channel.send(key, &text).await?;
+                let id = channel.send(key, &text).await?;
                 if let Some(thread) = self.threads.get_mut(key) {
                     thread.renderer.message_id = Some(id);
                 }
@@ -394,7 +429,9 @@ impl Core {
 
     /// Post a standalone note, outside any turn's message.
     async fn say(&self, key: &ThreadKey, text: &str) -> Result<()> {
-        self.channel.send(key, text).await?;
+        if let Some(channel) = self.channel(key) {
+            channel.send(key, text).await?;
+        }
         Ok(())
     }
 

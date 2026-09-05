@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -215,7 +216,17 @@ impl Telegram {
     }
 }
 
+#[async_trait]
 impl Channel for Telegram {
+    fn name(&self) -> &'static str {
+        CHANNEL
+    }
+
+    /// Telegram edits messages, so a turn can stream into one that grows.
+    fn can_edit(&self) -> bool {
+        true
+    }
+
     async fn send(&self, thread: &ThreadKey, text: &str) -> Result<MessageId> {
         let mut body = self.target(thread);
         body["text"] = json!(clip(text));

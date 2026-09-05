@@ -9,10 +9,11 @@ Not to be confused with a general chat assistant: the thing on the far end of
 the pipe is *your* agent, with your `CLAUDE.md`, your MCP servers, and your
 working tree.
 
-## Status: milestone 2
+## Status: milestone 3
 
-Telegram end to end. Text the bot, the agent runs in your working tree, and the
-reply streams back into a single message edited in place.
+Two channels — Telegram and iMessage (via Photon) — over one core. Text either
+one, the agent runs in your working tree, and the reply comes back to the
+thread it came from.
 
 ```bash
 switchboard serve --dir ~/src     # the bridge
@@ -21,18 +22,33 @@ switchboard repl  --dir .         # one session, driven from this terminal
 
 ### Setup
 
-1. Create a bot with [@BotFather](https://t.me/BotFather). **Mint a new one** —
-   `getUpdates` is exclusive, so sharing a token with another bot means the two
-   steal each other's messages.
-2. Find your numeric Telegram user id (message [@userinfobot](https://t.me/userinfobot)).
-3. Write `~/.config/switchboard/env`, `chmod 600`:
+At least one channel must be configured; both is fine.
 
-   ```
-   SWITCHBOARD_TELEGRAM_TOKEN=123456:AA...
-   SWITCHBOARD_TELEGRAM_ALLOWED_USERS=<your telegram user id>
-   ```
+**Telegram.** Create a bot with [@BotFather](https://t.me/BotFather). **Mint a
+new one** — `getUpdates` is exclusive, so sharing a token with another bot means
+the two steal each other's messages. Get your numeric user id from
+[@userinfobot](https://t.me/userinfobot).
 
-4. Install the service:
+**iMessage (Photon).** Photon is a managed service — no Mac relay. You need a
+project id and secret from [app.photon.codes](https://app.photon.codes/), and
+the sidecar's dependencies:
+
+```bash
+cd vendor/photon-sidecar && npm install
+```
+
+Then write `~/.config/switchboard/env`, `chmod 600`:
+
+```
+SWITCHBOARD_TELEGRAM_TOKEN=123456:AA...
+SWITCHBOARD_TELEGRAM_ALLOWED_USERS=<your telegram user id>
+
+SWITCHBOARD_PHOTON_PROJECT_ID=...
+SWITCHBOARD_PHOTON_PROJECT_SECRET=...
+SWITCHBOARD_PHOTON_ALLOWED_USERS=+15551234567
+```
+
+Install the service:
 
    ```bash
    cargo build --release
@@ -40,8 +56,9 @@ switchboard repl  --dir .         # one session, driven from this terminal
    systemctl --user enable --now switchboard
    ```
 
-The service needs no inbound port: long polling means it reaches out to
-Telegram, so it stays behind the tailnet with nothing exposed.
+The service needs no inbound port. Telegram long-polling reaches out rather
+than being called, and the Photon sidecar binds to loopback only — so the whole
+thing stays behind the tailnet with nothing exposed.
 
 ### Commands
 
@@ -60,8 +77,21 @@ many of which are prompt expansions, so `/review` just works.
 ### How a turn looks
 
 Tool calls appear inline as the agent makes them, and permission requests for
-consequential tools arrive as a message with **Allow** / **Deny** buttons that
-block the turn until tapped.
+consequential tools block the turn until answered — with **Allow** / **Deny**
+buttons on Telegram, and as a message asking for `/allow` or `/deny` on
+iMessage, which has no buttons.
+
+Streaming differs by channel, and the core learns which world it is in from
+`Channel::can_edit` rather than from the channel's name:
+
+| | Telegram | iMessage |
+|---|---|---|
+| Editing | yes | **never** |
+| A turn arrives as | one message, growing on a 1.5s debounce | one complete message at the end |
+
+iMessage cannot rewrite a sent message under any circumstances, so streaming
+there would mean a stream of fragments. Holding the turn back and delivering it
+whole is the only readable option.
 
 Not every tool asks. Gating all of them is unusable from a phone — the agent
 reads a dozen files before doing anything consequential, and a prompt per read

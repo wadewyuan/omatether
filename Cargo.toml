@@ -6,12 +6,16 @@ description = "Bridge between messaging channels and the Omarchy default coding 
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false }
 # rustls rather than the default openssl: one less system dependency for a
 # service that has to start reliably at boot.
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
+    # bytes_stream(), for the sidecar's open-ended NDJSON response.
+    "stream",
 ] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,6 +29,7 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
+tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
