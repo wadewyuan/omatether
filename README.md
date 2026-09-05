@@ -9,34 +9,76 @@ Not to be confused with a general chat assistant: the thing on the far end of
 the pipe is *your* agent, with your `CLAUDE.md`, your MCP servers, and your
 working tree.
 
-## Status: milestone 1
+## Status: milestone 2
 
-A Claude Code driver with **no channels attached**. It exists to prove the two
-things that decide whether the rest of the design holds:
+Telegram end to end. Text the bot, the agent runs in your working tree, and the
+reply streams back into a single message edited in place.
 
-1. the normalized event model (seam B) survives contact with a real agent, and
-2. the permission round-trip actually works over the stdio control channel.
-
-Both are verified against the real CLI: streaming text, tool calls, thinking
-blocks, rate-limit events and turn ends all normalize correctly, and a tool call
-blocks on `/allow` or `/deny` with the denial reason reaching the model.
-
-```
-cargo run -- --dir ~/src/someproject
-cargo run -- --raw --dir . "list the files here"
+```bash
+switchboard serve --dir ~/src     # the bridge
+switchboard repl  --dir .         # one session, driven from this terminal
 ```
 
-Type a prompt and press enter. Commands:
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather). **Mint a new one** —
+   `getUpdates` is exclusive, so sharing a token with another bot means the two
+   steal each other's messages.
+2. Find your numeric Telegram user id (message [@userinfobot](https://t.me/userinfobot)).
+3. Write `~/.config/switchboard/env`, `chmod 600`:
+
+   ```
+   SWITCHBOARD_TELEGRAM_TOKEN=123456:AA...
+   SWITCHBOARD_TELEGRAM_ALLOWED_USERS=<your telegram user id>
+   ```
+
+4. Install the service:
+
+   ```bash
+   cargo build --release
+   cp contrib/switchboard.service ~/.config/systemd/user/
+   systemctl --user enable --now switchboard
+   ```
+
+The service needs no inbound port: long polling means it reaches out to
+Telegram, so it stays behind the tailnet with nothing exposed.
+
+### Commands
 
 | Command | Effect |
 |---|---|
-| `/allow` | Approve the pending permission request |
-| `/deny <why>` | Refuse it, and tell the agent why |
-| `/cancel` | Interrupt the running turn |
-| `/quit` | Shut the agent down and exit |
+| `/new` | Fresh session in this thread |
+| `/stop` | Interrupt the running turn |
+| `/cd <path>` | Set the working directory (starts a fresh session) |
+| `/status` | Agent, directory, session, whether a turn is running |
+| `/allow`, `/deny <why>` | Answer a permission request without tapping |
+| `/help` | The above |
 
-`--raw` echoes every wire frame to stderr, which is how you learn the protocol
-when a Claude Code release changes it.
+Anything else goes to the agent as typed — including its own slash commands,
+many of which are prompt expansions, so `/review` just works.
+
+### How a turn looks
+
+Tool calls appear inline as the agent makes them, and permission requests for
+consequential tools arrive as a message with **Allow** / **Deny** buttons that
+block the turn until tapped.
+
+Not every tool asks. Gating all of them is unusable from a phone — the agent
+reads a dozen files before doing anything consequential, and a prompt per read
+trains you to tap Allow without looking. Only `Bash`, `Write`, `Edit` and
+`NotebookEdit` ask; the rest are approved by switchboard itself
+(`GATED_TOOLS` in `src/core.rs`).
+
+### The repl
+
+The milestone-1 instrument, still the fastest way to see the wire protocol:
+
+```bash
+switchboard repl --raw --dir . "list the files here"
+```
+
+`--raw` echoes every frame to stderr, which is how you find out what changed
+when a Claude Code release moves the format.
 
 ## How the Claude adapter works
 
@@ -48,8 +90,7 @@ claude --print --verbose \
        --output-format stream-json \
        --input-format stream-json \
        --include-partial-messages \
-       --session-id <uuid> \
-       --permission-mode manual
+       --session-id <uuid>
 ```
 
 `--input-format stream-json` is what makes this a session rather than a series
@@ -136,7 +177,13 @@ bridge needs. See `src/agent.rs`.
 | `src/agent.rs` | The trait every agent adapter implements. |
 | `src/claude/wire.rs` | Claude's `stream-json` frames → normalized events. |
 | `src/claude/mod.rs` | Process lifetime, stdin writes, stdout reader task. |
-| `src/main.rs` | The milestone-1 REPL. |
+| `src/channel/mod.rs` | Seam A: send, edit, ask, acknowledge. |
+| `src/channel/telegram.rs` | Bot API client and the long-poll loop. |
+| `src/core.rs` | The router: threads ↔ sessions, dispatch, flushing. |
+| `src/render.rs` | Debounced edit-in-place message building. |
+| `src/command.rs` | Slash commands, and what passes through. |
+| `src/store.rs` | SQLite thread state. |
+| `src/main.rs` | `serve` and `repl`. |
 
 ### The loosely-typed boundary
 
@@ -158,24 +205,17 @@ Deliberately the simplest option in each case; revisit when something hurts.
 | Concurrent turns | Rejected while one runs | More predictable from a phone than queuing, and much simpler than interleaving. |
 | Restart with a turn in flight | Kill the child, resume the conversation | `kill_on_drop` plus `--session-id`. The turn is lost; the conversation is not. |
 | Long output | Truncate | Revisit with a paste file served over the tailnet — chat is a bad place for a 500-line diff. |
+| Which tools ask | Only `Bash`/`Write`/`Edit`/`NotebookEdit` | A prompt per file read trains you to tap Allow without reading it. |
+| `/cd` on a live thread | Starts a fresh session | `cwd` is fixed when the agent process starts; the old session stays resumable by id. |
+| Telegram reply threads | Not separate threads | Only forum topics are; otherwise one conversation scatters into a session per reply chain. |
 
 ## Roadmap
 
-1. **Claude driver, no channels** ← you are here
-2. Telegram end to end — long-polling, debounced edit-in-place streaming, allowlist, SQLite thread state
+1. ~~Claude driver, no channels~~
+2. ~~Telegram end to end~~ ← you are here
 3. Photon channel — vendored Node sidecar, `GET /inbound` NDJSON, `POST /send`
 4. Second agent — Codex via `exec --json`, plus a tmux fallback tier for the rest
 5. Polish — attachments, tapbacks, forum-topic-per-project, `/attach` handoff over ssh
-
-### Notes for milestone 2
-
-- Telegram allows roughly one message per second to a chat, and
-  `editMessageText` draws on the same budget. Streaming means **debounced
-  edits every 1–2s**, flushed on tool-call boundaries — put the debounce in the
-  core, since Photon needs the same discipline.
-- Mint a **separate bot token**. `getUpdates` is exclusive; sharing a token with
-  another bot means the two steal updates from each other. Outbound
-  `sendMessage` on a shared token is fine.
 
 ### Notes for milestone 3
 

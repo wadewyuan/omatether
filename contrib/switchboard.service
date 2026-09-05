@@ -1,0 +1,24 @@
+[Unit]
+Description=switchboard - coding agent over chat
+# Long polling needs working DNS at start, not just a configured interface.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Explicit rather than inherited: a user service does not source .bashrc, so
+# without this neither `claude` nor the other mise-installed agents are found.
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin
+
+# SWITCHBOARD_TELEGRAM_TOKEN and SWITCHBOARD_TELEGRAM_ALLOWED_USERS.
+# chmod 600 - the token is a shell on this machine.
+EnvironmentFile=%h/.config/switchboard/env
+
+ExecStart=%h/src/switchboard/target/release/switchboard serve --dir %h/src
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

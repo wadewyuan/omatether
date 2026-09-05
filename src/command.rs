@@ -1,0 +1,101 @@
+//! Slash commands.
+//!
+//! Two kinds live in the same namespace: switchboard's own commands, which the
+//! agent could never provide, and everything else, which is passed through
+//! untouched. Many Claude Code slash commands are prompt expansions, so
+//! `/review` reaching the agent verbatim does the right thing.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// Abandon the session and start a fresh one in the same thread.
+    New,
+    /// Interrupt the running turn.
+    Stop,
+    /// Set the working directory for this thread.
+    Cd(String),
+    /// Report agent, directory, session and whether a turn is running.
+    Status,
+    /// Answer a pending permission request without tapping a button.
+    Allow,
+    Deny(String),
+    Help,
+    /// Anything else — hand it to the agent as typed.
+    Prompt(String),
+}
+
+pub fn parse(text: &str) -> Command {
+    let text = text.trim();
+    let (head, rest) = match text.split_once(char::is_whitespace) {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (text, ""),
+    };
+
+    match head {
+        "/new" => Command::New,
+        "/stop" | "/cancel" => Command::Stop,
+        "/status" => Command::Status,
+        "/allow" | "/yes" => Command::Allow,
+        "/deny" | "/no" => Command::Deny(if rest.is_empty() {
+            "denied from chat".to_string()
+        } else {
+            rest.to_string()
+        }),
+        "/help" | "/start" => Command::Help,
+        "/cd" => Command::Cd(rest.to_string()),
+        _ => Command::Prompt(text.to_string()),
+    }
+}
+
+pub const HELP: &str = "\
+switchboard — your coding agent, over chat
+
+/new           start a fresh session in this thread
+/stop          interrupt the running turn
+/cd <path>     set the working directory (starts a fresh session)
+/status        agent, directory, session, whether a turn is running
+/allow         approve a pending tool call
+/deny <why>    refuse it, and tell the agent why
+
+Anything else is sent to the agent as typed, including its own \
+slash commands.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switchboard_commands_are_recognized() {
+        assert_eq!(parse("/new"), Command::New);
+        assert_eq!(parse("  /stop  "), Command::Stop);
+        assert_eq!(parse("/status"), Command::Status);
+        assert_eq!(parse("/cd ~/src/foo"), Command::Cd("~/src/foo".into()));
+    }
+
+    #[test]
+    fn deny_carries_a_reason_and_has_a_default() {
+        assert_eq!(parse("/deny too risky"), Command::Deny("too risky".into()));
+        assert_eq!(parse("/deny"), Command::Deny("denied from chat".into()));
+    }
+
+    #[test]
+    fn unknown_slash_commands_go_to_the_agent() {
+        assert_eq!(parse("/review"), Command::Prompt("/review".into()));
+        assert_eq!(
+            parse("/compact keep the plan"),
+            Command::Prompt("/compact keep the plan".into())
+        );
+    }
+
+    #[test]
+    fn plain_text_is_a_prompt() {
+        assert_eq!(
+            parse("fix the flaky test"),
+            Command::Prompt("fix the flaky test".into())
+        );
+    }
+
+    #[test]
+    fn cd_without_an_argument_is_still_cd() {
+        assert_eq!(parse("/cd"), Command::Cd(String::new()));
+    }
+}

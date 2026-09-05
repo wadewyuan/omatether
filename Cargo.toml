@@ -7,6 +7,13 @@ description = "Bridge between messaging channels and the Omarchy default coding 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# rustls rather than the default openssl: one less system dependency for a
+# service that has to start reliably at boot.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [
