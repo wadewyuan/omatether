@@ -130,11 +130,11 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
         Backend::Claude => {
             let (session, events) = crate::claude::ClaudeSession::spawn(crate::claude::Config {
                 cwd: config.cwd,
-                // Claude takes a session id we choose, so a restart resumes.
+                // `None` here means a fresh conversation; `Some` means resume
+                // one from an earlier turn or an earlier process.
                 session_id: config
                     .session_id
-                    .and_then(|id| uuid::Uuid::parse_str(&id).ok())
-                    .unwrap_or_else(uuid::Uuid::new_v4),
+                    .and_then(|id| uuid::Uuid::parse_str(&id).ok()),
                 permission_mode: "default".to_string(),
                 raw: false,
             })

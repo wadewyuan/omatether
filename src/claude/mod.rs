@@ -66,8 +66,15 @@ pub struct Config {
     /// Working directory for the session. This is the "which repo" answer,
     /// and it is explicit state — never inferred.
     pub cwd: PathBuf,
-    /// Reused across restarts to resume the same conversation.
-    pub session_id: Uuid,
+    /// `Some` to pick up a conversation from an earlier turn or an earlier
+    /// process (e.g. after a service restart); `None` to start a fresh one.
+    ///
+    /// These are not interchangeable flags on the CLI: `--session-id` names a
+    /// *new* conversation and errors with "already in use" if that id already
+    /// has a transcript, while resuming an existing one needs `--resume`.
+    /// Conflating them is what broke every returning thread the first time
+    /// this adapter tried to resume one.
+    pub session_id: Option<Uuid>,
     /// `manual` makes the agent ask before every tool, which is what exercises
     /// the permission round-trip. `auto` approves most things itself.
     pub permission_mode: String,
@@ -79,7 +86,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             cwd: PathBuf::from("."),
-            session_id: Uuid::new_v4(),
+            session_id: None,
             permission_mode: "manual".to_string(),
             raw: false,
         }
@@ -102,14 +109,25 @@ impl ClaudeSession {
     /// The receiver is the only way events leave this session; dropping it
     /// stops the reader task at its next send.
     pub async fn spawn(config: Config) -> Result<(Self, mpsc::Receiver<AgentEvent>)> {
+        // `--session-id` claims a new id; `--resume` picks up an existing one.
+        // Passing a previously-used id to `--session-id` is rejected with
+        // "already in use", so which flag to use depends on whether this is a
+        // conversation's first turn or a later one.
+        let session_id = config.session_id.unwrap_or_else(Uuid::new_v4);
+
         let mut command = Command::new("claude");
         command
             .arg("--print")
             .arg("--verbose")
             .args(["--output-format", "stream-json"])
             .args(["--input-format", "stream-json"])
-            .arg("--include-partial-messages")
-            .args(["--session-id", &config.session_id.to_string()])
+            .arg("--include-partial-messages");
+        if config.session_id.is_some() {
+            command.args(["--resume", &session_id.to_string()]);
+        } else {
+            command.args(["--session-id", &session_id.to_string()]);
+        }
+        command
             .args(["--permission-mode", &config.permission_mode])
             .current_dir(&config.cwd)
             .stdin(Stdio::piped())
@@ -148,7 +166,7 @@ impl ClaudeSession {
         let mut session = Self {
             child,
             stdin,
-            session_id: config.session_id.to_string(),
+            session_id: session_id.to_string(),
             busy,
             pending,
             next_request: 0,
@@ -306,17 +324,15 @@ async fn read_events(
     raw: bool,
 ) {
     let mut lines = BufReader::new(stdout).lines();
+    let mut ended = false;
+    let mut exit_reason = "agent exited".to_string();
 
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(e) => {
-                let _ = tx
-                    .send(AgentEvent::Error {
-                        message: format!("reading agent stdout: {e}"),
-                    })
-                    .await;
+                exit_reason = format!("reading agent stdout: {e}");
                 break;
             }
         };
@@ -344,6 +360,7 @@ async fn read_events(
         for event in wire::normalize(&frame) {
             if matches!(event, AgentEvent::TurnEnd { .. }) {
                 busy.store(false, Ordering::SeqCst);
+                ended = true;
             }
             if let AgentEvent::PermissionRequest { request_id, .. } = &event {
                 if let Some(kind) = wire::permission_kind(&frame) {
@@ -360,16 +377,24 @@ async fn read_events(
     }
 
     busy.store(false, Ordering::SeqCst);
-    let _ = tx
-        .send(AgentEvent::Error {
-            message: "agent exited".to_string(),
-        })
-        .await;
+
+    // The process is long-lived across turns, so its stdout closing mid-turn
+    // is a crash, not a normal end — say so as a failed turn rather than a
+    // bare `Error`, which a non-editable channel (nothing to append text to
+    // once the turn is already "finished") would otherwise never flush.
+    if !ended {
+        let _ = tx
+            .send(AgentEvent::TurnEnd {
+                ok: false,
+                detail: Some(exit_reason),
+            })
+            .await;
+    }
 }
 
 async fn log_stderr(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(target: "switchboard::claude", "{line}");
+        tracing::info!(target: "switchboard::claude", "{line}");
     }
 }
