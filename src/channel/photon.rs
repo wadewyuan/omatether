@@ -363,7 +363,7 @@ fn tokio_util_lines(response: reqwest::Response) -> impl tokio::io::AsyncRead {
     tokio::io::BufReader::new(tokio_util::io::StreamReader::new(
         response
             .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+            .map_err(std::io::Error::other),
     ))
 }
 

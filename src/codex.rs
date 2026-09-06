@@ -311,10 +311,7 @@ fn item_events(item: &Value) -> Vec<AgentEvent> {
 
         "mcp_tool_call" => vec![AgentEvent::ToolCall {
             id,
-            name: format!(
-                "{}",
-                text_at("server").unwrap_or_else(|| "mcp".to_string())
-            ),
+            name: text_at("server").unwrap_or_else(|| "mcp".to_string()),
             input: item.get("arguments").cloned().unwrap_or(Value::Null),
         }],
 
