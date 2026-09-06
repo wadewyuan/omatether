@@ -12,8 +12,30 @@ pub mod photon;
 pub mod photon_setup;
 pub mod telegram;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
+
+/// A channel asking to be tried again in a moment.
+///
+/// Reported rather than handled: the adapter knows how long the platform said
+/// to wait, but only the caller knows whether this message is still worth
+/// sending and whose turn is being delayed by the waiting. Waiting inside the
+/// adapter meant waiting inside the core, which stalled every other thread on
+/// every other channel.
+#[derive(Debug, Clone)]
+pub struct RateLimited {
+    pub retry_after: Duration,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rate limited, retry in {}s", self.retry_after.as_secs())
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 /// A message id as the channel understands it, kept as a string so seam A does
 /// not inherit Telegram's i64 or Photon's opaque handle.
@@ -48,9 +70,19 @@ pub struct Inbound {
 #[derive(Debug, Clone)]
 pub enum InboundKind {
     Text(String),
-    /// A tap on one of the permission buttons. `token` is whatever the channel
-    /// needs to acknowledge the tap so the client stops showing a spinner.
-    Decision { allow: bool, token: String },
+    /// A tap on one of the permission buttons.
+    Decision {
+        allow: bool,
+        /// Whatever the channel needs to acknowledge the tap so the client
+        /// stops showing a spinner.
+        ack: String,
+        /// Which question this answers, as handed to [`Channel::ask_permission`].
+        ///
+        /// Buttons stay tappable forever in the chat history, so without this
+        /// a tap under an old question would be applied to whatever is pending
+        /// now — a decision about a tool the person never saw.
+        question: String,
+    },
 }
 
 #[async_trait]
@@ -74,7 +106,17 @@ pub trait Channel: Send + Sync {
 
     /// Ask for a decision. Channels with buttons should use them; channels
     /// without should say how to answer in words.
-    async fn ask_permission(&self, thread: &ThreadKey, text: &str) -> Result<MessageId>;
+    ///
+    /// `question` identifies this question. A channel whose buttons outlive the
+    /// question — all of them — must carry it back in
+    /// [`InboundKind::Decision`], so an answer to a question that has already
+    /// moved on can be told apart from an answer to this one.
+    async fn ask_permission(
+        &self,
+        thread: &ThreadKey,
+        text: &str,
+        question: &str,
+    ) -> Result<MessageId>;
 
     /// Acknowledge a button tap. A no-op where there are no buttons.
     async fn ack_decision(&self, _token: &str, _note: &str) -> Result<()> {

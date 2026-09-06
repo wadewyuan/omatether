@@ -61,6 +61,25 @@ const INHERITED_SESSION_VARS: &[&str] = &[
 /// Our handle for the PreToolUse hook registered during the handshake.
 const PRE_TOOL_USE_CALLBACK: &str = "switchboard-pretooluse";
 
+/// Request id for the handshake.
+///
+/// Fixed rather than taken from the counter because the reader task has to be
+/// watching for the answer before the question is written.
+const INIT_REQUEST_ID: &str = "switchboard-init";
+
+/// How long to wait for the agent to confirm the gate is installed.
+///
+/// Measured against the installed CLI: the answer arrives in about 900ms,
+/// almost all of it node starting up. This is fifteen times that, so a loaded
+/// machine is not mistaken for a missing gate.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The reader task's half of the handshake: it watches for the answer to
+/// [`INIT_REQUEST_ID`] and reports it back to `spawn`.
+struct Handshake {
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Working directory for the session. This is the "which repo" answer,
@@ -154,12 +173,17 @@ impl ClaudeSession {
         let busy = Arc::new(AtomicBool::new(false));
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        // Started before the handshake is written, so the answer cannot arrive
+        // before there is anything listening for it.
+        let (handshake_tx, handshake_rx) = tokio::sync::oneshot::channel();
+
         tokio::spawn(read_events(
             stdout,
             tx.clone(),
             busy.clone(),
             pending.clone(),
             config.raw,
+            Some(Handshake { reply: handshake_tx }),
         ));
         tokio::spawn(log_stderr(stderr));
 
@@ -174,6 +198,40 @@ impl ClaudeSession {
 
         session.initialize().await?;
 
+        // Block on the answer. A session whose gate failed to install is a
+        // session that runs every tool without asking, and it looks exactly
+        // like a well-behaved one until the moment it matters: no
+        // PermissionRequest ever arrives, which reads as "the agent didn't need
+        // permission for that" rather than "there is no gate". The whole pitch
+        // is a shell you approve from your phone, so this is a startup
+        // assertion, not a hope.
+        //
+        // Dropping `session` on the way out kills the child: it was spawned
+        // with kill_on_drop.
+        let confirmed = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_rx)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "`claude` did not answer switchboard's handshake within {}s, so \
+                     there is no confirmed tool gate — refusing to start a session \
+                     that would run tools unasked",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "`claude` exited during switchboard's handshake — see the \
+                     switchboard::claude log for what it said"
+                )
+            })?;
+
+        if let Err(reason) = confirmed {
+            bail!(
+                "`claude` refused switchboard's PreToolUse hook, so no tool call \
+                 would ever be routed here for a decision: {reason}"
+            );
+        }
+
         Ok((session, rx))
     }
 
@@ -186,10 +244,9 @@ impl ClaudeSession {
     /// hook"). Each tool call then arrives as a `hook_callback` control
     /// request, which we answer as a permission decision.
     async fn initialize(&mut self) -> Result<()> {
-        let id = self.request_id();
         let frame = json!({
             "type": "control_request",
-            "request_id": id,
+            "request_id": INIT_REQUEST_ID,
             "request": {
                 "subtype": "initialize",
                 // Shape per the CLI's own validation error: hook events map to
@@ -322,6 +379,7 @@ async fn read_events(
     busy: Arc<AtomicBool>,
     pending: PendingMap,
     raw: bool,
+    mut handshake: Option<Handshake>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     let mut ended = false;
@@ -355,6 +413,17 @@ async fn read_events(
 
         if raw {
             eprintln!("<<< {}", serde_json::to_string(&frame).unwrap_or(line));
+        }
+
+        // The handshake's answer is the first frame the CLI sends, before even
+        // system/init. Hand it to whoever is waiting on it, once.
+        if let Some(waiting) = handshake.take() {
+            match handshake_outcome(&frame, INIT_REQUEST_ID) {
+                Some(outcome) => {
+                    let _ = waiting.reply.send(outcome);
+                }
+                None => handshake = Some(waiting),
+            }
         }
 
         for event in wire::normalize(&frame) {
@@ -392,9 +461,116 @@ async fn read_events(
     }
 }
 
+/// Whether this frame answers the handshake, and what it said.
+///
+/// `None` means "not the answer — keep waiting".
+fn handshake_outcome(frame: &Value, request_id: &str) -> Option<Result<(), String>> {
+    if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+        return None;
+    }
+
+    let response = frame.get("response")?;
+    let answered = response.get("request_id").and_then(Value::as_str);
+
+    // An error-shaped response that names no request is still ours: the
+    // handshake is the only thing outstanding this early, and failing closed on
+    // an unattributed error beats waiting out the timeout to reach the same
+    // conclusion with a vaguer message.
+    let is_error = response.get("subtype").and_then(Value::as_str) == Some("error");
+    if answered != Some(request_id) && !(answered.is_none() && is_error) {
+        return None;
+    }
+
+    match response.get("subtype").and_then(Value::as_str) {
+        Some("success") => Some(Ok(())),
+        Some("error") => Some(Err(response
+            .get("error")
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unspecified".into()))),
+        other => Some(Err(format!(
+            "unexpected answer to the handshake: subtype {}",
+            other.unwrap_or("(none)")
+        ))),
+    }
+}
+
 async fn log_stderr(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::info!(target: "switchboard::claude", "{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim from the installed CLI, answering the handshake this adapter
+    /// sends. It is the first frame out, ahead of system/init, and arrives in
+    /// about 900ms. The real `response` object carries the full command and
+    /// agent inventory; it is elided here because nothing reads it.
+    fn success() -> Value {
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "switchboard-init",
+                "response": { "commands": [], "roots": [] }
+            }
+        })
+    }
+
+    #[test]
+    fn a_successful_handshake_confirms_the_gate() {
+        assert_eq!(handshake_outcome(&success(), INIT_REQUEST_ID), Some(Ok(())));
+    }
+
+    #[test]
+    fn a_refused_hook_registration_is_reported_not_ignored() {
+        // The shape the CLI returned when the hook schema was wrong — the error
+        // that taught us the schema in the first place. Before this, it was
+        // parsed into an event nothing acted on, and the session carried on
+        // with no gate at all.
+        let frame = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": "switchboard-init",
+                "error": "hooks.PreToolUse must be an array of matchers"
+            }
+        });
+        match handshake_outcome(&frame, INIT_REQUEST_ID) {
+            Some(Err(reason)) => assert!(reason.contains("PreToolUse")),
+            other => panic!("expected the reason to survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unattributed_error_still_fails_closed() {
+        // No request_id to match on. The handshake is the only thing
+        // outstanding this early, so this is ours and the answer is "no gate".
+        let frame = json!({
+            "type": "control_response",
+            "response": { "subtype": "error", "error": "unsupported" }
+        });
+        assert!(matches!(
+            handshake_outcome(&frame, INIT_REQUEST_ID),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn other_traffic_is_not_mistaken_for_the_answer() {
+        // Frames that arrive around the handshake, none of which answer it.
+        let init = json!({ "type": "system", "subtype": "init", "session_id": "abc" });
+        assert_eq!(handshake_outcome(&init, INIT_REQUEST_ID), None);
+
+        // The reply to a later interrupt, which must not be read as the
+        // handshake's — the wait would otherwise end on the wrong frame.
+        let interrupt = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "switchboard-1" }
+        });
+        assert_eq!(handshake_outcome(&interrupt, INIT_REQUEST_ID), None);
     }
 }

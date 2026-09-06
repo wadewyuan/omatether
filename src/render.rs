@@ -8,7 +8,6 @@
 //! The debounce lives here rather than in the channel adapter because every
 //! channel needs the same discipline for its own reasons.
 
-use crate::channel::MessageId;
 use crate::event::AgentEvent;
 
 /// One piece of the reply, kept in the order it happened so tool calls appear
@@ -22,9 +21,10 @@ enum Segment {
 #[derive(Debug, Default)]
 pub struct TurnRenderer {
     segments: Vec<Segment>,
-    /// The chat message being edited in place for this turn.
-    pub message_id: Option<MessageId>,
     /// What was last actually sent, so an unchanged turn costs no API call.
+    ///
+    /// Which *message* that went into is the outbox's business, not this
+    /// type's: the core never waits for a send, so it never learns an id.
     sent: String,
     thinking: bool,
     finished: bool,
@@ -121,13 +121,18 @@ impl TurnRenderer {
     }
 
     /// The text to send now, or `None` when nothing changed since last time.
-    pub fn take_pending(&mut self) -> Option<String> {
+    ///
+    /// Peeks rather than consumes, because handing the text to the outbox can
+    /// fail: the two phases mean a message that was not accepted for delivery
+    /// is still pending on the next flush instead of quietly vanishing.
+    pub fn pending(&self) -> Option<String> {
         let next = self.compose();
-        if next == self.sent {
-            return None;
-        }
-        self.sent = next.clone();
-        Some(next)
+        (next != self.sent).then_some(next)
+    }
+
+    /// Record that [`Self::pending`]'s text is on its way.
+    pub fn mark_sent(&mut self, text: String) {
+        self.sent = text;
     }
 
     pub fn is_finished(&self) -> bool {
@@ -150,7 +155,10 @@ fn push_line(out: &mut String, line: &str) {
 
 /// A one-line gist of a tool's arguments — the command for Bash, the path for
 /// a file tool, nothing for anything we do not recognize.
-fn summarize(input: &serde_json::Value) -> String {
+///
+/// Also used as the headline of a permission question, where the full input is
+/// too long to show: see `Core::permission_question`.
+pub fn summarize(input: &serde_json::Value) -> String {
     for key in ["command", "file_path", "path", "pattern", "url"] {
         if let Some(value) = input.get(key).and_then(|v| v.as_str()) {
             let one_line = value.replace('\n', " ");
@@ -223,11 +231,29 @@ mod tests {
     fn unchanged_content_produces_no_second_flush() {
         let mut r = TurnRenderer::new();
         r.apply(&delta("hi"));
-        assert_eq!(r.take_pending().as_deref(), Some("hi"));
-        assert_eq!(r.take_pending(), None, "no edit when nothing changed");
+        let text = r.pending().expect("first flush");
+        assert_eq!(text, "hi");
+        r.mark_sent(text);
+        assert_eq!(r.pending(), None, "no edit when nothing changed");
 
         r.apply(&delta(" there"));
-        assert_eq!(r.take_pending().as_deref(), Some("hi there"));
+        assert_eq!(r.pending().as_deref(), Some("hi there"));
+    }
+
+    #[test]
+    fn text_not_accepted_for_delivery_is_still_pending() {
+        // The outbox can refuse a job when a thread's channel is backed up.
+        // Peeking rather than consuming is what keeps that from silently
+        // eating the turn: nothing is marked sent until it has been handed over.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("important"));
+
+        assert_eq!(r.pending().as_deref(), Some("important"));
+        // ... delivery refused, so no mark_sent ...
+        assert_eq!(r.pending().as_deref(), Some("important"), "still owed");
+
+        r.mark_sent("important".to_string());
+        assert_eq!(r.pending(), None);
     }
 
     #[test]
@@ -266,9 +292,9 @@ mod tests {
     fn reset_clears_the_turn() {
         let mut r = TurnRenderer::new();
         r.apply(&delta("old"));
-        r.message_id = Some("5".into());
+        r.mark_sent("old".to_string());
         r.reset();
         assert_eq!(r.compose(), "working…");
-        assert!(r.message_id.is_none());
+        assert_eq!(r.pending().as_deref(), Some("working…"), "a fresh turn");
     }
 }

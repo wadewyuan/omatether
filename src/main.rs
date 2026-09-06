@@ -11,6 +11,7 @@ mod codex;
 mod command;
 mod core;
 mod event;
+mod outbox;
 mod render;
 mod store;
 mod tmux;

@@ -113,9 +113,18 @@ impl Agent for CodexSession {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = command
-            .spawn()
-            .context("spawning `codex` — is it on PATH?")?;
+        // Leave the busy flag honest if the spawn fails. Without this one
+        // missing `codex` binary wedges the thread on "a turn is already
+        // running" until the service restarts, because nothing else ever
+        // clears the flag — only the reader task does, and there is no reader
+        // task when there is no process.
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.busy.store(false, Ordering::SeqCst);
+                return Err(e).context("spawning `codex` — is it on PATH?");
+            }
+        };
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -302,10 +311,7 @@ fn item_events(item: &Value) -> Vec<AgentEvent> {
 
         "mcp_tool_call" => vec![AgentEvent::ToolCall {
             id,
-            name: format!(
-                "{}",
-                text_at("server").unwrap_or_else(|| "mcp".to_string())
-            ),
+            name: text_at("server").unwrap_or_else(|| "mcp".to_string()),
             input: item.get("arguments").cloned().unwrap_or(Value::Null),
         }],
 

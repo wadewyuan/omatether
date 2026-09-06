@@ -299,7 +299,16 @@ impl Channel for Photon {
         Ok(())
     }
 
-    async fn ask_permission(&self, thread: &ThreadKey, text: &str) -> Result<MessageId> {
+    /// No buttons here, so nothing can carry the question token back: an
+    /// answer arrives as `/allow` or `/deny` text, which is always about
+    /// whatever is currently pending. There is no stale tap to guard against
+    /// because there is nothing left behind to tap.
+    async fn ask_permission(
+        &self,
+        thread: &ThreadKey,
+        text: &str,
+        _question: &str,
+    ) -> Result<MessageId> {
         let question = format!("{text}\n\nReply /allow or /deny <why>");
         self.send(thread, &question).await
     }
@@ -354,7 +363,7 @@ fn tokio_util_lines(response: reqwest::Response) -> impl tokio::io::AsyncRead {
     tokio::io::BufReader::new(tokio_util::io::StreamReader::new(
         response
             .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+            .map_err(std::io::Error::other),
     ))
 }
 
