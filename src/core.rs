@@ -5,6 +5,7 @@
 //! only in [`Inbound`] and [`AgentEvent`].
 
 use std::collections::HashMap;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,14 @@ const GATED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
 /// messages anyway — which loses the tail silently. A file plus the command to
 /// read it loses nothing, and the tailnet already makes it reachable.
 const SPILL_THRESHOLD: usize = 2500;
+
+/// How much of a tool's input a permission question will show inline.
+///
+/// Deliberately well under the smallest channel's limit (Photon clips at 3000,
+/// Telegram at 3900) so that the question, the input and the pointer to the
+/// rest all survive whole. A gate that clips is a gate that gets approved
+/// blind.
+const PERMISSION_DETAIL_BUDGET: usize = 1500;
 
 struct Thread {
     session: Box<dyn Agent>,
@@ -472,8 +481,7 @@ impl Core {
             None => return Ok(()),
         };
 
-        let detail = serde_json::to_string_pretty(&input).unwrap_or_default();
-        let question = format!("Run {tool}?\n\n{detail}");
+        let question = self.permission_question(key, &tool, &input);
         let message_id = channel.ask_permission(key, &question).await?;
 
         if let Some(thread) = self.threads.get_mut(key) {
@@ -484,6 +492,52 @@ impl Core {
             });
         }
         Ok(())
+    }
+
+    /// The text of a permission question.
+    ///
+    /// This is the one message in the system that must never be silently cut
+    /// off. Both channels clip, and an `Edit` input is the whole old file plus
+    /// the whole new one — comfortably past every limit — so the naive
+    /// "pretty-print the input" produced exactly the wrong thing: a prompt
+    /// showing the first few thousand characters of the *old* file, with the
+    /// change being approved somewhere below the cut. Approving what you cannot
+    /// read is the failure the gate exists to prevent.
+    ///
+    /// So: show the whole input when the whole input fits, and otherwise say
+    /// what the tool is doing in one line and put the complete text in a file.
+    /// Never a silent truncation.
+    fn permission_question(&self, key: &ThreadKey, tool: &str, input: &serde_json::Value) -> String {
+        let detail = serde_json::to_string_pretty(input).unwrap_or_default();
+
+        if detail.chars().count() <= PERMISSION_DETAIL_BUDGET {
+            return format!("Run {tool}?\n\n{detail}");
+        }
+
+        let headline = crate::render::summarize(input);
+        let mut question = format!("Run {tool}?");
+        if !headline.is_empty() {
+            question.push_str(&format!("\n\n{headline}"));
+        }
+
+        match self.spill(key, &detail) {
+            Some(path) => question.push_str(&format!(
+                "\n\nThe full input is {} characters — too long to show here \
+                 without cutting it off, and this is not a message to read half \
+                 of. All of it is in:\n\n  ssh {} -t 'cat {}'",
+                detail.chars().count(),
+                hostname(),
+                path.display()
+            )),
+            // Saying so is the point: the alternative is a prompt that looks
+            // complete and is not.
+            None => question.push_str(&format!(
+                "\n\nThe full input is {} characters and could not be written to \
+                 a file to show you. Deny unless you know what this is.",
+                detail.chars().count()
+            )),
+        }
+        question
     }
 
     // ---- output --------------------------------------------------------
@@ -555,21 +609,10 @@ impl Core {
             return text;
         }
 
-        let name = format!(
-            "{}-{}.txt",
-            key.to_string().replace([':', '/'], "-"),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        );
-        let path = self.spill_dir.join(name);
-
-        if std::fs::create_dir_all(&self.spill_dir).is_err() || std::fs::write(&path, &text).is_err()
-        {
-            tracing::warn!("could not spill long output to {}", path.display());
-            return text;
-        }
+        let path = match self.spill(key, &text) {
+            Some(path) => path,
+            None => return text,
+        };
 
         let head: String = text.chars().take(SPILL_THRESHOLD).collect();
         format!(
@@ -578,6 +621,52 @@ impl Core {
             hostname(),
             path.display()
         )
+    }
+
+    /// Write text to a file in the spill directory and report where it went.
+    ///
+    /// Mode 0600, because what lands here is whatever the agent was about to
+    /// say or about to do: file contents, diffs, and whatever secrets those
+    /// happen to carry. The process umask would otherwise decide, and the usual
+    /// answer is world-readable.
+    ///
+    /// The name carries nanoseconds as well as seconds: two spills in the same
+    /// second are no longer hypothetical now that a permission question can
+    /// spill alongside a flush of the same turn, and the loser of that race
+    /// would have its pointer left naming someone else's content.
+    fn spill(&self, key: &ThreadKey, text: &str) -> Option<PathBuf> {
+        use std::io::Write as _;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let name = format!(
+            "{}-{}-{:09}.txt",
+            key.to_string().replace([':', '/'], "-"),
+            now.as_secs(),
+            now.subsec_nanos()
+        );
+        let path = self.spill_dir.join(name);
+
+        if let Err(e) = std::fs::create_dir_all(&self.spill_dir) {
+            tracing::warn!("could not create {}: {e}", self.spill_dir.display());
+            return None;
+        }
+
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut file| file.write_all(text.as_bytes()));
+
+        match written {
+            Ok(()) => Some(path),
+            Err(e) => {
+                tracing::warn!("could not spill to {}: {e}", path.display());
+                None
+            }
+        }
     }
 
     /// Post a standalone note, outside any turn's message.
@@ -687,6 +776,111 @@ mod tests {
             std::fs::read_to_string(written[0].path()).unwrap().len(),
             long.len()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `Core` with a scratch spill directory, for the tests that write one.
+    fn core_with_spill_dir(dir: &PathBuf) -> Core {
+        Core::new(
+            Store::in_memory().unwrap(),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            "claude".into(),
+            dir.clone(),
+        )
+    }
+
+    fn test_key() -> ThreadKey {
+        ThreadKey {
+            channel: "telegram",
+            chat_id: "5".into(),
+            topic_id: None,
+        }
+    }
+
+    #[test]
+    fn a_short_tool_input_is_shown_whole() {
+        let dir = std::env::temp_dir().join(format!("sb-q1-{}", std::process::id()));
+        let core = core_with_spill_dir(&dir);
+
+        let question = core.permission_question(
+            &test_key(),
+            "Bash",
+            &serde_json::json!({ "command": "rm -rf ./build" }),
+        );
+
+        assert!(question.starts_with("Run Bash?"));
+        assert!(question.contains("rm -rf ./build"), "the command itself");
+        assert!(!question.contains("ssh "), "no pointer needed for a short one");
+        assert!(!dir.exists(), "nothing spilled for an input that fits");
+    }
+
+    #[test]
+    fn a_huge_tool_input_is_summarized_and_spilled_never_clipped() {
+        let dir = std::env::temp_dir().join(format!("sb-q2-{}", std::process::id()));
+        let core = core_with_spill_dir(&dir);
+
+        // The case that motivated this: an Edit carrying a whole file, which
+        // every channel would clip — leaving the change being approved below
+        // the cut.
+        let input = serde_json::json!({
+            "file_path": "/home/wy/src/switchboard/src/core.rs",
+            "old_string": "x".repeat(9000),
+            "new_string": "y".repeat(9000),
+        });
+        let question = core.permission_question(&test_key(), "Edit", &input);
+
+        // Short enough that no channel will clip it.
+        assert!(
+            question.chars().count() < 3000,
+            "must fit the smallest channel, got {}",
+            question.chars().count()
+        );
+        // And it still says what is being touched, and where to read the rest.
+        assert!(question.contains("core.rs"), "the file being edited");
+        assert!(question.contains("ssh "), "how to read all of it");
+
+        // The whole input really is on disk, not just the part that fit.
+        let written: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(written.len(), 1);
+        let spilled = std::fs::read_to_string(written[0].path()).unwrap();
+        assert!(spilled.contains(&"x".repeat(9000)));
+        assert!(spilled.contains(&"y".repeat(9000)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spilled_files_are_not_readable_by_anyone_else() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("sb-q3-{}", std::process::id()));
+        let core = core_with_spill_dir(&dir);
+
+        // Agent output and tool inputs carry file contents and whatever secrets
+        // those contain; the process umask should not be what decides who can
+        // read them.
+        let path = core.spill(&test_key(), "sk-secret-token").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "group and other must have no access");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn two_spills_in_the_same_second_do_not_overwrite_each_other() {
+        let dir = std::env::temp_dir().join(format!("sb-q4-{}", std::process::id()));
+        let core = core_with_spill_dir(&dir);
+        let key = test_key();
+
+        // A permission question and a flush of the same turn can land together.
+        let first = core.spill(&key, "the first").unwrap();
+        let second = core.spill(&key, "the second").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "the first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "the second");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

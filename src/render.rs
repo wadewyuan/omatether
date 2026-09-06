@@ -150,7 +150,10 @@ fn push_line(out: &mut String, line: &str) {
 
 /// A one-line gist of a tool's arguments — the command for Bash, the path for
 /// a file tool, nothing for anything we do not recognize.
-fn summarize(input: &serde_json::Value) -> String {
+///
+/// Also used as the headline of a permission question, where the full input is
+/// too long to show: see `Core::permission_question`.
+pub fn summarize(input: &serde_json::Value) -> String {
     for key in ["command", "file_path", "path", "pattern", "url"] {
         if let Some(value) = input.get(key).and_then(|v| v.as_str()) {
             let one_line = value.replace('\n', " ");
