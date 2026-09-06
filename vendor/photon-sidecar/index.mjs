@@ -197,6 +197,16 @@ const server = http.createServer(async (req, res) => {
       return reply(res, 200, { ok: true, messageId: result?.id ?? null });
     }
 
+    if (req.method === "POST" && req.url === "/typing") {
+      const { spaceId } = await readJson(req);
+      if (!spaceId) return reply(res, 400, { ok: false, error: "spaceId required" });
+      const space = await resolveSpace(spaceId);
+      // Best effort: not every provider surfaces a typing indicator, and a
+      // missing one must not fail the turn.
+      await space.typing?.("start");
+      return reply(res, 200, { ok: true });
+    }
+
     if (req.method === "GET" && req.url === "/health") {
       return reply(res, 200, { ok: true, subscribers: subscribers.size });
     }

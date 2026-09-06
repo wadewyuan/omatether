@@ -7,11 +7,13 @@
 mod agent;
 mod channel;
 mod claude;
+mod codex;
 mod command;
 mod core;
 mod event;
 mod render;
 mod store;
+mod tmux;
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -20,13 +22,11 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use uuid::Uuid;
 
 use crate::agent::Agent;
 use crate::channel::photon::{self, Photon};
 use crate::channel::telegram::Telegram;
 use crate::channel::{Channel, Inbound};
-use crate::claude::{ClaudeSession, Config};
 use crate::core::Core;
 use crate::event::{AgentEvent, Decision};
 use crate::store::Store;
@@ -40,7 +40,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Mode {
-    /// Run the bridge: Telegram in, agent out.
+    /// Run the bridge: chat channels in, agent out.
     Serve {
         /// Working directory for threads that have not set one.
         #[arg(long, default_value = ".")]
@@ -54,6 +54,11 @@ enum Mode {
         /// this binary's source.
         #[arg(long)]
         photon_sidecar: Option<PathBuf>,
+
+        /// Agent a thread uses until told otherwise. Defaults to whatever
+        /// `omarchy default agent` says, then to claude.
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// Drive one agent session from this terminal.
@@ -61,16 +66,13 @@ enum Mode {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
 
-        #[arg(long, default_value = "default")]
-        permission_mode: String,
+        /// Which agent to drive. Defaults to `omarchy default agent`.
+        #[arg(long)]
+        agent: Option<String>,
 
         /// Resume an existing session instead of starting a new one.
         #[arg(long)]
-        session_id: Option<Uuid>,
-
-        /// Echo every raw frame from the agent to stderr.
-        #[arg(long)]
-        raw: bool,
+        session_id: Option<String>,
 
         /// Send this prompt immediately on start.
         prompt: Option<String>,
@@ -92,14 +94,14 @@ async fn main() -> Result<()> {
             dir,
             state,
             photon_sidecar,
-        } => serve(dir, state, photon_sidecar).await,
+            agent,
+        } => serve(dir, state, photon_sidecar, agent).await,
         Mode::Repl {
             dir,
-            permission_mode,
+            agent,
             session_id,
-            raw,
             prompt,
-        } => repl(dir, permission_mode, session_id, raw, prompt).await,
+        } => repl(dir, agent, session_id, prompt).await,
     }
 }
 
@@ -109,6 +111,7 @@ async fn serve(
     dir: PathBuf,
     state: Option<PathBuf>,
     photon_sidecar: Option<PathBuf>,
+    agent: Option<String>,
 ) -> Result<()> {
     let dir = dir.canonicalize().unwrap_or(dir);
     if !dir.is_dir() {
@@ -141,10 +144,36 @@ async fn serve(
         );
     }
 
+    let default_agent = agent.unwrap_or_else(omarchy_default_agent);
+    if agent::backend_for(&default_agent).is_none() {
+        bail!("unknown default agent '{default_agent}'");
+    }
+
     tracing::info!("default dir {}", dir.display());
+    tracing::info!("default agent {default_agent}");
     tracing::info!("state {}", state_path.display());
 
-    Core::new(store, channels, dir).run(inbound_rx).await
+    let spill_dir = state_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("out");
+
+    Core::new(store, channels, dir, default_agent, spill_dir)
+        .run(inbound_rx)
+        .await
+}
+
+/// Follow the desktop's choice, so the bridge and the keybinding agree about
+/// what "the agent" means.
+fn omarchy_default_agent() -> String {
+    std::process::Command::new("omarchy-default-agent")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| agent::backend_for(name).is_some())
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 /// Telegram is configured when a token is present; absent is not an error.
@@ -254,24 +283,33 @@ struct Pending {
 
 async fn repl(
     dir: PathBuf,
-    permission_mode: String,
-    session_id: Option<Uuid>,
-    raw: bool,
+    agent: Option<String>,
+    session_id: Option<String>,
     prompt: Option<String>,
 ) -> Result<()> {
-    let config = Config {
-        cwd: dir.clone(),
-        session_id: session_id.unwrap_or_else(Uuid::new_v4),
-        permission_mode,
-        raw,
-    };
+    let name = agent.unwrap_or_else(omarchy_default_agent);
+    let dir = dir.canonicalize().unwrap_or(dir);
 
-    println!("session  {}", config.session_id);
+    let (mut session, mut events) = agent::spawn(agent::SpawnConfig {
+        agent: name.clone(),
+        cwd: dir.clone(),
+        session_id,
+        label: "repl".to_string(),
+    })
+    .await?;
+
+    println!("agent    {name}");
     println!("dir      {}", dir.display());
+    println!(
+        "gating   {}",
+        if session.gates_tools() {
+            "tools are routed here for a decision"
+        } else {
+            "this agent approves its own tools"
+        }
+    );
     println!("commands /allow  /deny <why>  /cancel  /status  /quit");
     println!();
-
-    let (mut session, mut events) = ClaudeSession::spawn(config).await?;
 
     if let Some(prompt) = prompt.as_deref() {
         session.prompt(prompt).await?;
@@ -282,23 +320,48 @@ async fn repl(
     let mut pending: Option<Pending> = None;
     let mut streamed = false;
 
+    // A prompt given on the command line with stdin closed should still run to
+    // completion — `switchboard repl <prompt> < /dev/null` is a one-shot, not a
+    // request to abandon the turn the moment there is nothing left to read.
+    let mut input_open = true;
+    let mut turn_running = prompt.is_some();
+
     loop {
         tokio::select! {
             event = events.recv() => {
                 match event {
-                    Some(event) => if render(&event, &mut streamed, &mut pending) { break },
-                    None => break,
-                }
-            }
-
-            line = stdin.next_line() => {
-                match line? {
-                    Some(line) => {
-                        if handle_input(line.trim(), &mut session, &mut pending).await? {
+                    Some(event) => {
+                        if matches!(event, AgentEvent::TurnEnd { .. }) {
+                            turn_running = false;
+                        }
+                        if render(&event, &mut streamed, &mut pending) {
+                            break;
+                        }
+                        if !input_open && !turn_running {
                             break;
                         }
                     }
                     None => break,
+                }
+            }
+
+            line = stdin.next_line(), if input_open => {
+                match line? {
+                    Some(line) => {
+                        let text = line.trim();
+                        if handle_input(text, &mut session, &mut pending).await? {
+                            break;
+                        }
+                        if !text.is_empty() && !text.starts_with('/') {
+                            turn_running = true;
+                        }
+                    }
+                    None => {
+                        input_open = false;
+                        if !turn_running {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -396,7 +459,7 @@ fn render(event: &AgentEvent, streamed: &mut bool, pending: &mut Option<Pending>
 /// Handle one line of operator input. Returns true to quit.
 async fn handle_input(
     line: &str,
-    session: &mut ClaudeSession,
+    session: &mut Box<dyn Agent>,
     pending: &mut Option<Pending>,
 ) -> Result<bool> {
     if line.is_empty() {
@@ -442,8 +505,11 @@ async fn handle_input(
 
         command::Command::Help => println!("{}", command::HELP),
 
-        // /new and /cd are thread concepts; the repl drives a single session.
-        command::Command::New | command::Command::Cd(_) => {
+        // Thread concepts; the repl drives one session in one place.
+        command::Command::New
+        | command::Command::Cd(_)
+        | command::Command::Agent(_)
+        | command::Command::Attach => {
             println!("[not available in repl — use serve]")
         }
 

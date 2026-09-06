@@ -273,6 +273,13 @@ impl Channel for Telegram {
             .unwrap_or_default())
     }
 
+    async fn typing(&self, thread: &ThreadKey) -> Result<()> {
+        let mut body = self.target(thread);
+        body["action"] = json!("typing");
+        self.call("sendChatAction", body).await?;
+        Ok(())
+    }
+
     async fn ack_decision(&self, token: &str, note: &str) -> Result<()> {
         self.call(
             "answerCallbackQuery",

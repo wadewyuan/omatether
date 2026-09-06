@@ -12,9 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::agent::Agent;
+use crate::agent::{self, Agent};
 use crate::channel::{Channel, Inbound, InboundKind, ThreadKey};
-use crate::claude::{ClaudeSession, Config};
 use crate::command::{self, Command};
 use crate::event::{AgentEvent, Decision};
 use crate::render::TurnRenderer;
@@ -33,8 +32,16 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 /// keeps the prompts meaningful.
 const GATED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
 
+/// Above this many characters, a reply is spilled to a file and the chat gets a
+/// pointer instead.
+///
+/// Chat is a bad place for a 500-line diff, and both channels clip long
+/// messages anyway — which loses the tail silently. A file plus the command to
+/// read it loses nothing, and the tailnet already makes it reachable.
+const SPILL_THRESHOLD: usize = 2500;
+
 struct Thread {
-    session: ClaudeSession,
+    session: Box<dyn Agent>,
     renderer: TurnRenderer,
     /// The permission question waiting on a human, if any. At most one: the
     /// turn is blocked on it anyway.
@@ -49,6 +56,10 @@ struct PendingPermission {
 
 pub struct Core {
     store: Store,
+    /// Where replies too long for chat are written.
+    spill_dir: PathBuf,
+    /// What a thread talks to before anyone says otherwise.
+    default_agent: String,
     /// Every channel this instance serves, keyed by the name it puts in a
     /// [`ThreadKey`]. The core never names a concrete channel.
     channels: HashMap<&'static str, Arc<dyn Channel>>,
@@ -59,10 +70,18 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn new(store: Store, channels: Vec<Arc<dyn Channel>>, default_cwd: PathBuf) -> Self {
+    pub fn new(
+        store: Store,
+        channels: Vec<Arc<dyn Channel>>,
+        default_cwd: PathBuf,
+        default_agent: String,
+        spill_dir: PathBuf,
+    ) -> Self {
         let (agent_tx, agent_rx) = mpsc::channel(256);
         Self {
             store,
+            spill_dir,
+            default_agent,
             channels: channels.into_iter().map(|c| (c.name(), c)).collect(),
             default_cwd,
             threads: HashMap::new(),
@@ -101,6 +120,15 @@ impl Core {
         Ok(())
     }
 
+    /// This thread's stored state, created against the defaults on first sight.
+    fn state(&self, key: &ThreadKey) -> Result<crate::store::ThreadState> {
+        self.store.get_or_create(
+            &key.to_string(),
+            &self.default_cwd.to_string_lossy(),
+            &self.default_agent,
+        )
+    }
+
     // ---- inbound -------------------------------------------------------
 
     async fn on_inbound(&mut self, message: Inbound) -> Result<()> {
@@ -121,6 +149,8 @@ impl Core {
                 Command::Stop => self.on_stop(&message.thread).await,
                 Command::Status => self.on_status(&message.thread).await,
                 Command::Cd(path) => self.on_cd(&message.thread, &path).await,
+                Command::Agent(name) => self.on_agent(&message.thread, &name).await,
+                Command::Attach => self.on_attach(&message.thread).await,
                 Command::Allow => self.decide(&message.thread, Decision::allow(), None).await,
                 Command::Deny(why) => {
                     self.decide(&message.thread, Decision::deny(why), None).await
@@ -142,6 +172,14 @@ impl Core {
         }
 
         thread.renderer.reset();
+
+        // Where the reply cannot arrive progressively, this is the only sign
+        // anything is happening.
+        if let Some(channel) = self.channel(key) {
+            if !channel.can_edit() {
+                channel.typing(key).await.ok();
+            }
+        }
         Ok(())
     }
 
@@ -150,13 +188,14 @@ impl Core {
             thread.session.shutdown().await.ok();
         }
 
-        let mut state = self
-            .store
-            .get_or_create(&key.to_string(), &self.default_cwd.to_string_lossy())?;
-        state.session_id = uuid::Uuid::new_v4();
+        let mut state = self.state(key)?;
+        // Forget the agent's handle rather than inventing one: the next turn
+        // starts a conversation and the agent tells us what to call it.
+        state.session_id = None;
         self.store.put(&state)?;
 
-        self.say(key, &format!("New session in {}.", state.cwd)).await
+        self.say(key, &format!("New {} session in {}.", state.agent, state.cwd))
+            .await
     }
 
     async fn on_stop(&mut self, key: &ThreadKey) -> Result<()> {
@@ -172,22 +211,22 @@ impl Core {
     }
 
     async fn on_status(&mut self, key: &ThreadKey) -> Result<()> {
-        let state = self
-            .store
-            .get_or_create(&key.to_string(), &self.default_cwd.to_string_lossy())?;
+        let state = self.state(key)?;
 
-        let (running, awaiting) = match self.threads.get(key) {
+        let (running, awaiting, live_agent) = match self.threads.get(key) {
             Some(thread) => (
                 thread.session.is_busy(),
                 thread.pending.as_ref().map(|p| p.tool.clone()),
+                Some(thread.session.name()),
             ),
-            None => (false, None),
+            None => (false, None, None),
         };
 
         let mut note = format!(
-            "agent    claude\ndir      {}\nsession  {}\nstate    {}",
+            "agent    {}\ndir      {}\nsession  {}\nstate    {}",
+            live_agent.unwrap_or(&state.agent),
             state.cwd,
-            state.session_id,
+            state.session_id.as_deref().unwrap_or("(new)"),
             if running { "turn running" } else { "idle" }
         );
         if let Some(tool) = awaiting {
@@ -214,14 +253,69 @@ impl Core {
             thread.session.shutdown().await.ok();
         }
 
-        let mut state = self
-            .store
-            .get_or_create(&key.to_string(), &self.default_cwd.to_string_lossy())?;
+        let mut state = self.state(key)?;
         state.cwd = expanded.to_string_lossy().to_string();
-        state.session_id = uuid::Uuid::new_v4();
+        state.session_id = None;
         self.store.put(&state)?;
 
         let note = format!("Working in {}. New session.", state.cwd);
+        self.say(key, &note).await
+    }
+
+    /// Switch agents. Each has its own conversation, so this starts a fresh
+    /// one rather than pretending a transcript can move between them.
+    async fn on_agent(&mut self, key: &ThreadKey, name: &str) -> Result<()> {
+        if name.is_empty() {
+            let state = self.state(key)?;
+            let known: Vec<&str> = agent::AGENTS.iter().map(|(n, _)| *n).collect();
+            let note = format!("Using {}. Available: {}", state.agent, known.join(", "));
+            return self.say(key, &note).await;
+        }
+
+        if agent::backend_for(name).is_none() {
+            let known: Vec<&str> = agent::AGENTS.iter().map(|(n, _)| *n).collect();
+            let note = format!("Unknown agent '{name}'. Try: {}", known.join(", "));
+            return self.say(key, &note).await;
+        }
+
+        if let Some(mut thread) = self.threads.remove(key) {
+            thread.session.shutdown().await.ok();
+        }
+
+        let mut state = self.state(key)?;
+        state.agent = name.to_string();
+        state.session_id = None;
+        self.store.put(&state)?;
+
+        // Say what changes about the experience, not just the name. Waiting for
+        // an approval prompt that will never arrive is a bad way to find out.
+        let mut note = format!("Now using {name} in {}.", state.cwd);
+        match agent::backend_for(name) {
+            Some(agent::Backend::Claude) => {}
+            Some(agent::Backend::Codex) => note
+                .push_str("\n\nCodex approves its own tools inside a sandbox — no Allow/Deny here."),
+            Some(agent::Backend::Tmux) => note.push_str(
+                "\n\nThis agent has no structured output: it runs detached and does not \
+                 stream back. Use /attach to take over.",
+            ),
+            None => {}
+        }
+        self.say(key, &note).await
+    }
+
+    async fn on_attach(&mut self, key: &ThreadKey) -> Result<()> {
+        let state = self.state(key)?;
+        let session = crate::tmux::session_name(&key.to_string());
+        let host = hostname();
+
+        let note = format!(
+            "Take over at a terminal:\n\n  ssh {host} -t tmux attach -t {session}\n\n\
+             That session exists only for detached agents ({}). For {} the \
+             conversation lives in the agent's own store — resume it with its session id: {}",
+            "pi, omp, opencode, crush, grok, gemini, copilot",
+            state.agent,
+            state.session_id.as_deref().unwrap_or("(none yet)")
+        );
         self.say(key, &note).await
     }
 
@@ -305,6 +399,17 @@ impl Core {
                 if worst > 0.9 {
                     let note = format!("Heads up: {:.0}% of a usage window used.", worst * 100.0);
                     return self.say(key, &note).await;
+                }
+                return Ok(());
+            }
+
+            // The agent names its own conversation — Codex assigns a thread id
+            // on the first turn — so record whatever it reports.
+            AgentEvent::Ready { session_id, .. } if !session_id.is_empty() => {
+                let mut state = self.state(key)?;
+                if state.session_id.as_deref() != Some(session_id.as_str()) {
+                    state.session_id = Some(session_id.clone());
+                    self.store.put(&state)?;
                 }
                 return Ok(());
             }
@@ -404,7 +509,12 @@ impl Core {
 
         let (text, message_id) = match self.threads.get_mut(key) {
             Some(thread) => {
-                if !channel.can_edit() && !thread.renderer.is_finished() {
+                // Two reasons to hold a turn back until it is done: a channel
+                // that cannot rewrite a message, and an agent that produces
+                // nothing worth showing until the end. Either makes a mid-turn
+                // flush a wasted message.
+                let deliver_whole = !channel.can_edit() || !thread.session.streams();
+                if deliver_whole && !thread.renderer.is_finished() {
                     return Ok(());
                 }
                 match thread.renderer.take_pending() {
@@ -414,6 +524,8 @@ impl Core {
             }
             None => return Ok(()),
         };
+
+        let text = self.spill_if_long(key, text);
 
         match message_id {
             Some(id) => channel.edit(key, &id, &text).await?,
@@ -425,6 +537,40 @@ impl Core {
             }
         }
         Ok(())
+    }
+
+    /// Write an over-long reply to a file and hand back a pointer to it.
+    ///
+    /// Falls back to the untouched text if the file cannot be written — a
+    /// clipped reply is worse than a whole one, but both beat no reply.
+    fn spill_if_long(&self, key: &ThreadKey, text: String) -> String {
+        if text.chars().count() <= SPILL_THRESHOLD {
+            return text;
+        }
+
+        let name = format!(
+            "{}-{}.txt",
+            key.to_string().replace([':', '/'], "-"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+        let path = self.spill_dir.join(name);
+
+        if std::fs::create_dir_all(&self.spill_dir).is_err() || std::fs::write(&path, &text).is_err()
+        {
+            tracing::warn!("could not spill long output to {}", path.display());
+            return text;
+        }
+
+        let head: String = text.chars().take(SPILL_THRESHOLD).collect();
+        format!(
+            "{head}\n\n… {} characters in all. Read the rest with:\n\n  ssh {} -t 'cat {}'",
+            text.chars().count(),
+            hostname(),
+            path.display()
+        )
     }
 
     /// Post a standalone note, outside any turn's message.
@@ -442,20 +588,16 @@ impl Core {
             return Ok(());
         }
 
-        let state = self
-            .store
-            .get_or_create(&key.to_string(), &self.default_cwd.to_string_lossy())?;
+        let state = self.state(key)?;
 
-        let (session, events) = ClaudeSession::spawn(Config {
+        let (session, events) = agent::spawn(agent::SpawnConfig {
+            agent: state.agent.clone(),
             cwd: PathBuf::from(&state.cwd),
-            session_id: state.session_id,
-            // The PreToolUse hook installed during the handshake is what
-            // actually gates tools; this flag is inert under --print.
-            permission_mode: "default".to_string(),
-            raw: false,
+            session_id: state.session_id.clone(),
+            label: key.to_string(),
         })
         .await
-        .with_context(|| format!("starting agent for {key}"))?;
+        .with_context(|| format!("starting {} for {key}", state.agent))?;
 
         forward(key.clone(), events, self.agent_tx.clone());
 
@@ -487,6 +629,12 @@ fn forward(
     });
 }
 
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|name| name.trim().to_string())
+        .unwrap_or_else(|_| "localhost".to_string())
+}
+
 fn expand_home(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
@@ -500,6 +648,40 @@ fn expand_home(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_replies_are_left_alone_and_long_ones_are_spilled() {
+        let dir = std::env::temp_dir().join(format!("sb-spill-{}", std::process::id()));
+        let core = Core::new(
+            Store::in_memory().unwrap(),
+            Vec::new(),
+            PathBuf::from("/tmp"),
+            "claude".into(),
+            dir.clone(),
+        );
+        let key = ThreadKey {
+            channel: "telegram",
+            chat_id: "5".into(),
+            topic_id: None,
+        };
+
+        assert_eq!(core.spill_if_long(&key, "short".into()), "short");
+
+        let long = "x".repeat(SPILL_THRESHOLD + 500);
+        let pointed = core.spill_if_long(&key, long.clone());
+        assert!(pointed.chars().count() < long.chars().count());
+        assert!(pointed.contains("ssh "), "must say how to read the rest");
+        assert!(pointed.contains(&format!("{}", SPILL_THRESHOLD + 500)));
+
+        // The whole thing is on disk, not just the part that fit.
+        let written: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(written.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(written[0].path()).unwrap().len(),
+            long.len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn only_writing_and_executing_tools_are_gated() {

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -187,11 +188,6 @@ impl ClaudeSession {
         self.write_frame(&frame).await
     }
 
-    /// True while a turn is in flight.
-    pub fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst)
-    }
-
     async fn write_frame(&mut self, frame: &Value) -> Result<()> {
         let mut line = serde_json::to_vec(frame)?;
         line.push(b'\n');
@@ -209,7 +205,26 @@ impl ClaudeSession {
     }
 }
 
+#[async_trait]
 impl Agent for ClaudeSession {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
+    /// The PreToolUse hook installed during the handshake routes every tool
+    /// call out for a decision.
+    fn gates_tools(&self) -> bool {
+        true
+    }
+
+    fn streams(&self) -> bool {
+        true
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     async fn prompt(&mut self, text: &str) -> Result<()> {
         if self.busy.swap(true, Ordering::SeqCst) {
             bail!("a turn is already running — cancel it first");

@@ -79,4 +79,13 @@ pub trait Channel: Send + Sync {
     async fn ack_decision(&self, _token: &str, _note: &str) -> Result<()> {
         Ok(())
     }
+
+    /// Show that the agent is working.
+    ///
+    /// Only worth sending on channels that cannot stream: where a message grows
+    /// as the turn runs, that *is* the indicator, and an extra one costs rate
+    /// limit for nothing.
+    async fn typing(&self, _thread: &ThreadKey) -> Result<()> {
+        Ok(())
+    }
 }

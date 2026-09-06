@@ -273,6 +273,20 @@ impl Channel for Photon {
         bail!("iMessage cannot edit a sent message")
     }
 
+    /// The only feedback there is on iMessage: with no editing, nothing else
+    /// arrives until the turn is finished.
+    async fn typing(&self, thread: &ThreadKey) -> Result<()> {
+        self.http
+            .post(format!("{}/typing", self.base))
+            .header("x-switchboard-token", &self.token)
+            .timeout(Duration::from_secs(10))
+            .json(&json!({ "spaceId": thread.chat_id }))
+            .send()
+            .await
+            .context("photon /typing")?;
+        Ok(())
+    }
+
     async fn ask_permission(&self, thread: &ThreadKey, text: &str) -> Result<MessageId> {
         let question = format!("{text}\n\nReply /allow or /deny <why>");
         self.send(thread, &question).await

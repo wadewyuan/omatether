@@ -9,11 +9,11 @@ Not to be confused with a general chat assistant: the thing on the far end of
 the pipe is *your* agent, with your `CLAUDE.md`, your MCP servers, and your
 working tree.
 
-## Status: milestone 3
+## Status: complete
 
-Two channels — Telegram and iMessage (via Photon) — over one core. Text either
-one, the agent runs in your working tree, and the reply comes back to the
-thread it came from.
+Two channels — Telegram and iMessage (via Photon) — and every agent Omarchy
+supports, over one core. Text either one, the agent runs in your working tree,
+and the reply comes back to the thread it came from.
 
 ```bash
 switchboard serve --dir ~/src     # the bridge
@@ -67,6 +67,8 @@ thing stays behind the tailnet with nothing exposed.
 | `/new` | Fresh session in this thread |
 | `/stop` | Interrupt the running turn |
 | `/cd <path>` | Set the working directory (starts a fresh session) |
+| `/agent <name>` | Switch agent — claude, codex, pi, omp, opencode, crush, grok, gemini, copilot |
+| `/attach` | The ssh line to take over at a real terminal |
 | `/status` | Agent, directory, session, whether a turn is running |
 | `/allow`, `/deny <why>` | Answer a permission request without tapping |
 | `/help` | The above |
@@ -99,16 +101,58 @@ trains you to tap Allow without looking. Only `Bash`, `Write`, `Edit` and
 `NotebookEdit` ask; the rest are approved by switchboard itself
 (`GATED_TOOLS` in `src/core.rs`).
 
+### Agents
+
+All nine of Omarchy's agents work, in three tiers. `/agent` says what changes
+when you switch, because waiting for an approval prompt that will never arrive
+is a bad way to find out.
+
+| Tier | Agents | Streams | Gates tools | How |
+|---|---|---|---|---|
+| Structured | `claude` | yes | **yes** | Bidirectional `stream-json`, one long-lived process |
+| Structured | `codex` | yes | no | `codex exec --json`, one process per turn, `resume` for continuity |
+| Detached | the other seven | no | no | `omarchy-agent --inline` in a tmux session |
+
+Two honest limits, both the agent's rather than ours:
+
+* **Codex cannot gate tools.** `codex exec`'s only non-interactive approval mode
+  is `--approve-for-me`, which reviews automatically inside a workspace-write
+  sandbox. There is no callback to route to a human, so no Allow/Deny appears.
+* **The detached tier does not stream.** Those agents have no structured output,
+  so the reply is the tmux session, not a chat message. Switchboard says so and
+  gives you the `/attach` line rather than pretending otherwise.
+
+Codex assigns its own conversation id on the first turn and reports it back
+through `AgentEvent::Ready`; Claude takes one we choose. Either way it
+round-trips through the store, so a restart resumes.
+
+### Long replies
+
+Above ~2500 characters a reply is written to
+`$XDG_STATE_HOME/switchboard/out/` and the chat gets the head plus the command
+to read the rest:
+
+```
+… 12431 characters in all. Read the rest with:
+
+  ssh omarchy -t 'cat /home/wy/.local/state/switchboard/out/telegram-5-1788.txt'
+```
+
+Both channels clip long messages anyway, which loses the tail silently. A file
+plus a way to read it loses nothing, and the tailnet already makes it
+reachable.
+
 ### The repl
 
 The milestone-1 instrument, still the fastest way to see the wire protocol:
 
 ```bash
-switchboard repl --raw --dir . "list the files here"
+switchboard repl --dir .                            # interactive
+switchboard repl --agent codex --dir . "run tests"  # one-shot; runs to completion
 ```
 
-`--raw` echoes every frame to stderr, which is how you find out what changed
-when a Claude Code release moves the format.
+It drives any agent through the same seam, which makes it the fastest way to
+see what a backend actually emits.
 
 ## How the Claude adapter works
 
@@ -207,6 +251,8 @@ bridge needs. See `src/agent.rs`.
 | `src/agent.rs` | The trait every agent adapter implements. |
 | `src/claude/wire.rs` | Claude's `stream-json` frames → normalized events. |
 | `src/claude/mod.rs` | Process lifetime, stdin writes, stdout reader task. |
+| `src/codex.rs` | `codex exec --json`: per-turn process, `resume` for continuity. |
+| `src/tmux.rs` | The detached tier, for agents with no structured output. |
 | `src/channel/mod.rs` | Seam A: send, edit, ask, acknowledge. |
 | `src/channel/telegram.rs` | Bot API client and the long-poll loop. |
 | `src/core.rs` | The router: threads ↔ sessions, dispatch, flushing. |
@@ -238,19 +284,54 @@ Deliberately the simplest option in each case; revisit when something hurts.
 | Which tools ask | Only `Bash`/`Write`/`Edit`/`NotebookEdit` | A prompt per file read trains you to tap Allow without reading it. |
 | `/cd` on a live thread | Starts a fresh session | `cwd` is fixed when the agent process starts; the old session stays resumable by id. |
 | Telegram reply threads | Not separate threads | Only forum topics are; otherwise one conversation scatters into a session per reply chain. |
+| Switching agents | Starts a fresh conversation | Transcripts do not move between agents; pretending otherwise would lose context silently. |
+| Typing indicators | Only on channels that cannot edit | Where a message grows as the turn runs, that *is* the indicator. |
 
 ## Roadmap
 
 1. ~~Claude driver, no channels~~
-2. ~~Telegram end to end~~ ← you are here
-3. Photon channel — vendored Node sidecar, `GET /inbound` NDJSON, `POST /send`
-4. Second agent — Codex via `exec --json`, plus a tmux fallback tier for the rest
-5. Polish — attachments, tapbacks, forum-topic-per-project, `/attach` handoff over ssh
+2. ~~Telegram end to end~~
+3. ~~Photon channel~~
+4. ~~Second agent, plus the detached tier~~
+5. ~~Polish~~ — typing indicators, long-reply spill, `/attach`, forum topics
 
-### Notes for milestone 3
+Deliberately not built: **attachments** (sending and receiving files) and
+**Photon tapbacks**. Both need live channel credentials to exercise at all, and
+neither addresses a problem the long-reply spill does not already solve.
+
+## What is verified, and what is not
+
+Verified against the real thing:
+
+- The Claude adapter end to end, including the permission gate blocking a tool
+  call and a denial's reason reaching the model.
+- The Codex adapter's process lifecycle: a real `thread.started` id captured,
+  real JSONL parsed, errors surfaced, turn failure reported. Its event
+  vocabulary was read out of codex-cli 0.152.1 itself.
+- The detached tier: a real tmux session, the exact
+  `omarchy-agent --inline --prompt …` invocation, and a second prompt reaching
+  the running session through `send-keys`.
+- Telegram's configuration and error paths against the live API, plus the
+  service running live.
+- The Photon sidecar's startup, credential validation, and supervision — a dead
+  sidecar is reported in 2s with its real reason.
+
+Not verified, and why:
+
+- **A successful Codex turn.** `codex login` has not been run on this machine,
+  so every request 401s. Everything up to the model call is exercised.
+- **The live Photon path.** Testing it would have meant pointing a second client
+  at the Photon project the Hermes bridge is using, which could have intercepted
+  its messages.
+
+## Notes kept from the build
 
 - Vendor the Photon sidecar rather than pointing at the copy inside the Hermes
   install tree — an update there would break us, and depending on that path is
   not Hermes-free.
 - `PHOTON_SIDECAR_WATCH_STDIN=1` makes the sidecar exit on stdin EOF, which
   gives parent-death binding for free when spawned with a piped stdin.
+- Telegram allows roughly one message per second to a chat, and
+  `editMessageText` draws on the same budget.
+- `getUpdates` is exclusive: two pollers on one bot token steal each other's
+  messages. Outbound `sendMessage` on a shared token is fine.

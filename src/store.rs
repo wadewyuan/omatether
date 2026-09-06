@@ -9,16 +9,21 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
-use uuid::Uuid;
 
 /// Everything switchboard remembers about one chat thread.
 #[derive(Debug, Clone)]
 pub struct ThreadState {
     pub key: String,
-    /// Passed to the agent as `--session-id`, so a restart resumes rather than
-    /// starting a cold conversation.
-    pub session_id: Uuid,
+    /// The agent's handle for this conversation, so a restart resumes rather
+    /// than starting cold.
+    ///
+    /// A string rather than a UUID because the two agents disagree about who
+    /// owns it: Claude accepts one we choose, Codex assigns its own and reports
+    /// it back. Whoever decides, it round-trips through here.
+    pub session_id: Option<String>,
     pub cwd: String,
+    /// Which agent this thread talks to.
+    pub agent: String,
 }
 
 pub struct Store {
@@ -40,11 +45,19 @@ impl Store {
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS threads (
                  key        TEXT PRIMARY KEY,
-                 session_id TEXT NOT NULL,
+                 session_id TEXT,
                  cwd        TEXT NOT NULL,
                  updated_at INTEGER NOT NULL
              );",
         )?;
+
+        // Added after the first release. Failing means the column is already
+        // there, which is the common case.
+        conn.execute(
+            "ALTER TABLE threads ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
+            [],
+        )
+        .ok();
 
         Ok(Self { conn })
     }
@@ -56,24 +69,32 @@ impl Store {
         conn.execute_batch(
             "CREATE TABLE threads (
                  key        TEXT PRIMARY KEY,
-                 session_id TEXT NOT NULL,
+                 session_id TEXT,
                  cwd        TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL
+                 updated_at INTEGER NOT NULL,
+                 agent      TEXT NOT NULL DEFAULT 'claude'
              );",
         )?;
         Ok(Self { conn })
     }
 
-    /// Fetch a thread's state, creating it against `default_cwd` on first sight.
-    pub fn get_or_create(&self, key: &str, default_cwd: &str) -> Result<ThreadState> {
+    /// Fetch a thread's state, creating it against the defaults on first sight.
+    pub fn get_or_create(
+        &self,
+        key: &str,
+        default_cwd: &str,
+        default_agent: &str,
+    ) -> Result<ThreadState> {
         if let Some(state) = self.get(key)? {
             return Ok(state);
         }
 
         let state = ThreadState {
             key: key.to_string(),
-            session_id: Uuid::new_v4(),
+            // Left for the agent to fill in on its first turn.
+            session_id: None,
             cwd: default_cwd.to_string(),
+            agent: default_agent.to_string(),
         };
         self.put(&state)?;
         Ok(state)
@@ -83,22 +104,22 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT session_id, cwd FROM threads WHERE key = ?1",
+                "SELECT session_id, cwd, agent FROM threads WHERE key = ?1",
                 [key],
                 |row| {
-                    let session_id: String = row.get(0)?;
+                    let session_id: Option<String> = row.get(0)?;
                     let cwd: String = row.get(1)?;
-                    Ok((session_id, cwd))
+                    let agent: String = row.get(2)?;
+                    Ok((session_id, cwd, agent))
                 },
             )
             .optional()?;
 
-        Ok(row.map(|(session_id, cwd)| ThreadState {
+        Ok(row.map(|(session_id, cwd, agent)| ThreadState {
             key: key.to_string(),
-            // A corrupt id is not worth failing a message over; a fresh one
-            // starts a new conversation, which is the recoverable outcome.
-            session_id: Uuid::parse_str(&session_id).unwrap_or_else(|_| Uuid::new_v4()),
+            session_id,
             cwd,
+            agent,
         }))
     }
 
@@ -109,13 +130,14 @@ impl Store {
             .unwrap_or(0);
 
         self.conn.execute(
-            "INSERT INTO threads (key, session_id, cwd, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO threads (key, session_id, cwd, updated_at, agent)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(key) DO UPDATE SET
                  session_id = excluded.session_id,
                  cwd        = excluded.cwd,
-                 updated_at = excluded.updated_at",
-            rusqlite::params![state.key, state.session_id.to_string(), state.cwd, now],
+                 updated_at = excluded.updated_at,
+                 agent      = excluded.agent",
+            rusqlite::params![state.key, state.session_id, state.cwd, now, state.agent],
         )?;
         Ok(())
     }
@@ -129,25 +151,33 @@ mod tests {
     fn first_sight_creates_a_session_and_it_sticks() {
         let store = Store::in_memory().unwrap();
 
-        let first = store.get_or_create("telegram:1", "/home/wy/Work").unwrap();
-        let again = store.get_or_create("telegram:1", "/somewhere/else").unwrap();
+        let first = store
+            .get_or_create("telegram:1", "/home/wy/Work", "claude")
+            .unwrap();
+        let again = store
+            .get_or_create("telegram:1", "/somewhere/else", "codex")
+            .unwrap();
 
         assert_eq!(first.session_id, again.session_id);
         assert_eq!(again.cwd, "/home/wy/Work", "default must not overwrite");
+        assert_eq!(again.agent, "claude", "default must not overwrite");
     }
 
     #[test]
     fn cwd_and_session_survive_a_rewrite() {
         let store = Store::in_memory().unwrap();
-        let mut state = store.get_or_create("telegram:2", "/a").unwrap();
+        let mut state = store.get_or_create("telegram:2", "/a", "claude").unwrap();
+        assert_eq!(state.session_id, None, "no id until the agent assigns one");
 
         state.cwd = "/b".into();
-        state.session_id = Uuid::new_v4();
+        state.session_id = Some("thread-from-codex".into());
+        state.agent = "codex".into();
         store.put(&state).unwrap();
 
         let read = store.get("telegram:2").unwrap().unwrap();
         assert_eq!(read.cwd, "/b");
-        assert_eq!(read.session_id, state.session_id);
+        assert_eq!(read.session_id.as_deref(), Some("thread-from-codex"));
+        assert_eq!(read.agent, "codex");
     }
 
     #[test]

@@ -13,6 +13,10 @@ pub enum Command {
     Stop,
     /// Set the working directory for this thread.
     Cd(String),
+    /// Switch which agent this thread talks to.
+    Agent(String),
+    /// Get the line to type to take over at a real terminal.
+    Attach,
     /// Report agent, directory, session and whether a turn is running.
     Status,
     /// Answer a pending permission request without tapping a button.
@@ -42,6 +46,8 @@ pub fn parse(text: &str) -> Command {
         }),
         "/help" | "/start" => Command::Help,
         "/cd" => Command::Cd(rest.to_string()),
+        "/agent" => Command::Agent(rest.to_string()),
+        "/attach" => Command::Attach,
         _ => Command::Prompt(text.to_string()),
     }
 }
@@ -52,6 +58,8 @@ switchboard — your coding agent, over chat
 /new           start a fresh session in this thread
 /stop          interrupt the running turn
 /cd <path>     set the working directory (starts a fresh session)
+/agent <name>  switch agent (claude, codex, pi, ...)
+/attach        how to take over at a real terminal
 /status        agent, directory, session, whether a turn is running
 /allow         approve a pending tool call
 /deny <why>    refuse it, and tell the agent why
@@ -75,6 +83,13 @@ mod tests {
     fn deny_carries_a_reason_and_has_a_default() {
         assert_eq!(parse("/deny too risky"), Command::Deny("too risky".into()));
         assert_eq!(parse("/deny"), Command::Deny("denied from chat".into()));
+    }
+
+    #[test]
+    fn agent_and_attach_are_switchboard_commands() {
+        assert_eq!(parse("/agent codex"), Command::Agent("codex".into()));
+        assert_eq!(parse("/attach"), Command::Attach);
+        assert_eq!(parse("/agent"), Command::Agent(String::new()));
     }
 
     #[test]
