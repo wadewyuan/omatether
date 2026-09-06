@@ -11,12 +11,26 @@
 //! [`Agent::gates_tools`] reports false so the core says so up front, the same
 //! deal as the Codex tier.
 //!
-//! Event vocabulary confirmed against a live `pi -p --mode json` run
-//! (pi 0.84.4): `session`, `agent_start`/`agent_end`, `turn_start`/`turn_end`,
-//! `message_start`/`message_update`/`message_end`, `agent_settled`, with
+//! Event vocabulary confirmed against a live `pi -p --mode json` run and
+//! against pi's own `docs/json.md` (pi 0.84.4): `session`,
+//! `agent_start`/`agent_end`, `turn_start`/`turn_end`,
+//! `message_start`/`message_update`/`message_end`,
+//! `tool_execution_start`/`_update`/`_end`, `agent_settled`, with
 //! `message_update` carrying `assistantMessageEvent` deltas (`thinking_delta`,
 //! `text_delta`, …). Completed tool calls appear in `message_end`'s content
 //! array as `toolCall` entries.
+//!
+//! **`turn_end` is not the end of the exchange — `agent_end` is.** Pi documents
+//! two nested lifecycles, and a *turn* is one model round-trip: a prompt
+//! answered with a tool call emits `turn_end` twice. Treating it as the end
+//! closes the turn while the agent is still working, and since the core flushes
+//! and resets the renderer there, one reply arrives as several chat messages
+//! with the first marked finished.
+//!
+//! A failed turn is quiet: pi exits 0 and still emits `agent_end`, with the
+//! only sign in the last message's `stopReason` (`"error"`) and the reason
+//! beside it in `errorMessage`. Both are surfaced, or the chat renders an empty
+//! answer and calls it success.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -252,26 +266,48 @@ pub fn normalize(frame: &Value, announce_ready: bool) -> Vec<AgentEvent> {
             }]
         }
 
-        // Turn framing carries nothing a chat channel renders. The
-        // `message_start` pairs echo what `message_update` streams and
-        // `message_end` completes.
-        "agent_start" | "turn_start" | "message_start" | "agent_end" | "agent_settled" => {
-            Vec::new()
+        // Framing that carries nothing a chat channel renders. `message_start`
+        // echoes what `message_update` streams and `message_end` completes, and
+        // `tool_execution_*` re-reports a tool call already announced by the
+        // `message_end` that precedes it.
+        "agent_start" | "turn_start" | "message_start" | "agent_settled"
+        | "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => Vec::new(),
+
+        // NOT the end of the exchange. In Pi's vocabulary a *turn* is one model
+        // round-trip, so a prompt answered with a tool call emits `turn_end`
+        // twice: once when the model stops to call the tool, and again when it
+        // has read the result and replied. Closing the turn here flushes and
+        // resets the renderer mid-answer, which splits one reply across several
+        // chat messages and calls the first of them finished. `agent_end` is
+        // the boundary that means what this needs.
+        "turn_end" => Vec::new(),
+
+        // The end of the exchange. `willRetry` means Pi is going around again,
+        // so the turn is not over yet.
+        "agent_end" => {
+            if frame.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                return Vec::new();
+            }
+            // A turn that failed still exits 0 and still ends cleanly; the only
+            // sign is the last message's `stopReason`, with the reason beside
+            // it. Reported rather than dropped, or the chat shows an empty
+            // answer and calls it success.
+            let failure = frame
+                .get("messages")
+                .and_then(Value::as_array)
+                .and_then(|messages| messages.last())
+                .filter(|last| last.get("stopReason").and_then(Value::as_str) == Some("error"))
+                .map(|last| {
+                    last.get("errorMessage")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pi reported an error with no message")
+                        .to_string()
+                });
+            vec![AgentEvent::TurnEnd {
+                ok: failure.is_none(),
+                detail: failure,
+            }]
         }
-
-        "turn_end" => vec![AgentEvent::TurnEnd {
-            ok: true,
-            detail: None,
-        }],
-
-        "turn_aborted" => vec![AgentEvent::TurnEnd {
-            ok: false,
-            detail: frame
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(String::from)
-                .or_else(|| Some("turn aborted".into())),
-        }],
 
         // Incremental message content. Text streams as deltas; thinking deltas
         // are dropped deliberately — the same call the Codex adapter makes,
@@ -441,11 +477,15 @@ mod tests {
     }
 
     #[test]
-    fn turn_end_closes_the_turn() {
+    fn agent_end_closes_the_turn() {
         let frame = json!({
-            "type": "turn_end",
-            "message": { "role": "assistant", "content": [] },
-            "toolResults": []
+            "type": "agent_end",
+            "willRetry": false,
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "hello" }],
+                  "stopReason": "stop" }
+            ]
         });
         match normalize(&frame, false).as_slice() {
             [AgentEvent::TurnEnd { ok, detail }] => {
@@ -457,15 +497,50 @@ mod tests {
     }
 
     #[test]
-    fn turn_aborted_reports_failure() {
-        let frame = json!({ "type": "turn_aborted", "reason": "interrupted" });
+    fn turn_end_does_not_close_the_turn() {
+        // The bug this guards: a prompt answered with a tool call emits
+        // `turn_end` once when the model stops to call the tool and again when
+        // it has replied. Closing the turn on the first one resets the renderer
+        // mid-answer and splits one reply across several chat messages.
+        let frame = json!({
+            "type": "turn_end",
+            "message": {
+                "role": "assistant",
+                "content": [{ "type": "toolCall", "id": "t1", "name": "bash",
+                              "arguments": { "command": "ls" } }],
+                "stopReason": "toolUse"
+            },
+            "toolResults": [{ "role": "toolResult", "toolCallId": "t1" }]
+        });
+        assert!(normalize(&frame, false).is_empty());
+    }
+
+    #[test]
+    fn a_failed_turn_reports_its_reason_rather_than_looking_empty() {
+        // Verbatim from `pi -p --mode json` against a bad API key: pi exits 0,
+        // ends cleanly, and the only sign of failure is on the last message.
+        let frame = json!({
+            "type": "agent_end",
+            "willRetry": false,
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hi" }] },
+                { "role": "assistant", "content": [], "stopReason": "error",
+                  "errorMessage": "401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"API key is invalid.\"}}" }
+            ]
+        });
         match normalize(&frame, false).as_slice() {
             [AgentEvent::TurnEnd { ok, detail }] => {
                 assert!(!ok);
-                assert_eq!(detail.as_deref(), Some("interrupted"));
+                assert!(detail.as_deref().unwrap().contains("API key is invalid."));
             }
-            other => panic!("expected TurnEnd, got {other:?}"),
+            other => panic!("expected a failed TurnEnd, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_retrying_agent_has_not_finished() {
+        let frame = json!({ "type": "agent_end", "willRetry": true, "messages": [] });
+        assert!(normalize(&frame, false).is_empty());
     }
 
     #[test]
@@ -473,8 +548,13 @@ mod tests {
         for frame in [
             json!({ "type": "agent_start" }),
             json!({ "type": "turn_start" }),
-            json!({ "type": "agent_end" }),
+            json!({ "type": "message_start" }),
             json!({ "type": "agent_settled" }),
+            // Re-reports a tool call the preceding `message_end` already named.
+            json!({ "type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash" }),
+            json!({ "type": "tool_execution_update", "toolCallId": "t1", "toolName": "bash" }),
+            json!({ "type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash",
+                    "isError": false }),
         ] {
             assert!(normalize(&frame, false).is_empty(), "{frame}");
         }

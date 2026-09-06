@@ -90,7 +90,42 @@ this machine, so every request 401s. Everything up to the model call is
 exercised, including a real captured thread id. Run `codex login` and then
 `switchboard repl --agent codex --dir . "say hi"` to close this.
 
-## Detached tier (the other seven agents)
+## Pi adapter
+
+Same shape as Codex: `pi -p --mode json`, one process per turn, continuity
+through `--session <id>`. **Pi assigns the session id itself** and reports it in
+the first frame (`{"type":"session","id":…}`), so like Codex it fills in
+`ThreadState::session_id` rather than taking one we choose. Verified: a second
+process started with `--session <id>` still knows what the first one was told.
+
+**Pi cannot gate tools.** `-p` runs its tools as it decides on them; there is no
+approval callback, so `gates_tools()` is false and `/agent pi` says so.
+
+**`turn_end` is not the end of the exchange — `agent_end` is.** This one cost
+real time and looks like nothing in the frame log. Pi has two nested
+lifecycles, `agent_*` around `turn_*`, and a *turn* is one model round-trip: a
+prompt answered with a tool call emits `turn_end` twice, once when the model
+stops to call the tool and again when it has read the result and replied.
+Reading the first as the end is not a cosmetic error — the core flushes and
+*resets the renderer* on `TurnEnd`, so the answer that comes after it is
+discarded and the user gets the tool call alone, reported as a completed turn.
+The A/B is worth keeping in mind: with `turn_end` closing the turn, `switchboard
+repl --agent pi` prints the `[tool]` line and `[turn end] ok` and never prints
+the reply at all.
+
+**A failed turn is quiet.** Pi exits 0 and still emits a well-formed `agent_end`
+on an API error; the only sign is the last message's `stopReason` of `"error"`,
+with the reason next to it in `errorMessage` (`401 … "API key is invalid."`).
+Read the status alone and a failure renders as an empty successful answer —
+the same trap as Spectrum's `succeed:false` below.
+
+`tool_execution_{start,update,end}` re-report a tool call that the preceding
+`message_end` already announced, so they are dropped rather than rendered
+twice. Vocabulary is confirmed against both a live run and pi's own
+`docs/json.md` (pi 0.84.4) — note there is **no** `turn_aborted` frame, despite
+it being an obvious guess.
+
+## Detached tier (the other six agents)
 
 `omarchy-agent --inline` execs the agent directly instead of opening a terminal
 window, so it runs under tmux with no compositor. That is the whole trick. No
@@ -207,7 +242,7 @@ alone.
 
 ## Diagnostics
 
-Subprocess output logs under `switchboard::{photon,claude,codex}` so the
+Subprocess output logs under `switchboard::{photon,claude,codex,pi}` so the
 default `switchboard=info` filter catches it. If you add a subprocess, use a
 `switchboard::` target — a target outside that tree is silently dropped, which
 once produced an error saying "see its log above" when there was no log above.
