@@ -37,7 +37,7 @@ secret, then:
 cd vendor/photon-sidecar && npm install
 
 export SWITCHBOARD_PHOTON_PROJECT_ID=... SWITCHBOARD_PHOTON_PROJECT_SECRET=...
-switchboard photon-setup --phone +15551234567
+switchboard photon-setup --phone <your phone, E.164>
 ```
 
 Credentials alone are not enough. A fresh project knows nothing about you: your
@@ -55,7 +55,7 @@ SWITCHBOARD_TELEGRAM_ALLOWED_USERS=<your telegram user id>
 
 SWITCHBOARD_PHOTON_PROJECT_ID=...
 SWITCHBOARD_PHOTON_PROJECT_SECRET=...
-SWITCHBOARD_PHOTON_ALLOWED_USERS=+15551234567
+SWITCHBOARD_PHOTON_ALLOWED_USERS=<your phone, E.164>
 ```
 
 Install the service:
@@ -145,7 +145,7 @@ to read the rest:
 ```
 … 12431 characters in all. Read the rest with:
 
-  ssh omarchy -t 'cat /home/wy/.local/state/switchboard/out/telegram-5-1788.txt'
+  ssh <host> -t 'cat ~/.local/state/switchboard/out/telegram-5-1788.txt'
 ```
 
 Both channels clip long messages anyway, which loses the tail silently. A file
@@ -311,28 +311,30 @@ neither addresses a problem the long-reply spill does not already solve.
 
 ## What is verified, and what is not
 
-Verified against the real thing:
+Both channels are live and working end to end. Everything below was checked
+against the real tool or service rather than inferred.
 
-- The Claude adapter end to end, including the permission gate blocking a tool
-  call and a denial's reason reaching the model.
-- The Codex adapter's process lifecycle: a real `thread.started` id captured,
-  real JSONL parsed, errors surfaced, turn failure reported. Its event
-  vocabulary was read out of codex-cli 0.152.1 itself.
-- The detached tier: a real tmux session, the exact
+Verified:
+
+- **Telegram**, in daily use.
+- **Photon/iMessage**, end to end: a real message inbound, through the agent,
+  and the reply back out.
+- **The Claude adapter**, including the permission gate blocking a tool call
+  and a denial's reason reaching the model, which the model then explains
+  rather than retrying blindly.
+- **The detached tier**: a real tmux session, the exact
   `omarchy-agent --inline --prompt …` invocation, and a second prompt reaching
-  the running session through `send-keys`.
-- Telegram's configuration and error paths against the live API, plus the
-  service running live.
-- The Photon sidecar's startup, credential validation, and supervision — a dead
-  sidecar is reported in 2s with its real reason.
+  a running session through `send-keys`.
+- **The Codex adapter's lifecycle**: a real `thread.started` id captured, real
+  JSONL parsed, errors surfaced, turn failure reported.
+- **The store migration**, on the live database, preserving existing threads.
 
-Not verified, and why:
+Not verified:
 
-- **A successful Codex turn.** `codex login` has not been run on this machine,
-  so every request 401s. Everything up to the model call is exercised.
-- **The live Photon path.** Testing it would have meant pointing a second client
-  at the Photon project the Hermes bridge is using, which could have intercepted
-  its messages.
+- **A successful Codex turn.** `codex login` has never been run on this
+  machine, so every request 401s. Everything up to the model call is exercised.
+  `codex login`, then `switchboard repl --agent codex --dir . "say hi"`.
+- **Photon attachments and tapbacks**, which are not implemented at all.
 
 ## Notes kept from the build
 
