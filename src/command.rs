@@ -65,7 +65,14 @@ switchboard — your coding agent, over chat
 /deny <why>    refuse it, and tell the agent why
 
 Anything else is sent to the agent as typed, including its own \
-slash commands.";
+slash commands.
+
+Not every agent is gated:
+  claude       asks you before Bash, Write and Edit
+  codex        approves its own tools inside a sandbox
+  everything else (pi, omp, opencode, crush, grok, gemini, copilot)
+               runs detached with its own auto-approve flags, unsandboxed,
+               and nothing here can stop a tool call";
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +106,15 @@ mod tests {
             parse("/compact keep the plan"),
             Command::Prompt("/compact keep the plan".into())
         );
+    }
+
+    #[test]
+    fn help_admits_which_tiers_have_no_gate() {
+        // The gate is the one safety feature this product has. A tier without
+        // it has to say so somewhere a person reads before switching, not only
+        // in the reply to /agent after they already have.
+        assert!(HELP.contains("unsandboxed"), "the tmux tier's terms");
+        assert!(HELP.contains("sandbox"), "codex's terms");
     }
 
     #[test]

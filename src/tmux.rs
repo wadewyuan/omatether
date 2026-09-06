@@ -99,7 +99,18 @@ impl Agent for TmuxSession {
         if self.session_exists().await {
             // Feed an existing session instead of starting a second one: the
             // agent is sitting at its prompt waiting for exactly this.
-            self.tmux(&["send-keys", "-t", &self.session, text, "Enter"])
+            //
+            // `-l --` is what makes this type the message rather than perform
+            // it. Without `-l`, tmux reads key *names*: a message of exactly
+            // `C-c` interrupts the agent instead of asking it about `C-c`, and
+            // `Enter`, `Space` and `BSpace` are all real messages someone might
+            // send. Without `--`, a message starting with `-` is parsed as
+            // flags. Verified against tmux 3.7c: all four arrive as text.
+            //
+            // The newline stays a separate call, because under `-l` the word
+            // "Enter" would be typed rather than submit the line.
+            self.tmux(&type_text_args(&self.session, text)).await?;
+            self.tmux(&["send-keys", "-t", &self.session, "Enter"])
                 .await?;
 
             let _ = self
@@ -200,6 +211,14 @@ impl Agent for TmuxSession {
     }
 }
 
+/// The tmux invocation that types a message into a live pane as *text*.
+///
+/// Both flags are load-bearing and neither is obvious, which is why this is a
+/// function with a test rather than an inline array.
+fn type_text_args<'a>(session: &'a str, text: &'a str) -> [&'a str; 6] {
+    ["send-keys", "-t", session, "-l", "--", text]
+}
+
 /// tmux session names take neither dots nor colons.
 pub fn session_name(label: &str) -> String {
     let cleaned: String = label
@@ -219,6 +238,24 @@ mod tests {
         assert!(!name.contains(':'), "colons break tmux targets");
         assert!(!name.contains('.'), "dots break tmux targets");
         assert_eq!(name, "sb-telegram--1001234-77");
+    }
+
+    #[test]
+    fn a_message_is_typed_as_text_not_performed_as_keys() {
+        // Verified against tmux 3.7c: without `-l`, `C-c` is not typed but
+        // *pressed* — it interrupts the agent the message was meant for, and
+        // in the probe that found this it killed the session outright. `Enter`,
+        // `Space` and `BSpace` are the same trap, and they are all things a
+        // person might reasonably send.
+        let args = type_text_args("sb-telegram-5", "C-c");
+        assert!(args.contains(&"-l"), "without -l tmux performs key names");
+
+        // A message starting with `-` must not be read as flags, so the text
+        // has to come after `--` and stay last.
+        let args = type_text_args("sb-telegram-5", "-H hello");
+        let separator = args.iter().position(|a| *a == "--").expect("needs --");
+        assert_eq!(args[separator + 1], "-H hello");
+        assert_eq!(args.len(), separator + 2, "text must be the final argument");
     }
 
     #[test]

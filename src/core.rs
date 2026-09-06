@@ -294,9 +294,16 @@ impl Core {
             Some(agent::Backend::Claude) => {}
             Some(agent::Backend::Codex) => note
                 .push_str("\n\nCodex approves its own tools inside a sandbox — no Allow/Deny here."),
+            // The gate is this product's one safety feature, and this tier does
+            // not have it. Someone who just approved a Bash call on claude is
+            // one command away from an agent that approves its own — that
+            // difference has to be visible at the moment it changes, not
+            // discovered when a prompt never arrives.
             Some(agent::Backend::Tmux) => note.push_str(
-                "\n\nThis agent has no structured output: it runs detached and does not \
-                 stream back. Use /attach to take over.",
+                "\n\nNo Allow/Deny on this tier: it runs with its own auto-approve \
+                 flags, unsandboxed, and nothing here can stop a tool call. It has \
+                 no structured output either, so nothing streams back — /attach to \
+                 take over at a terminal.",
             ),
             None => {}
         }
