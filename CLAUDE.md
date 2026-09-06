@@ -43,6 +43,15 @@ Answer with `hookSpecificOutput.permissionDecision` (`allow`/`deny`) plus
 `permissionDecisionReason`. The reason reaches the model, which explains it
 back rather than retrying blindly.
 
+**The handshake is answered, and `spawn` blocks on the answer.** The reply is
+`{"type":"control_response","response":{"subtype":"success","request_id":…}}`,
+it carries the request id we sent, and it is the *first* frame out — ahead of
+`system/init` — about 900ms in, nearly all of it node starting. A session whose
+hook registration is refused is a session with no gate that looks exactly like
+a working one (no `PermissionRequest` ever arrives, which reads as "the agent
+didn't need permission"), so registration failing is now a startup error
+quoting the CLI's reason rather than something only the logs know.
+
 The older `can_use_tool` control request is also accepted (`{behavior:
 'allow'|'deny'}`), but it is not what arrives in practice. The adapter
 remembers which dialect each question came in and answers in kind; that
@@ -86,10 +95,21 @@ exercised, including a real captured thread id. Run `codex login` and then
 `omarchy-agent --inline` execs the agent directly instead of opening a terminal
 window, so it runs under tmux with no compositor. That is the whole trick. No
 structured output means no streaming and no gating, and the code says so to the
-user rather than pretending.
+user rather than pretending — in `/agent`'s reply, in `/help` and in the
+README, because "no gate" is a security property and inferring it from "does
+not stream" is not reasonable to ask of anyone.
 
 A second prompt to a live session goes in via `send-keys` rather than starting
-a new one.
+a new one. **It must be `send-keys -l -- <text>`**, with the newline sent
+separately. Without `-l`, tmux reads key *names*: a message of exactly `C-c` is
+not typed but pressed, which interrupts the agent it was meant for — the probe
+that found this killed its own test session, because `cat` took the SIGINT and
+the pane closed. `Enter`, `Space` and `BSpace` are the same trap. Without `--`,
+a message starting with `-` is parsed as flags. Verified against tmux 3.7c.
+
+The `new-session` path is fine as it is: tmux passes the prompt to
+`omarchy-agent` as argv with no shell in between, so `foo; rm -rf ~` stays a
+string. Verified, not assumed.
 
 ## Telegram
 
@@ -100,6 +120,18 @@ Outbound `sendMessage` on a shared token is fine.
 Roughly one message per second per chat, and `editMessageText` draws on the
 same budget, hence the 1.5s debounce. 429s carry `parameters.retry_after` and
 are expected traffic, not an anomaly.
+
+**The waiting happens in the thread's outbox, never in the adapter.** A 429
+becomes a `RateLimited` error the adapter reports; `src/outbox.rs` decides
+whether to wait and retry. It used to sleep inside `Telegram::call`, which is
+inside the core's one `select!` loop — so one rate-limited chat stopped every
+other chat on every channel — and then bailed anyway, losing the message it had
+just waited for. If you add a channel, report the platform's retry hint rather
+than acting on it.
+
+**Buttons outlive their question**, so `callback_data` carries a per-question
+token (`allow:<token>`) and a tap naming a question that is no longer open is
+refused rather than applied to whatever is pending now.
 
 **Only forum topics are separate threads.** Plain replies in a group also set
 `message_thread_id`; treating those as threads scatters one conversation into a
@@ -160,6 +192,18 @@ alone.
   shell on this machine.
 - **One turn per thread.** A second message while one runs is rejected, not
   queued. From a phone that is more predictable, and far simpler.
+- **Nothing slow happens on the core's task.** Every channel call goes through
+  the thread's outbox (`src/outbox.rs`); the core queues and moves on. This is
+  what keeps "one turn per thread" from quietly meaning "one *anything* at a
+  time, globally" — which is what it meant when a 429 slept in the shared loop.
+  If you find yourself awaiting a `Channel` method from `core.rs`, that is the
+  regression.
+- **The gate must be confirmed, not assumed.** An agent that claims to gate
+  tools has to prove it at startup; a gate that silently failed to install is
+  indistinguishable from an agent that had nothing to ask about.
+- **Never show a question you had to cut off.** A permission prompt is the one
+  human control here, so the full tool input goes out whole or goes to a file
+  with a pointer — never clipped by the channel with "… truncated".
 
 ## Diagnostics
 
@@ -176,7 +220,15 @@ readiness timeout.
 ## How to verify a change
 
 `cargo test` covers the wire parsers, the renderer's debounce, command parsing,
-the store and its migration, using frames captured from the real tools.
+the store and its migration, using frames captured from the real tools. It also
+covers the outbox against a fake channel, including the property it exists for:
+a thread waiting out a rate limit does not delay another thread's message.
+
+Two things there are worth knowing before you trust them. The permission-gate
+handshake was verified in both directions against the installed CLI — accepted,
+and deliberately broken — not just unit tested. And the "unchanged turn is not
+re-sent" test was confirmed to fail when its bug is reintroduced; a test for a
+spam-the-phone bug is worth that much.
 
 Beyond that, the repl drives any agent without a channel:
 

@@ -132,6 +132,16 @@ Two honest limits, both the agent's rather than ours:
   so the reply is the tmux session, not a chat message. Switchboard says so and
   gives you the `/attach` line rather than pretending otherwise.
 
+And one that is worth stating plainly rather than reading out of the table:
+
+> **Only `claude` asks you anything.** The detached tier runs each agent with
+> its own auto-approve flags, unsandboxed, and switchboard cannot stop a tool
+> call there — it has no channel to be asked through. The same allowlisted
+> person who approves every `Bash` on `claude` is one `/agent pi` away from an
+> agent that approves its own. That is a deliberate trade for reaching the
+> other seven agents at all, but it is a real one: `/agent` says so on the way
+> in, and `/help` lists the terms of all three tiers.
+
 Codex assigns its own conversation id on the first turn and reports it back
 through `AgentEvent::Ready`; Claude takes one we choose. Either way it
 round-trips through the store, so a restart resumes.
