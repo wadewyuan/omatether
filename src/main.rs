@@ -229,10 +229,11 @@ async fn start_photon(sidecar: Option<PathBuf>) -> Result<Option<Arc<Photon>>> {
          allowed to message this bridge, comma separated.",
     )?;
 
+    // Zero means "ask the OS". Only pin a port if you have a reason to.
     let port: u16 = std::env::var("SWITCHBOARD_PHOTON_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(8789);
+        .unwrap_or(0);
 
     let sidecar_dir = sidecar.unwrap_or_else(default_sidecar_dir);
 

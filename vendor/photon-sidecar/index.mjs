@@ -218,6 +218,30 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// Without this, a failed listen is an uncaught exception: Node exits 1 with a
+// stack trace and the supervisor has nothing useful to report.
+server.on("error", (e) => {
+  if (e?.code === "EADDRINUSE") {
+    console.error(
+      `photon-sidecar: 127.0.0.1:${port} is already in use — another sidecar ` +
+        "(Hermes runs one too) is on that port. Set SWITCHBOARD_PHOTON_PORT, " +
+        "or leave it unset to be given a free one."
+    );
+  } else {
+    console.error("photon-sidecar: server error — " + String(e?.message ?? e));
+  }
+  process.exit(5);
+});
+
+process.on("uncaughtException", (e) => {
+  console.error("photon-sidecar: " + String(e?.stack ?? e));
+  process.exit(6);
+});
+process.on("unhandledRejection", (e) => {
+  console.error("photon-sidecar: unhandled rejection — " + String(e?.stack ?? e));
+  process.exit(6);
+});
+
 server.listen(port, "127.0.0.1", () => {
   console.error(`photon-sidecar: listening on 127.0.0.1:${port}`);
 });

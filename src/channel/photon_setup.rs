@@ -23,17 +23,42 @@ fn basic_auth(project_id: &str, project_secret: &str) -> String {
     )
 }
 
-/// Spectrum wraps collections inconsistently; accept either shape.
+/// Spectrum replies are enveloped — `{"succeed":true,"data":{"users":[…]}}` —
+/// so the list is two levels down, not one. Descend rather than guess: reading
+/// an envelope as empty is worse than failing, because it looks like a project
+/// with no users and invites you to "fix" it by registering again.
 fn as_list(value: &Value) -> Vec<Value> {
     if let Some(items) = value.as_array() {
         return items.clone();
     }
     for key in ["data", "results", "users", "items"] {
-        if let Some(items) = value.get(key).and_then(Value::as_array) {
-            return items.clone();
+        match value.get(key) {
+            Some(Value::Array(items)) => return items.clone(),
+            // e.g. data -> { users: [...] }
+            Some(nested @ Value::Object(_)) => {
+                let inner = as_list(nested);
+                if !inner.is_empty() {
+                    return inner;
+                }
+            }
+            _ => {}
         }
     }
     Vec::new()
+}
+
+/// Spectrum returns HTTP 200 with `succeed:false` for application errors, so
+/// the status alone is not an answer.
+fn envelope_error(body: &Value) -> Option<String> {
+    if body.get("succeed").and_then(Value::as_bool) == Some(false) {
+        return Some(
+            body.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unspecified error")
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn digits(value: &str) -> String {
@@ -93,7 +118,11 @@ pub async fn run(project_id: &str, project_secret: &str, phone: &str) -> Result<
         bail!("Photon rejected the project credentials ({status}): {body}");
     }
 
-    let users = as_list(&response.json::<Value>().await.context("decoding users")?);
+    let body: Value = response.json().await.context("decoding users")?;
+    if let Some(message) = envelope_error(&body) {
+        bail!("Photon refused to list users: {message}");
+    }
+    let users = as_list(&body);
     println!("project  {project_id}");
     println!("users    {}", users.len());
 
@@ -117,8 +146,14 @@ pub async fn run(project_id: &str, project_secret: &str, phone: &str) -> Result<
                 bail!("Photon refused to register {phone} ({status}): {body}");
             }
 
+            let body: Value = response.json().await.context("decoding new user")?;
+            if let Some(message) = envelope_error(&body) {
+                bail!("Photon refused to register {phone}: {message}");
+            }
+
             println!("phone    {phone} (registered)");
-            response.json::<Value>().await.context("decoding new user")?
+            // The created user is inside the same envelope as everything else.
+            body.get("data").cloned().unwrap_or(body)
         }
     };
 
@@ -158,10 +193,38 @@ mod tests {
     }
 
     #[test]
-    fn collections_unwrap_from_either_shape() {
+    fn collections_unwrap_from_every_shape_photon_uses() {
         assert_eq!(as_list(&json!([{ "a": 1 }])).len(), 1);
         assert_eq!(as_list(&json!({ "data": [{ "a": 1 }, { "b": 2 }] })).len(), 2);
         assert_eq!(as_list(&json!({ "nothing": true })).len(), 0);
+
+        // The shape Photon actually returns, verified against the live API.
+        let real = json!({
+            "succeed": true,
+            "data": { "users": [{ "id": "u1", "phoneNumber": "+15551234567" }], "total": 1 }
+        });
+        assert_eq!(as_list(&real).len(), 1, "must descend into data.users");
+    }
+
+    #[test]
+    fn an_enveloped_failure_is_not_a_success() {
+        let body = json!({ "succeed": false, "message": "nope", "data": null });
+        assert_eq!(envelope_error(&body).as_deref(), Some("nope"));
+        assert_eq!(envelope_error(&json!({ "succeed": true })), None);
+    }
+
+    #[test]
+    fn the_line_is_read_from_a_real_response() {
+        let real = json!({
+            "succeed": true,
+            "data": { "users": [{
+                "phoneNumber": "+15551234567",
+                "assignedPhoneNumber": "+15559876543"
+            }], "total": 1 }
+        });
+        let users = as_list(&real);
+        let user = find_by_phone(&users, "+15551234567").expect("registered user");
+        assert_eq!(assigned_line(&user).as_deref(), Some("+15559876543"));
     }
 
     #[test]

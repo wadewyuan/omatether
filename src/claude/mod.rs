@@ -370,6 +370,6 @@ async fn read_events(
 async fn log_stderr(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(target: "claude::stderr", "{line}");
+        tracing::debug!(target: "switchboard::claude", "{line}");
     }
 }

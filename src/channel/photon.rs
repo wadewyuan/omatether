@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -45,6 +46,9 @@ pub struct Config {
     pub sidecar_dir: PathBuf,
     pub project_id: String,
     pub project_secret: String,
+    /// Loopback port for the sidecar's control channel. Zero — the default —
+    /// means "pick a free one", which is what you want: a fixed port collides
+    /// with anything else running a Photon sidecar, Hermes included.
     pub port: u16,
     /// Phone numbers (E.164) permitted to talk to this bridge.
     pub allowed_users: Vec<String>,
@@ -70,12 +74,17 @@ impl Photon {
         // process send iMessages as the user.
         let token = format!("{}", uuid::Uuid::new_v4());
 
+        let port = match config.port {
+            0 => free_port().context("finding a free loopback port for the sidecar")?,
+            port => port,
+        };
+
         let mut child = Command::new("node")
             .arg(&entry)
             .current_dir(&config.sidecar_dir)
             .env("PHOTON_PROJECT_ID", &config.project_id)
             .env("PHOTON_PROJECT_SECRET", &config.project_secret)
-            .env("PHOTON_SIDECAR_PORT", config.port.to_string())
+            .env("PHOTON_SIDECAR_PORT", port.to_string())
             .env("PHOTON_SIDECAR_TOKEN", &token)
             // Bind the sidecar's life to ours. Without this a crashed
             // switchboard leaves a process holding the iMessage line.
@@ -87,8 +96,11 @@ impl Photon {
             .spawn()
             .context("spawning the photon sidecar — is node on PATH?")?;
 
+        // Keep the sidecar's last words, so a startup failure can quote the
+        // reason instead of pointing at a log the operator may not have.
+        let recent: RecentLog = Arc::new(std::sync::Mutex::new(Vec::new()));
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(log_lines(stderr));
+            tokio::spawn(log_lines(stderr, recent.clone()));
         }
 
         let http = reqwest::Client::builder()
@@ -96,8 +108,8 @@ impl Photon {
             // timeouts are applied where they make sense instead.
             .build()?;
 
-        let base = format!("http://127.0.0.1:{}", config.port);
-        wait_until_ready(&http, &base, &token, &mut child).await?;
+        let base = format!("http://127.0.0.1:{port}");
+        wait_until_ready(&http, &base, &token, &mut child, &recent).await?;
 
         Ok(Self {
             http,
@@ -305,10 +317,17 @@ async fn wait_until_ready(
     base: &str,
     token: &str,
     child: &mut Child,
+    recent: &RecentLog,
 ) -> Result<()> {
     for attempt in 0..40 {
         if let Some(status) = child.try_wait()? {
-            bail!("photon sidecar exited during startup ({status}) — see its log above");
+            // Give it a moment to flush: the process can exit before the
+            // reader task has drained the line explaining why.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            bail!(
+                "photon sidecar exited during startup ({status}):\n{}",
+                tail(recent)
+            );
         }
 
         let response = http
@@ -339,10 +358,42 @@ fn tokio_util_lines(response: reqwest::Response) -> impl tokio::io::AsyncRead {
     ))
 }
 
-async fn log_lines(stderr: tokio::process::ChildStderr) {
+/// Ask the OS for a port nobody is using.
+///
+/// Binding and immediately dropping leaves a small race, but the alternative —
+/// a fixed default — collides in practice: Hermes runs its own Photon sidecar
+/// on 8789, and losing that race is a certainty rather than a chance.
+fn free_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// The sidecar's most recent stderr, kept so a failure can quote itself.
+type RecentLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+const RECENT_LINES: usize = 20;
+
+async fn log_lines(stderr: tokio::process::ChildStderr, recent: RecentLog) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "photon::sidecar", "{line}");
+        tracing::info!(target: "switchboard::photon", "{line}");
+        if let Ok(mut recent) = recent.lock() {
+            recent.push(line);
+            if recent.len() > RECENT_LINES {
+                recent.remove(0);
+            }
+        }
+    }
+}
+
+fn tail(recent: &RecentLog) -> String {
+    match recent.lock() {
+        Ok(recent) if !recent.is_empty() => recent
+            .iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => "  (the sidecar said nothing before exiting)".to_string(),
     }
 }
 
@@ -408,6 +459,14 @@ mod tests {
         assert!(!seen.contains(&"1".to_string()), "old ids are dropped");
         assert!(seen.contains(&"299".to_string()), "recent ids are kept");
         assert_eq!(seen.len(), 256);
+    }
+
+    #[test]
+    fn a_free_port_is_actually_free() {
+        let port = free_port().unwrap();
+        assert!(port > 1024, "must be an unprivileged port, got {port}");
+        // Bindable, which is the whole point of asking.
+        std::net::TcpListener::bind(("127.0.0.1", port)).expect("port should be free");
     }
 
     #[test]
