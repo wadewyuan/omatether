@@ -27,9 +27,12 @@ const MAX_TEXT: usize = 3900;
 /// spinning; well under any sane proxy timeout.
 const POLL_TIMEOUT_SECS: u64 = 25;
 
-/// Callback payloads. At most one permission is outstanding per thread, so
-/// these need carry no request id — which also keeps them inside Telegram's
-/// 64-byte callback_data limit without any encoding scheme.
+/// Callback payloads, as `allow:<question>` / `deny:<question>`.
+///
+/// The question token is what stops a tap on an old message from answering
+/// whichever question happens to be pending now. Telegram allows 64 bytes of
+/// callback_data and a verb plus an eight-character token spends fourteen of
+/// them.
 const CB_ALLOW: &str = "allow";
 const CB_DENY: &str = "deny";
 
@@ -174,8 +177,14 @@ impl Telegram {
                 return None;
             }
 
-            let data = callback.get("data").and_then(Value::as_str)?;
-            let allow = match data {
+            // Anything without a question token is from a build that predates
+            // them. Dropping it is the safe direction: the alternative is
+            // applying it to whatever is pending now.
+            let (verb, question) = callback
+                .get("data")
+                .and_then(Value::as_str)?
+                .split_once(':')?;
+            let allow = match verb {
                 CB_ALLOW => true,
                 CB_DENY => false,
                 _ => return None,
@@ -186,7 +195,8 @@ impl Telegram {
                 user_id,
                 kind: InboundKind::Decision {
                     allow,
-                    token: callback.get("id").and_then(Value::as_str)?.to_string(),
+                    ack: callback.get("id").and_then(Value::as_str)?.to_string(),
+                    question: question.to_string(),
                 },
             });
         }
@@ -255,13 +265,18 @@ impl Channel for Telegram {
         }
     }
 
-    async fn ask_permission(&self, thread: &ThreadKey, text: &str) -> Result<MessageId> {
+    async fn ask_permission(
+        &self,
+        thread: &ThreadKey,
+        text: &str,
+        question: &str,
+    ) -> Result<MessageId> {
         let mut body = self.target(thread);
         body["text"] = json!(clip(text));
         body["reply_markup"] = json!({
             "inline_keyboard": [[
-                { "text": "Allow", "callback_data": CB_ALLOW },
-                { "text": "Deny",  "callback_data": CB_DENY  },
+                { "text": "Allow", "callback_data": format!("{CB_ALLOW}:{question}") },
+                { "text": "Deny",  "callback_data": format!("{CB_DENY}:{question}")  },
             ]]
         });
 
@@ -394,18 +409,69 @@ mod tests {
     }
 
     #[test]
-    fn button_taps_parse_as_decisions() {
+    fn button_taps_carry_the_question_they_were_asked_under() {
         let update = json!({
             "update_id": 1,
             "callback_query": {
-                "id": "cb-1", "from": { "id": 42 }, "data": "deny",
+                "id": "cb-1", "from": { "id": 42 }, "data": "deny:a1b2c3d4",
                 "message": { "chat": { "id": 5 } }
             }
         });
         match telegram().parse_update(&update).unwrap().kind {
-            InboundKind::Decision { allow, token } => {
+            InboundKind::Decision {
+                allow,
+                ack,
+                question,
+            } => {
                 assert!(!allow);
-                assert_eq!(token, "cb-1");
+                assert_eq!(ack, "cb-1", "so the spinner can be stopped");
+                assert_eq!(question, "a1b2c3d4", "so a stale tap can be spotted");
+            }
+            other => panic!("expected decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tap_with_no_question_token_is_dropped() {
+        // A button from a build that predates question tokens. Dropping it is
+        // the safe direction — the alternative is applying someone's old tap to
+        // whatever tool is waiting now.
+        let update = json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "cb-1", "from": { "id": 42 }, "data": "allow",
+                "message": { "chat": { "id": 5 } }
+            }
+        });
+        assert!(telegram().parse_update(&update).is_none());
+    }
+
+    #[test]
+    fn the_buttons_carry_the_question_into_their_callback_data() {
+        // The two halves have to agree, and they are written in different
+        // places: this is the seam where a rename would go unnoticed.
+        let sent = json!({
+            "inline_keyboard": [[
+                { "text": "Allow", "callback_data": format!("{CB_ALLOW}:{}", "a1b2c3d4") },
+                { "text": "Deny",  "callback_data": format!("{CB_DENY}:{}", "a1b2c3d4")  },
+            ]]
+        });
+        let allow = sent["inline_keyboard"][0][0]["callback_data"].as_str().unwrap();
+        assert!(allow.len() <= 64, "Telegram's callback_data limit");
+
+        let update = json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "cb-1", "from": { "id": 42 }, "data": allow,
+                "message": { "chat": { "id": 5 } }
+            }
+        });
+        match telegram().parse_update(&update).unwrap().kind {
+            InboundKind::Decision {
+                allow, question, ..
+            } => {
+                assert!(allow);
+                assert_eq!(question, "a1b2c3d4");
             }
             other => panic!("expected decision, got {other:?}"),
         }

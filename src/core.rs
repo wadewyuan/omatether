@@ -61,6 +61,9 @@ struct PendingPermission {
     request_id: String,
     tool: String,
     message_id: String,
+    /// Identifies this question to the channel, so a tap can be matched to the
+    /// question it was asked under rather than to whatever is pending now.
+    question: String,
 }
 
 pub struct Core {
@@ -149,8 +152,13 @@ impl Core {
         );
 
         match message.kind {
-            InboundKind::Decision { allow, token } => {
-                self.on_decision(&message.thread, allow, &token).await
+            InboundKind::Decision {
+                allow,
+                ack,
+                question,
+            } => {
+                self.on_decision(&message.thread, allow, &ack, &question)
+                    .await
             }
             InboundKind::Text(text) => match command::parse(&text) {
                 Command::Help => self.say(&message.thread, command::HELP).await,
@@ -335,13 +343,46 @@ impl Core {
         self.say(key, &note).await
     }
 
-    async fn on_decision(&mut self, key: &ThreadKey, allow: bool, token: &str) -> Result<()> {
+    /// A button tap. Unlike `/allow` typed as text, this names the question it
+    /// was asked under, because the buttons under an old question stay tappable
+    /// for as long as the message exists.
+    async fn on_decision(
+        &mut self,
+        key: &ThreadKey,
+        allow: bool,
+        ack: &str,
+        question: &str,
+    ) -> Result<()> {
+        // Check before consuming anything: a tap that does not name the
+        // question we are waiting on must leave that question waiting.
+        let answers_the_open_question = self
+            .threads
+            .get(key)
+            .and_then(|thread| thread.pending.as_ref())
+            .is_some_and(|pending| pending.question == question);
+
+        if !answers_the_open_question {
+            if let Some(channel) = self.channel(key) {
+                channel.ack_decision(ack, "That question has moved on").await.ok();
+            }
+            // Say which way it went, because from the chat it looks like the
+            // tap did nothing: the buttons are still there under a question
+            // that is no longer the one being asked.
+            return self
+                .say(
+                    key,
+                    "That was a button from an earlier question — it was not \
+                     applied. Scroll down for the current one, if there is one.",
+                )
+                .await;
+        }
+
         let decision = if allow {
             Decision::allow()
         } else {
             Decision::deny("denied from chat")
         };
-        self.decide(key, decision, Some(token)).await
+        self.decide(key, decision, Some(ack)).await
     }
 
     /// Answer the thread's outstanding permission question.
@@ -481,14 +522,16 @@ impl Core {
             None => return Ok(()),
         };
 
-        let question = self.permission_question(key, &tool, &input);
-        let message_id = channel.ask_permission(key, &question).await?;
+        let text = self.permission_question(key, &tool, &input);
+        let question = question_token();
+        let message_id = channel.ask_permission(key, &text, &question).await?;
 
         if let Some(thread) = self.threads.get_mut(key) {
             thread.pending = Some(PendingPermission {
                 request_id,
                 tool,
                 message_id,
+                question,
             });
         }
         Ok(())
@@ -723,6 +766,22 @@ fn forward(
             }
         }
     });
+}
+
+/// A short handle for one permission question.
+///
+/// Only ever compared against the one question a thread has outstanding, so it
+/// needs to be unpredictable across restarts rather than globally unique — a
+/// counter would let a button from before a restart match a question after it.
+/// Eight hex characters leave plenty of room inside Telegram's 64-byte
+/// callback_data.
+fn question_token() -> String {
+    uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect()
 }
 
 fn hostname() -> String {
