@@ -51,14 +51,15 @@ impl Store {
              );",
         )?;
 
-        // Added after the first release. Failing means the column is already
-        // there, which is the common case.
-        conn.execute(
-            "ALTER TABLE threads ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
-            [],
-        )
-        .ok();
+        migrate(&conn)?;
 
+        Ok(Self { conn })
+    }
+
+    /// Wrap an already-open connection. For tests that build an older schema.
+    #[cfg(test)]
+    fn from_conn(conn: Connection) -> Result<Self> {
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -143,6 +144,62 @@ impl Store {
     }
 }
 
+/// Bring an existing database up to the current schema.
+///
+/// Both steps are needed by databases created before the column they add, and
+/// both are no-ops afterwards.
+fn migrate(conn: &Connection) -> Result<()> {
+    // Which agent a thread talks to. Added in the multi-agent release; the
+    // error on an existing column is the common case and is not interesting.
+    conn.execute(
+        "ALTER TABLE threads ADD COLUMN agent TEXT NOT NULL DEFAULT 'claude'",
+        [],
+    )
+    .ok();
+
+    // `session_id` began as NOT NULL, back when switchboard chose the id
+    // itself. Codex assigns its own on the first turn, so a thread now starts
+    // without one — and SQLite cannot drop a NOT NULL in place, which means a
+    // table rebuild rather than an ALTER.
+    if !session_id_is_nullable(conn)? {
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE threads_migrated (
+                 key        TEXT PRIMARY KEY,
+                 session_id TEXT,
+                 cwd        TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 agent      TEXT NOT NULL DEFAULT 'claude'
+             );
+             INSERT INTO threads_migrated (key, session_id, cwd, updated_at, agent)
+                 SELECT key, NULLIF(session_id, ''), cwd, updated_at, agent FROM threads;
+             DROP TABLE threads;
+             ALTER TABLE threads_migrated RENAME TO threads;
+             COMMIT;",
+        )
+        .context("migrating threads.session_id to nullable")?;
+
+        tracing::info!("migrated thread store: session_id is now optional");
+    }
+
+    Ok(())
+}
+
+fn session_id_is_nullable(conn: &Connection) -> Result<bool> {
+    let mut statement = conn.prepare("PRAGMA table_info(threads)")?;
+    let mut rows = statement.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "session_id" {
+            let not_null: i64 = row.get(3)?;
+            return Ok(not_null == 0);
+        }
+    }
+    // No such column: a fresh database, created correctly.
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +235,50 @@ mod tests {
         assert_eq!(read.cwd, "/b");
         assert_eq!(read.session_id.as_deref(), Some("thread-from-codex"));
         assert_eq!(read.agent, "codex");
+    }
+
+    /// The schema switchboard shipped before agents chose their own session id.
+    fn legacy_database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                 key        TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 cwd        TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO threads (key, session_id, cwd, updated_at)
+                 VALUES ('telegram:5', 'old-uuid', '/home/wy/Work', 1);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn an_old_database_accepts_a_thread_with_no_session_id() {
+        let store = Store::from_conn(legacy_database()).unwrap();
+
+        // The row that was already there survives intact.
+        let existing = store.get("telegram:5").unwrap().unwrap();
+        assert_eq!(existing.session_id.as_deref(), Some("old-uuid"));
+        assert_eq!(existing.cwd, "/home/wy/Work");
+        assert_eq!(existing.agent, "claude", "back-filled by the migration");
+
+        // And a new thread, which has no id until its agent assigns one, no
+        // longer trips a NOT NULL constraint.
+        let fresh = store
+            .get_or_create("photon:any;-;+15551234567", "/home/wy/src", "claude")
+            .unwrap();
+        assert_eq!(fresh.session_id, None);
+    }
+
+    #[test]
+    fn migrating_twice_is_harmless() {
+        let conn = legacy_database();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let store = Store::from_conn(conn).unwrap();
+        assert!(store.get("telegram:5").unwrap().is_some());
     }
 
     #[test]
