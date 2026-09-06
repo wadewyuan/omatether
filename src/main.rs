@@ -61,6 +61,13 @@ enum Mode {
         agent: Option<String>,
     },
 
+    /// One-time Photon setup: register your phone and report the line to text.
+    PhotonSetup {
+        /// Your phone number, E.164 (e.g. +15551234567).
+        #[arg(long)]
+        phone: String,
+    },
+
     /// Drive one agent session from this terminal.
     Repl {
         #[arg(long, default_value = ".")]
@@ -96,6 +103,14 @@ async fn main() -> Result<()> {
             photon_sidecar,
             agent,
         } => serve(dir, state, photon_sidecar, agent).await,
+        Mode::PhotonSetup { phone } => {
+            let project_id = std::env::var("SWITCHBOARD_PHOTON_PROJECT_ID")
+                .context("SWITCHBOARD_PHOTON_PROJECT_ID is not set")?;
+            let project_secret = std::env::var("SWITCHBOARD_PHOTON_PROJECT_SECRET")
+                .context("SWITCHBOARD_PHOTON_PROJECT_SECRET is not set")?;
+            crate::channel::photon_setup::run(&project_id, &project_secret, &phone).await
+        }
+
         Mode::Repl {
             dir,
             agent,

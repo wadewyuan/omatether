@@ -29,13 +29,23 @@ new one** — `getUpdates` is exclusive, so sharing a token with another bot mea
 the two steal each other's messages. Get your numeric user id from
 [@userinfobot](https://t.me/userinfobot).
 
-**iMessage (Photon).** Photon is a managed service — no Mac relay. You need a
-project id and secret from [app.photon.codes](https://app.photon.codes/), and
-the sidecar's dependencies:
+**iMessage (Photon).** Photon is a managed service — no Mac relay. Create a
+project at [app.photon.codes](https://app.photon.codes/) and note its id and
+secret, then:
 
 ```bash
 cd vendor/photon-sidecar && npm install
+
+export SWITCHBOARD_PHOTON_PROJECT_ID=... SWITCHBOARD_PHOTON_PROJECT_SECRET=...
+switchboard photon-setup --phone +15551234567
 ```
+
+Credentials alone are not enough. A fresh project knows nothing about you: your
+phone has to be registered as a Spectrum user before inbound messages route
+anywhere, and **the number you text to reach the agent is assigned per user,
+per project** — so a new project means a new number, not whatever an older one
+used. `photon-setup` registers the phone if absent and prints that number. It
+is idempotent; re-run it if the line has not been assigned yet.
 
 Then write `~/.config/switchboard/env`, `chmod 600`:
 

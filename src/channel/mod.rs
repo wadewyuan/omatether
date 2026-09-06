@@ -9,6 +9,7 @@
 //! which world it is in without knowing which channel it is talking to.
 
 pub mod photon;
+pub mod photon_setup;
 pub mod telegram;
 
 use anyhow::Result;
