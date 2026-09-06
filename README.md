@@ -121,30 +121,34 @@ is a bad way to find out.
 |---|---|---|---|---|
 | Structured | `claude` | yes | **yes** | Bidirectional `stream-json`, one long-lived process |
 | Structured | `codex` | yes | no | `codex exec --json`, one process per turn, `resume` for continuity |
-| Detached | the other seven | no | no | `omarchy-agent --inline` in a tmux session |
+| Structured | `pi` | yes | no | `pi -p --mode json`, one process per turn, `--session` for continuity |
+| Detached | the other six | no | no | `omarchy-agent --inline` in a tmux session |
 
-Two honest limits, both the agent's rather than ours:
+Honest limits, all the agent's rather than ours:
 
 * **Codex cannot gate tools.** `codex exec`'s only non-interactive approval mode
   is `--approve-for-me`, which reviews automatically inside a workspace-write
   sandbox. There is no callback to route to a human, so no Allow/Deny appears.
+* **Pi cannot gate tools either.** `pi -p` runs its tools as it decides on them;
+  there is no approval callback in non-interactive mode.
 * **The detached tier does not stream.** Those agents have no structured output,
   so the reply is the tmux session, not a chat message. Switchboard says so and
   gives you the `/attach` line rather than pretending otherwise.
 
 And one that is worth stating plainly rather than reading out of the table:
 
-> **Only `claude` asks you anything.** The detached tier runs each agent with
-> its own auto-approve flags, unsandboxed, and switchboard cannot stop a tool
-> call there — it has no channel to be asked through. The same allowlisted
+> **Only `claude` asks you anything.** Codex, Pi and the detached tier run
+> their tools as they decide on them, unsandboxed, and switchboard cannot stop a
+> tool call there — it has no channel to be asked through. The same allowlisted
 > person who approves every `Bash` on `claude` is one `/agent pi` away from an
 > agent that approves its own. That is a deliberate trade for reaching the
-> other seven agents at all, but it is a real one: `/agent` says so on the way
-> in, and `/help` lists the terms of all three tiers.
+> other agents at all, but it is a real one: `/agent` says so on the way in,
+> and `/help` lists the terms of every tier.
 
 Codex assigns its own conversation id on the first turn and reports it back
-through `AgentEvent::Ready`; Claude takes one we choose. Either way it
-round-trips through the store, so a restart resumes.
+through `AgentEvent::Ready`; Pi does the same in its first `session` frame and
+resumes with `--session <id>`; Claude takes one we choose. Any way it arrives,
+the id round-trips through the store, so a restart resumes.
 
 ### Long replies
 

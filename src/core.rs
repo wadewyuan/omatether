@@ -322,6 +322,8 @@ impl Core {
             Some(agent::Backend::Claude) => {}
             Some(agent::Backend::Codex) => note
                 .push_str("\n\nCodex approves its own tools inside a sandbox — no Allow/Deny here."),
+            Some(agent::Backend::Pi) => note
+                .push_str("\n\nPi runs and approves its own tools — no Allow/Deny here."),
             // The gate is this product's one safety feature, and this tier does
             // not have it. Someone who just approved a Bash call on claude is
             // one command away from an agent that approves its own — that
@@ -347,7 +349,7 @@ impl Core {
             "Take over at a terminal:\n\n  ssh {host} -t tmux attach -t {session}\n\n\
              That session exists only for detached agents ({}). For {} the \
              conversation lives in the agent's own store — resume it with its session id: {}",
-            "pi, omp, opencode, crush, grok, gemini, copilot",
+            "omp, opencode, crush, grok, gemini, copilot",
             state.agent,
             state.session_id.as_deref().unwrap_or("(none yet)")
         );

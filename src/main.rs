@@ -12,6 +12,7 @@ mod command;
 mod core;
 mod event;
 mod outbox;
+mod pi;
 mod render;
 mod store;
 mod tmux;

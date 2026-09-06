@@ -70,7 +70,8 @@ slash commands.
 Not every agent is gated:
   claude       asks you before Bash, Write and Edit
   codex        approves its own tools inside a sandbox
-  everything else (pi, omp, opencode, crush, grok, gemini, copilot)
+  pi           runs and approves its own tools
+  everything else (omp, opencode, crush, grok, gemini, copilot)
                runs detached with its own auto-approve flags, unsandboxed,
                and nothing here can stop a tool call";
 

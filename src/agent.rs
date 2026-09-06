@@ -66,6 +66,8 @@ pub enum Backend {
     Claude,
     /// `codex exec --json`: one process per turn, continuity via `resume`.
     Codex,
+    /// `pi -p --mode json`: one process per turn, continuity via `--session`.
+    Pi,
     /// A detached tmux session. No streaming and no gating, but it works for
     /// every agent Omarchy supports.
     Tmux,
@@ -78,7 +80,7 @@ pub enum Backend {
 pub const AGENTS: &[(&str, Backend)] = &[
     ("claude", Backend::Claude),
     ("codex", Backend::Codex),
-    ("pi", Backend::Tmux),
+    ("pi", Backend::Pi),
     ("omp", Backend::Tmux),
     ("opencode", Backend::Tmux),
     ("crush", Backend::Tmux),
@@ -150,6 +152,14 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
             Ok((Box::new(session), events))
         }
 
+        Backend::Pi => {
+            let (session, events) = crate::pi::PiSession::new(crate::pi::Config {
+                cwd: config.cwd,
+                session_id: config.session_id,
+            });
+            Ok((Box::new(session), events))
+        }
+
         Backend::Tmux => {
             let (session, events) = crate::tmux::TmuxSession::new(crate::tmux::Config {
                 agent: canonical_name(&config.agent).unwrap_or("claude"),
@@ -183,8 +193,10 @@ mod tests {
     #[test]
     fn only_claude_gates_tools_today() {
         assert_eq!(backend_for("claude"), Some(Backend::Claude));
-        // codex exec's only approval mode is automatic.
+        // codex exec's only approval mode is automatic; pi -p runs its tools
+        // as it decides on them. Neither has a callback to route to a human.
         assert_eq!(backend_for("codex"), Some(Backend::Codex));
-        assert_eq!(backend_for("pi"), Some(Backend::Tmux));
+        assert_eq!(backend_for("pi"), Some(Backend::Pi));
+        assert_eq!(backend_for("omp"), Some(Backend::Tmux));
     }
 }
