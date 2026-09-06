@@ -80,12 +80,18 @@ impl Telegram {
                 .and_then(|p| p.get("retry_after"))
                 .and_then(Value::as_u64);
 
-            // 429 is expected traffic on a streaming bridge, not an anomaly —
-            // wait exactly as long as told, then let the caller try again.
+            // 429 is expected traffic on a streaming bridge, not an anomaly.
+            // Report how long Telegram said to wait and let the caller do the
+            // waiting: this used to sleep here, which meant sleeping inside the
+            // core's one loop — every other thread on every other channel
+            // stopped too — and then throwing the message away anyway.
             if let Some(seconds) = retry_after {
-                tracing::warn!("telegram rate limited on {method}, waiting {seconds}s");
-                tokio::time::sleep(Duration::from_secs(seconds + 1)).await;
-                bail!("rate limited on {method}, retry");
+                return Err(super::RateLimited {
+                    // The extra second is Telegram's own advice: retry_after is
+                    // when the window opens, not when it is safe to be early.
+                    retry_after: Duration::from_secs(seconds + 1),
+                }
+                .into());
             }
 
             bail!(

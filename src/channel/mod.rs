@@ -12,8 +12,30 @@ pub mod photon;
 pub mod photon_setup;
 pub mod telegram;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
+
+/// A channel asking to be tried again in a moment.
+///
+/// Reported rather than handled: the adapter knows how long the platform said
+/// to wait, but only the caller knows whether this message is still worth
+/// sending and whose turn is being delayed by the waiting. Waiting inside the
+/// adapter meant waiting inside the core, which stalled every other thread on
+/// every other channel.
+#[derive(Debug, Clone)]
+pub struct RateLimited {
+    pub retry_after: Duration,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rate limited, retry in {}s", self.retry_after.as_secs())
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 /// A message id as the channel understands it, kept as a string so seam A does
 /// not inherit Telegram's i64 or Photon's opaque handle.

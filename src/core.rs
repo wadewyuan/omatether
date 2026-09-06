@@ -17,6 +17,7 @@ use crate::agent::{self, Agent};
 use crate::channel::{Channel, Inbound, InboundKind, ThreadKey};
 use crate::command::{self, Command};
 use crate::event::{AgentEvent, Decision};
+use crate::outbox::{OutJob, Outbox};
 use crate::render::TurnRenderer;
 use crate::store::Store;
 
@@ -60,9 +61,12 @@ struct Thread {
 struct PendingPermission {
     request_id: String,
     tool: String,
-    message_id: String,
     /// Identifies this question to the channel, so a tap can be matched to the
     /// question it was asked under rather than to whatever is pending now.
+    ///
+    /// Which *message* carries it is the outbox's business: settling the
+    /// question is a job, not something the core waits for an id to be able to
+    /// do.
     question: String,
 }
 
@@ -75,6 +79,10 @@ pub struct Core {
     /// Every channel this instance serves, keyed by the name it puts in a
     /// [`ThreadKey`]. The core never names a concrete channel.
     channels: HashMap<&'static str, Arc<dyn Channel>>,
+    /// One outbound task per thread. Kept separately from `threads` because
+    /// they outlive sessions: `/new` and `/cd` end a session and still have
+    /// something to say about it.
+    outboxes: HashMap<ThreadKey, Outbox>,
     default_cwd: PathBuf,
     threads: HashMap<ThreadKey, Thread>,
     agent_tx: mpsc::Sender<(ThreadKey, AgentEvent)>,
@@ -95,6 +103,7 @@ impl Core {
             spill_dir,
             default_agent,
             channels: channels.into_iter().map(|c| (c.name(), c)).collect(),
+            outboxes: HashMap::new(),
             default_cwd,
             threads: HashMap::new(),
             agent_tx,
@@ -121,9 +130,7 @@ impl Core {
                 }
 
                 _ = ticker.tick() => {
-                    if let Err(e) = self.flush_all().await {
-                        tracing::error!("flushing: {e:#}");
-                    }
+                    self.flush_all();
                 }
 
                 else => break,
@@ -161,7 +168,7 @@ impl Core {
                     .await
             }
             InboundKind::Text(text) => match command::parse(&text) {
-                Command::Help => self.say(&message.thread, command::HELP).await,
+                Command::Help => self.say(&message.thread, command::HELP),
                 Command::New => self.on_new(&message.thread).await,
                 Command::Stop => self.on_stop(&message.thread).await,
                 Command::Status => self.on_status(&message.thread).await,
@@ -185,17 +192,22 @@ impl Core {
         // queueing, and far simpler than interleaving.
         if let Err(e) = thread.session.prompt(text).await {
             let note = format!("Busy — {e}. Send /stop to interrupt.");
-            return self.say(key, &note).await;
+            return self.say(key, &note);
         }
 
         thread.renderer.reset();
 
+        // A new turn grows a new message rather than continuing the last one's.
+        self.queue(key, OutJob::NewTurn);
+
         // Where the reply cannot arrive progressively, this is the only sign
         // anything is happening.
-        if let Some(channel) = self.channel(key) {
-            if !channel.can_edit() {
-                channel.typing(key).await.ok();
-            }
+        let can_edit = self
+            .channel(key)
+            .map(|channel| channel.can_edit())
+            .unwrap_or(false);
+        if !can_edit {
+            self.queue(key, OutJob::Typing);
         }
         Ok(())
     }
@@ -212,7 +224,6 @@ impl Core {
         self.store.put(&state)?;
 
         self.say(key, &format!("New {} session in {}.", state.agent, state.cwd))
-            .await
     }
 
     async fn on_stop(&mut self, key: &ThreadKey) -> Result<()> {
@@ -221,9 +232,9 @@ impl Core {
                 thread.session.cancel().await?;
                 thread.renderer.reset();
                 thread.pending = None;
-                self.say(key, "Stopped.").await
+                self.say(key, "Stopped.")
             }
-            None => self.say(key, "Nothing running.").await,
+            None => self.say(key, "Nothing running."),
         }
     }
 
@@ -249,18 +260,18 @@ impl Core {
         if let Some(tool) = awaiting {
             note.push_str(&format!("\nwaiting  decision on {tool}"));
         }
-        self.say(key, &note).await
+        self.say(key, &note)
     }
 
     async fn on_cd(&mut self, key: &ThreadKey, path: &str) -> Result<()> {
         if path.is_empty() {
-            return self.say(key, "Usage: /cd <path>").await;
+            return self.say(key, "Usage: /cd <path>");
         }
 
         let expanded = expand_home(path);
         if !expanded.is_dir() {
             let note = format!("Not a directory: {}", expanded.display());
-            return self.say(key, &note).await;
+            return self.say(key, &note);
         }
 
         // The working directory is fixed when the agent process starts, so
@@ -276,7 +287,7 @@ impl Core {
         self.store.put(&state)?;
 
         let note = format!("Working in {}. New session.", state.cwd);
-        self.say(key, &note).await
+        self.say(key, &note)
     }
 
     /// Switch agents. Each has its own conversation, so this starts a fresh
@@ -286,13 +297,13 @@ impl Core {
             let state = self.state(key)?;
             let known: Vec<&str> = agent::AGENTS.iter().map(|(n, _)| *n).collect();
             let note = format!("Using {}. Available: {}", state.agent, known.join(", "));
-            return self.say(key, &note).await;
+            return self.say(key, &note);
         }
 
         if agent::backend_for(name).is_none() {
             let known: Vec<&str> = agent::AGENTS.iter().map(|(n, _)| *n).collect();
             let note = format!("Unknown agent '{name}'. Try: {}", known.join(", "));
-            return self.say(key, &note).await;
+            return self.say(key, &note);
         }
 
         if let Some(mut thread) = self.threads.remove(key) {
@@ -324,7 +335,7 @@ impl Core {
             ),
             None => {}
         }
-        self.say(key, &note).await
+        self.say(key, &note)
     }
 
     async fn on_attach(&mut self, key: &ThreadKey) -> Result<()> {
@@ -340,7 +351,7 @@ impl Core {
             state.agent,
             state.session_id.as_deref().unwrap_or("(none yet)")
         );
-        self.say(key, &note).await
+        self.say(key, &note)
     }
 
     /// A button tap. Unlike `/allow` typed as text, this names the question it
@@ -362,19 +373,21 @@ impl Core {
             .is_some_and(|pending| pending.question == question);
 
         if !answers_the_open_question {
-            if let Some(channel) = self.channel(key) {
-                channel.ack_decision(ack, "That question has moved on").await.ok();
-            }
+            self.queue(
+                key,
+                OutJob::Ack {
+                    ack: ack.to_string(),
+                    note: "That question has moved on".to_string(),
+                },
+            );
             // Say which way it went, because from the chat it looks like the
             // tap did nothing: the buttons are still there under a question
             // that is no longer the one being asked.
-            return self
-                .say(
-                    key,
-                    "That was a button from an earlier question — it was not \
-                     applied. Scroll down for the current one, if there is one.",
-                )
-                .await;
+            return self.say(
+                key,
+                "That was a button from an earlier question — it was not \
+                 applied. Scroll down for the current one, if there is one.",
+            );
         }
 
         let decision = if allow {
@@ -395,10 +408,16 @@ impl Core {
         let pending = match self.threads.get_mut(key).and_then(|t| t.pending.take()) {
             Some(pending) => pending,
             None => {
-                if let (Some(token), Some(channel)) = (token, self.channel(key)) {
-                    channel.ack_decision(token, "Nothing pending").await.ok();
+                if let Some(token) = token {
+                    self.queue(
+                        key,
+                        OutJob::Ack {
+                            ack: token.to_string(),
+                            note: "Nothing pending".to_string(),
+                        },
+                    );
                 }
-                return self.say(key, "Nothing waiting for a decision.").await;
+                return self.say(key, "Nothing waiting for a decision.");
             }
         };
 
@@ -407,26 +426,23 @@ impl Core {
         let thread = self.threads.get_mut(key).expect("pending implies a thread");
         thread.session.decide(&pending.request_id, decision).await?;
 
+        // What was decided, on what, by whom, and when — the audit line for a
+        // service whose whole purpose is running shell commands from a chat.
         let verdict = if allowed { "Allowed" } else { "Denied" };
+        tracing::info!(
+            thread = %key,
+            tool = %pending.tool,
+            by = if token.is_some() { "button" } else { "command" },
+            "{verdict}"
+        );
 
-        let channel = match self.channel(key) {
-            Some(channel) => channel.clone(),
-            None => return Ok(()),
-        };
-
-        if let Some(token) = token {
-            channel.ack_decision(token, verdict).await.ok();
-        }
-
-        // Where messages can be rewritten, retire the buttons and record the
-        // outcome in place. Where they cannot, say it in a new message —
-        // otherwise a tap looks like it did nothing.
-        let settled = format!("{} {}", verdict, pending.tool);
-        if channel.can_edit() {
-            channel.edit(key, &pending.message_id, &settled).await.ok();
-        } else {
-            channel.send(key, &settled).await.ok();
-        }
+        self.queue(
+            key,
+            OutJob::Settle {
+                verdict: format!("{} {}", verdict, pending.tool),
+                ack: token.map(str::to_string),
+            },
+        );
 
         Ok(())
     }
@@ -455,7 +471,7 @@ impl Core {
                 let worst = five_hour.unwrap_or(0.0).max(seven_day.unwrap_or(0.0));
                 if worst > 0.9 {
                     let note = format!("Heads up: {:.0}% of a usage window used.", worst * 100.0);
-                    return self.say(key, &note).await;
+                    return self.say(key, &note);
                 }
                 return Ok(());
             }
@@ -490,7 +506,7 @@ impl Core {
         // A finished turn is flushed immediately rather than waiting out the
         // debounce — the last word should not arrive a second and a half late.
         if finished {
-            self.flush(key).await?;
+            self.flush(key);
             if let Some(thread) = self.threads.get_mut(key) {
                 thread.renderer.reset();
             }
@@ -515,22 +531,37 @@ impl Core {
         }
 
         // Show the pending work before asking, so the question has context.
-        self.flush(key).await?;
-
-        let channel = match self.channel(key) {
-            Some(channel) => channel.clone(),
-            None => return Ok(()),
-        };
+        // Queued ahead of the question, and the outbox keeps that order.
+        self.flush(key);
 
         let text = self.permission_question(key, &tool, &input);
         let question = question_token();
-        let message_id = channel.ask_permission(key, &text, &question).await?;
+        if !self.queue(
+            key,
+            OutJob::Ask {
+                text,
+                question: question.clone(),
+            },
+        ) {
+            // The question could not even be queued, so nobody will ever be
+            // asked. Denying is the only honest answer: the alternative is a
+            // turn blocked forever on a prompt that was never posted.
+            if let Some(thread) = self.threads.get_mut(key) {
+                thread
+                    .session
+                    .decide(
+                        &request_id,
+                        Decision::deny("switchboard could not deliver the question to the chat"),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
 
         if let Some(thread) = self.threads.get_mut(key) {
             thread.pending = Some(PendingPermission {
                 request_id,
                 tool,
-                message_id,
                 question,
             });
         }
@@ -591,12 +622,32 @@ impl Core {
         self.channels.get(key.channel)
     }
 
-    async fn flush_all(&mut self) -> Result<()> {
+    /// This thread's outbound task, started on first use.
+    ///
+    /// Everything the core says goes through here rather than being awaited
+    /// inline, so no chat's latency or rate limit is any other chat's problem.
+    fn outbox(&mut self, key: &ThreadKey) -> Option<&Outbox> {
+        if !self.outboxes.contains_key(key) {
+            let channel = self.channels.get(key.channel)?.clone();
+            self.outboxes
+                .insert(key.clone(), Outbox::spawn(key.clone(), channel));
+        }
+        self.outboxes.get(key)
+    }
+
+    /// Queue one piece of outbound work, if the thread's channel still exists.
+    fn queue(&mut self, key: &ThreadKey, job: OutJob) -> bool {
+        match self.outbox(key) {
+            Some(outbox) => outbox.queue(job),
+            None => false,
+        }
+    }
+
+    fn flush_all(&mut self) {
         let keys: Vec<ThreadKey> = self.threads.keys().cloned().collect();
         for key in keys {
-            self.flush(&key).await?;
+            self.flush(&key);
         }
-        Ok(())
     }
 
     /// Push a thread's pending text.
@@ -605,42 +656,44 @@ impl Core {
     /// one that cannot — iMessage — mid-turn flushes are skipped entirely and
     /// the turn arrives as a single finished message, because the alternative
     /// is a stream of fragments nobody wants to read on a phone.
-    async fn flush(&mut self, key: &ThreadKey) -> Result<()> {
-        let channel = match self.channel(key) {
-            Some(channel) => channel.clone(),
-            None => return Ok(()),
+    /// Handing the text over cannot fail slowly: the outbox takes it or says it
+    /// is full, and either way the core moves on to the next thread.
+    fn flush(&mut self, key: &ThreadKey) {
+        let can_edit = match self.channel(key) {
+            Some(channel) => channel.can_edit(),
+            None => return,
         };
 
-        let (text, message_id) = match self.threads.get_mut(key) {
+        let text = match self.threads.get(key) {
             Some(thread) => {
                 // Two reasons to hold a turn back until it is done: a channel
                 // that cannot rewrite a message, and an agent that produces
                 // nothing worth showing until the end. Either makes a mid-turn
                 // flush a wasted message.
-                let deliver_whole = !channel.can_edit() || !thread.session.streams();
+                let deliver_whole = !can_edit || !thread.session.streams();
                 if deliver_whole && !thread.renderer.is_finished() {
-                    return Ok(());
+                    return;
                 }
-                match thread.renderer.take_pending() {
-                    Some(text) => (text, thread.renderer.message_id.clone()),
-                    None => return Ok(()),
+                match thread.renderer.pending() {
+                    Some(text) => text,
+                    None => return,
                 }
             }
-            None => return Ok(()),
+            None => return,
         };
 
-        let text = self.spill_if_long(key, text);
+        // Spilling rewrites the message into a pointer, but what the renderer
+        // has to remember is the text it composed: comparing next time against
+        // the pointer would make every tick look like a change and re-send the
+        // whole turn.
+        let payload = self.spill_if_long(key, text.clone());
 
-        match message_id {
-            Some(id) => channel.edit(key, &id, &text).await?,
-            None => {
-                let id = channel.send(key, &text).await?;
-                if let Some(thread) = self.threads.get_mut(key) {
-                    thread.renderer.message_id = Some(id);
-                }
+        // Only once it has been accepted for delivery is it no longer owed.
+        if self.queue(key, OutJob::Turn(payload)) {
+            if let Some(thread) = self.threads.get_mut(key) {
+                thread.renderer.mark_sent(text);
             }
         }
-        Ok(())
     }
 
     /// Write an over-long reply to a file and hand back a pointer to it.
@@ -713,10 +766,8 @@ impl Core {
     }
 
     /// Post a standalone note, outside any turn's message.
-    async fn say(&self, key: &ThreadKey, text: &str) -> Result<()> {
-        if let Some(channel) = self.channel(key) {
-            channel.send(key, text).await?;
-        }
+    fn say(&mut self, key: &ThreadKey, text: &str) -> Result<()> {
+        self.queue(key, OutJob::Say(text.to_string()));
         Ok(())
     }
 
@@ -839,13 +890,13 @@ mod tests {
     }
 
     /// A `Core` with a scratch spill directory, for the tests that write one.
-    fn core_with_spill_dir(dir: &PathBuf) -> Core {
+    fn core_with_spill_dir(dir: &std::path::Path) -> Core {
         Core::new(
             Store::in_memory().unwrap(),
             Vec::new(),
             PathBuf::from("/tmp"),
             "claude".into(),
-            dir.clone(),
+            dir.to_path_buf(),
         )
     }
 
@@ -940,6 +991,121 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "the first");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "the second");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Counts what reached the chat, so a test can tell one message from ten.
+    struct CountingChannel {
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for CountingChannel {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn can_edit(&self) -> bool {
+            true
+        }
+        async fn send(&self, _t: &ThreadKey, text: &str) -> Result<String> {
+            let mut sent = self.sent.lock().unwrap();
+            sent.push(text.to_string());
+            Ok(format!("m{}", sent.len()))
+        }
+        async fn edit(&self, _t: &ThreadKey, _id: &String, text: &str) -> Result<()> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+        async fn ask_permission(&self, t: &ThreadKey, text: &str, _q: &str) -> Result<String> {
+            self.send(t, text).await
+        }
+    }
+
+    /// An agent that runs no process. Enough for the core to have a session.
+    struct StubAgent;
+
+    #[async_trait::async_trait]
+    impl Agent for StubAgent {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        fn gates_tools(&self) -> bool {
+            true
+        }
+        fn streams(&self) -> bool {
+            true
+        }
+        fn is_busy(&self) -> bool {
+            false
+        }
+        async fn prompt(&mut self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn cancel(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_turn_is_not_re_sent_on_every_tick() {
+        // Spilling rewrites a long reply into a pointer before it goes out. If
+        // what the renderer remembers is that pointer rather than the text it
+        // composed, every tick compares unequal, and the thread gets the whole
+        // turn again every 1.5 seconds — on someone's phone. Verified to fail
+        // when that mistake is reintroduced.
+        let dir = std::env::temp_dir().join(format!("sb-tick-{}", std::process::id()));
+        let channel = Arc::new(CountingChannel {
+            sent: std::sync::Mutex::new(Vec::new()),
+        });
+        let key = ThreadKey {
+            channel: "fake",
+            chat_id: "1".into(),
+            topic_id: None,
+        };
+
+        let mut core = Core::new(
+            Store::in_memory().unwrap(),
+            vec![channel.clone()],
+            PathBuf::from("/tmp"),
+            "claude".into(),
+            dir.clone(),
+        );
+
+        let mut renderer = TurnRenderer::new();
+        renderer.apply(&AgentEvent::Text {
+            text: "x".repeat(SPILL_THRESHOLD + 500),
+        });
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent),
+                renderer,
+                pending: None,
+            },
+        );
+
+        // The flush the turn earns, then four ticks that changed nothing.
+        for _ in 0..5 {
+            core.flush(&key);
+        }
+
+        // Let the outbox drain.
+        for _ in 0..100 {
+            if !channel.sent.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            channel.sent.lock().unwrap().len(),
+            1,
+            "an unchanged turn must cost exactly one message"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
