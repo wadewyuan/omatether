@@ -162,11 +162,11 @@ pub async fn run(project_id: &str, project_secret: &str, phone: &str) -> Result<
             println!("line     {line}");
             println!();
             println!("Text {line} from {phone} to reach the agent.");
-            println!("Then add to ~/.config/switchboard/env:");
+            println!("Then add to ~/.config/omatether/env:");
             println!();
-            println!("  SWITCHBOARD_PHOTON_PROJECT_ID={project_id}");
-            println!("  SWITCHBOARD_PHOTON_PROJECT_SECRET=...");
-            println!("  SWITCHBOARD_PHOTON_ALLOWED_USERS={phone}");
+            println!("  OMATETHER_PHOTON_PROJECT_ID={project_id}");
+            println!("  OMATETHER_PHOTON_PROJECT_SECRET=...");
+            println!("  OMATETHER_PHOTON_ALLOWED_USERS={phone}");
         }
         None => {
             println!("line     (not assigned yet)");

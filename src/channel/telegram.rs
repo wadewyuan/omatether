@@ -47,7 +47,7 @@ pub struct Telegram {
 impl Telegram {
     pub fn new(token: &str, allowed_users: Vec<String>) -> Result<Self> {
         if allowed_users.is_empty() {
-            bail!("refusing to start with an empty allowlist — set SWITCHBOARD_TELEGRAM_ALLOWED_USERS");
+            bail!("refusing to start with an empty allowlist — set OMATETHER_TELEGRAM_ALLOWED_USERS");
         }
 
         let http = reqwest::Client::builder()

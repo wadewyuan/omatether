@@ -73,7 +73,7 @@ pub enum Backend {
     Tmux,
 }
 
-/// Every agent Omarchy knows about, and how switchboard drives it.
+/// Every agent Omarchy knows about, and how omatether drives it.
 ///
 /// The list mirrors `omarchy-default-agent` so that `/agent <name>` accepts
 /// whatever the desktop accepts.

@@ -1,4 +1,4 @@
-# Switchboard — brutal code review
+# Omatether — brutal code review
 
 Scope: architecture, multi-channel support, abstraction, extensibility, security.
 Verdict first, evidence after. Tests pass (62), the code is readable, and the
@@ -236,7 +236,7 @@ are right. Now the buts, roughly in order of how much I'd worry:
 For claude, a phone user approves every `Bash`/`Write`/`Edit`. For the seven
 tmux-tier agents, the agent "runs with its own auto-approve flags"
 (`tmux.rs`) — i.e. **unsandboxed, self-approving, unaudited** — and
-switchboard hands the phone a `tmux attach` line. The same allowlisted user
+omatether hands the phone a `tmux attach` line. The same allowlisted user
 who gets a permission prompt on `/agent claude` gets a free remote root shell
 on `/agent pi`, in the same thread, one command apart. `/agent` *mentions*
 "no Allow/Deny" for codex; the tmux note says "does not stream" but not
@@ -270,13 +270,13 @@ this.
 ### 4.4 Spill files leak and accumulate (medium)
 
 `spill_if_long` writes agent output — which routinely contains secrets,
-tokens, and file contents — to `~/.local/state/switchboard/out/` with the
+tokens, and file contents — to `~/.local/state/omatether/out/` with the
 process umask (typically 0644, world-readable on a multi-user box) and never
 deletes it. The README pitches this as the answer to long output. Set 0600
 explicitly, and either expire files (mtime sweep on startup) or state plainly
 that out/ is a permanent transcript. Also the suggested reader is
 `ssh host -t 'cat …'` — which will mangle anything with quotes/backslashes
-and assumes tailnet ssh; a `switchboard read <file>` subcommand would be both
+and assumes tailnet ssh; an `omatether read <file>` subcommand would be both
 safer and correct.
 
 ### 4.5 Token in error chains (low)
@@ -292,7 +292,7 @@ instead of an in-URL credential. Same class of leak: `start_telegram` logs
 ### 4.6 `/cd` path handling (low)
 
 `expand_home` handles `~/` but not a bare `~`; relative paths resolve against
-switchboard's cwd, not the thread's current cwd (surprising); and nothing
+omatether's cwd, not the thread's current cwd (surprising); and nothing
 prevents `/cd /etc` — the agent then runs in `/etc` with the phone user's
 full environment. That's by design ("explicit state") but there's no
 allowlist on *directories*, only on people. One wrong paste of `/cd /` from a

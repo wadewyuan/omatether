@@ -1,5 +1,5 @@
 [package]
-name = "switchboard"
+name = "omatether"
 version = "0.1.0"
 edition = "2021"
 description = "Bridge between messaging channels and the Omarchy default coding agent"

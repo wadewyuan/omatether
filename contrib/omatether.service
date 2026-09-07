@@ -1,5 +1,5 @@
 [Unit]
-Description=switchboard - coding agent over chat
+Description=omatether - coding agent over chat
 # Long polling needs working DNS at start, not just a configured interface.
 After=network-online.target
 Wants=network-online.target
@@ -13,13 +13,13 @@ Type=simple
 Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin
 
 # Channel credentials. At least one channel must be configured:
-#   SWITCHBOARD_TELEGRAM_TOKEN, SWITCHBOARD_TELEGRAM_ALLOWED_USERS
-#   SWITCHBOARD_PHOTON_PROJECT_ID, SWITCHBOARD_PHOTON_PROJECT_SECRET,
-#   SWITCHBOARD_PHOTON_ALLOWED_USERS
+#   OMATETHER_TELEGRAM_TOKEN, OMATETHER_TELEGRAM_ALLOWED_USERS
+#   OMATETHER_PHOTON_PROJECT_ID, OMATETHER_PHOTON_PROJECT_SECRET,
+#   OMATETHER_PHOTON_ALLOWED_USERS
 # chmod 600 - these are a shell on this machine.
-EnvironmentFile=%h/.config/switchboard/env
+EnvironmentFile=%h/.config/omatether/env
 
-ExecStart=%h/src/switchboard/target/release/switchboard serve --dir %h/src
+ExecStart=%h/src/omatether/target/release/omatether serve --dir %h/src
 
 Restart=on-failure
 RestartSec=5

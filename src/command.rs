@@ -1,6 +1,6 @@
 //! Slash commands.
 //!
-//! Two kinds live in the same namespace: switchboard's own commands, which the
+//! Two kinds live in the same namespace: omatether's own commands, which the
 //! agent could never provide, and everything else, which is passed through
 //! untouched. Many Claude Code slash commands are prompt expansions, so
 //! `/review` reaching the agent verbatim does the right thing.
@@ -53,7 +53,7 @@ pub fn parse(text: &str) -> Command {
 }
 
 pub const HELP: &str = "\
-switchboard — your coding agent, over chat
+omatether — your coding agent, over chat
 
 /new           start a fresh session in this thread
 /stop          interrupt the running turn
@@ -80,7 +80,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn switchboard_commands_are_recognized() {
+    fn omatether_commands_are_recognized() {
         assert_eq!(parse("/new"), Command::New);
         assert_eq!(parse("  /stop  "), Command::Stop);
         assert_eq!(parse("/status"), Command::Status);
@@ -94,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_and_attach_are_switchboard_commands() {
+    fn agent_and_attach_are_omatether_commands() {
         assert_eq!(parse("/agent codex"), Command::Agent("codex".into()));
         assert_eq!(parse("/attach"), Command::Attach);
         assert_eq!(parse("/agent"), Command::Agent(String::new()));

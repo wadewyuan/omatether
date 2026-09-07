@@ -1,4 +1,4 @@
-//! switchboard — your coding agent, reachable from a chat thread.
+//! omatether — your coding agent, reachable from a chat thread.
 //!
 //! `serve` runs the bridge. `repl` is the milestone-1 instrument: the same
 //! agent driver with a terminal on the front, useful for watching the wire
@@ -34,7 +34,7 @@ use crate::event::{AgentEvent, Decision};
 use crate::store::Store;
 
 #[derive(Parser, Debug)]
-#[command(name = "switchboard", about = "Your coding agent, over chat")]
+#[command(name = "omatether", about = "Your coding agent, over chat")]
 struct Args {
     #[command(subcommand)]
     command: Mode,
@@ -48,7 +48,7 @@ enum Mode {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
 
-        /// State database. Defaults to $XDG_STATE_HOME/switchboard/state.db.
+        /// State database. Defaults to $XDG_STATE_HOME/omatether/state.db.
         #[arg(long)]
         state: Option<PathBuf>,
 
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "switchboard=info".into()),
+                .unwrap_or_else(|_| "omatether=info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -106,10 +106,10 @@ async fn main() -> Result<()> {
             agent,
         } => serve(dir, state, photon_sidecar, agent).await,
         Mode::PhotonSetup { phone } => {
-            let project_id = std::env::var("SWITCHBOARD_PHOTON_PROJECT_ID")
-                .context("SWITCHBOARD_PHOTON_PROJECT_ID is not set")?;
-            let project_secret = std::env::var("SWITCHBOARD_PHOTON_PROJECT_SECRET")
-                .context("SWITCHBOARD_PHOTON_PROJECT_SECRET is not set")?;
+            let project_id = std::env::var("OMATETHER_PHOTON_PROJECT_ID")
+                .context("OMATETHER_PHOTON_PROJECT_ID is not set")?;
+            let project_secret = std::env::var("OMATETHER_PHOTON_PROJECT_SECRET")
+                .context("OMATETHER_PHOTON_PROJECT_SECRET is not set")?;
             crate::channel::photon_setup::run(&project_id, &project_secret, &phone).await
         }
 
@@ -155,9 +155,9 @@ async fn serve(
 
     if channels.is_empty() {
         bail!(
-            "no channels configured. Set SWITCHBOARD_TELEGRAM_TOKEN (with \
-             SWITCHBOARD_TELEGRAM_ALLOWED_USERS), or SWITCHBOARD_PHOTON_PROJECT_ID \
-             (with _SECRET and SWITCHBOARD_PHOTON_ALLOWED_USERS), or both."
+            "no channels configured. Set OMATETHER_TELEGRAM_TOKEN (with \
+             OMATETHER_TELEGRAM_ALLOWED_USERS), or OMATETHER_PHOTON_PROJECT_ID \
+             (with _SECRET and OMATETHER_PHOTON_ALLOWED_USERS), or both."
         );
     }
 
@@ -195,13 +195,13 @@ fn omarchy_default_agent() -> String {
 
 /// Telegram is configured when a token is present; absent is not an error.
 async fn start_telegram() -> Result<Option<Arc<Telegram>>> {
-    let token = match std::env::var("SWITCHBOARD_TELEGRAM_TOKEN") {
+    let token = match std::env::var("OMATETHER_TELEGRAM_TOKEN") {
         Ok(token) => token,
         Err(_) => return Ok(None),
     };
 
-    let allowed = allowlist("SWITCHBOARD_TELEGRAM_ALLOWED_USERS").context(
-        "SWITCHBOARD_TELEGRAM_ALLOWED_USERS is not set. A bot token in a chat is \
+    let allowed = allowlist("OMATETHER_TELEGRAM_ALLOWED_USERS").context(
+        "OMATETHER_TELEGRAM_ALLOWED_USERS is not set. A bot token in a chat is \
          a shell on this machine — list the Telegram user ids allowed to use it, \
          comma separated.",
     )?;
@@ -218,21 +218,21 @@ async fn start_telegram() -> Result<Option<Arc<Telegram>>> {
 
 /// Photon is configured when a project id is present.
 async fn start_photon(sidecar: Option<PathBuf>) -> Result<Option<Arc<Photon>>> {
-    let project_id = match std::env::var("SWITCHBOARD_PHOTON_PROJECT_ID") {
+    let project_id = match std::env::var("OMATETHER_PHOTON_PROJECT_ID") {
         Ok(id) => id,
         Err(_) => return Ok(None),
     };
 
-    let project_secret = std::env::var("SWITCHBOARD_PHOTON_PROJECT_SECRET")
-        .context("SWITCHBOARD_PHOTON_PROJECT_SECRET is not set")?;
+    let project_secret = std::env::var("OMATETHER_PHOTON_PROJECT_SECRET")
+        .context("OMATETHER_PHOTON_PROJECT_SECRET is not set")?;
 
-    let allowed = allowlist("SWITCHBOARD_PHOTON_ALLOWED_USERS").context(
-        "SWITCHBOARD_PHOTON_ALLOWED_USERS is not set — list the phone numbers \
+    let allowed = allowlist("OMATETHER_PHOTON_ALLOWED_USERS").context(
+        "OMATETHER_PHOTON_ALLOWED_USERS is not set — list the phone numbers \
          allowed to message this bridge, comma separated.",
     )?;
 
     // Zero means "ask the OS". Only pin a port if you have a reason to.
-    let port: u16 = std::env::var("SWITCHBOARD_PHOTON_PORT")
+    let port: u16 = std::env::var("OMATETHER_PHOTON_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
@@ -289,7 +289,7 @@ fn default_state_path() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("switchboard/state.db")
+    base.join("omatether/state.db")
 }
 
 // ---- repl --------------------------------------------------------------
@@ -339,7 +339,7 @@ async fn repl(
     let mut streamed = false;
 
     // A prompt given on the command line with stdin closed should still run to
-    // completion — `switchboard repl <prompt> < /dev/null` is a one-shot, not a
+    // completion — `omatether repl <prompt> < /dev/null` is a one-shot, not a
     // request to abandon the turn the moment there is nothing left to read.
     let mut input_open = true;
     let mut turn_running = prompt.is_some();

@@ -333,7 +333,7 @@ fn item_events(item: &Value) -> Vec<AgentEvent> {
 async fn log_stderr(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "switchboard::codex", "{line}");
+        tracing::info!(target: "omatether::codex", "{line}");
     }
 }
 

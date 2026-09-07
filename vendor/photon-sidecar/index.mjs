@@ -1,13 +1,13 @@
 // Photon (iMessage) sidecar.
 //
 // Photon's Spectrum SDK is TypeScript only, so the send path cannot live in the
-// Rust core. This process owns the SDK and exposes the two things switchboard
+// Rust core. This process owns the SDK and exposes the two things omatether
 // needs over loopback HTTP:
 //
 //   GET  /inbound  -> NDJSON stream, one normalized inbound message per line
 //   POST /send     -> { spaceId, text } -> { ok, messageId }
 //
-// Both require `X-Switchboard-Token`. It binds to 127.0.0.1 only; nothing here
+// Both require `X-Omatether-Token`. It binds to 127.0.0.1 only; nothing here
 // is safe to expose.
 //
 // The SDK usage below (Spectrum construction, the `app.messages` async
@@ -95,7 +95,7 @@ function normalize(space, message) {
 }
 
 // The SDK's stream can end or error without being fatal. Re-subscribe with
-// capped backoff rather than dying; switchboard dedupes on messageId, so a
+// capped backoff rather than dying; omatether dedupes on messageId, so a
 // catch-up replay is harmless.
 (async () => {
   let backoff = 1000;
@@ -172,7 +172,7 @@ async function readJson(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.headers["x-switchboard-token"] !== token) {
+  if (req.headers["x-omatether-token"] !== token) {
     return reply(res, 401, { ok: false, error: "unauthorized" });
   }
 
@@ -224,7 +224,7 @@ server.on("error", (e) => {
   if (e?.code === "EADDRINUSE") {
     console.error(
       `photon-sidecar: 127.0.0.1:${port} is already in use — another sidecar ` +
-        "(Hermes runs one too) is on that port. Set SWITCHBOARD_PHOTON_PORT, " +
+        "(Hermes runs one too) is on that port. Set OMATETHER_PHOTON_PORT, " +
         "or leave it unset to be given a free one."
     );
   } else {

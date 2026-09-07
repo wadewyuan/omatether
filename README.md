@@ -1,4 +1,4 @@
-# Switchboard
+# omatether
 
 Bridge between messaging channels and the coding agent already installed in
 your repo. Text it from a phone; it runs Claude Code (or Codex, or whichever
@@ -16,8 +16,8 @@ supports, over one core. Text either one, the agent runs in your working tree,
 and the reply comes back to the thread it came from.
 
 ```bash
-switchboard serve --dir ~/src     # the bridge
-switchboard repl  --dir .         # one session, driven from this terminal
+omatether serve --dir ~/src     # the bridge
+omatether repl  --dir .         # one session, driven from this terminal
 ```
 
 ### Setup
@@ -36,8 +36,8 @@ secret, then:
 ```bash
 cd vendor/photon-sidecar && npm install
 
-export SWITCHBOARD_PHOTON_PROJECT_ID=... SWITCHBOARD_PHOTON_PROJECT_SECRET=...
-switchboard photon-setup --phone <your phone, E.164>
+export OMATETHER_PHOTON_PROJECT_ID=... OMATETHER_PHOTON_PROJECT_SECRET=...
+omatether photon-setup --phone <your phone, E.164>
 ```
 
 Credentials alone are not enough. A fresh project knows nothing about you: your
@@ -47,23 +47,23 @@ per project** — so a new project means a new number, not whatever an older one
 used. `photon-setup` registers the phone if absent and prints that number. It
 is idempotent; re-run it if the line has not been assigned yet.
 
-Then write `~/.config/switchboard/env`, `chmod 600`:
+Then write `~/.config/omatether/env`, `chmod 600`:
 
 ```
-SWITCHBOARD_TELEGRAM_TOKEN=123456:AA...
-SWITCHBOARD_TELEGRAM_ALLOWED_USERS=<your telegram user id>
+OMATETHER_TELEGRAM_TOKEN=123456:AA...
+OMATETHER_TELEGRAM_ALLOWED_USERS=<your telegram user id>
 
-SWITCHBOARD_PHOTON_PROJECT_ID=...
-SWITCHBOARD_PHOTON_PROJECT_SECRET=...
-SWITCHBOARD_PHOTON_ALLOWED_USERS=<your phone, E.164>
+OMATETHER_PHOTON_PROJECT_ID=...
+OMATETHER_PHOTON_PROJECT_SECRET=...
+OMATETHER_PHOTON_ALLOWED_USERS=<your phone, E.164>
 ```
 
 Install the service:
 
    ```bash
    cargo build --release
-   cp contrib/switchboard.service ~/.config/systemd/user/
-   systemctl --user enable --now switchboard
+   cp contrib/omatether.service ~/.config/systemd/user/
+   systemctl --user enable --now omatether
    ```
 
 The service needs no inbound port. Telegram long-polling reaches out rather
@@ -108,7 +108,7 @@ whole is the only readable option.
 Not every tool asks. Gating all of them is unusable from a phone — the agent
 reads a dozen files before doing anything consequential, and a prompt per read
 trains you to tap Allow without looking. Only `Bash`, `Write`, `Edit` and
-`NotebookEdit` ask; the rest are approved by switchboard itself
+`NotebookEdit` ask; the rest are approved by omatether itself
 (`GATED_TOOLS` in `src/core.rs`).
 
 ### Agents
@@ -132,13 +132,13 @@ Honest limits, all the agent's rather than ours:
 * **Pi cannot gate tools either.** `pi -p` runs its tools as it decides on them;
   there is no approval callback in non-interactive mode.
 * **The detached tier does not stream.** Those agents have no structured output,
-  so the reply is the tmux session, not a chat message. Switchboard says so and
+  so the reply is the tmux session, not a chat message. Omatether says so and
   gives you the `/attach` line rather than pretending otherwise.
 
 And one that is worth stating plainly rather than reading out of the table:
 
 > **Only `claude` asks you anything.** Codex, Pi and the detached tier run
-> their tools as they decide on them, unsandboxed, and switchboard cannot stop a
+> their tools as they decide on them, unsandboxed, and omatether cannot stop a
 > tool call there — it has no channel to be asked through. The same allowlisted
 > person who approves every `Bash` on `claude` is one `/agent pi` away from an
 > agent that approves its own. That is a deliberate trade for reaching the
@@ -153,13 +153,13 @@ the id round-trips through the store, so a restart resumes.
 ### Long replies
 
 Above ~2500 characters a reply is written to
-`$XDG_STATE_HOME/switchboard/out/` and the chat gets the head plus the command
+`$XDG_STATE_HOME/omatether/out/` and the chat gets the head plus the command
 to read the rest:
 
 ```
 … 12431 characters in all. Read the rest with:
 
-  ssh <host> -t 'cat ~/.local/state/switchboard/out/telegram-5-1788.txt'
+  ssh <host> -t 'cat ~/.local/state/omatether/out/telegram-5-1788.txt'
 ```
 
 Both channels clip long messages anyway, which loses the tail silently. A file
@@ -171,8 +171,8 @@ reachable.
 The milestone-1 instrument, still the fastest way to see the wire protocol:
 
 ```bash
-switchboard repl --dir .                            # interactive
-switchboard repl --agent codex --dir . "run tests"  # one-shot; runs to completion
+omatether repl --dir .                            # interactive
+omatether repl --agent codex --dir . "run tests"  # one-shot; runs to completion
 ```
 
 It drives any agent through the same seam, which makes it the fastest way to
@@ -213,13 +213,13 @@ answered:
 
 ```jsonc
 // initialize — shape per the CLI's own validation error
-{"type":"control_request","request_id":"switchboard-1","request":{
+{"type":"control_request","request_id":"omatether-1","request":{
   "subtype":"initialize",
-  "hooks":{"PreToolUse":[{"matcher":"*","hookCallbackIds":["switchboard-pretooluse"]}]}}}
+  "hooks":{"PreToolUse":[{"matcher":"*","hookCallbackIds":["omatether-pretooluse"]}]}}}
 
 // …then, per tool call
 {"type":"control_request","request_id":"…","request":{
-  "subtype":"hook_callback","callback_id":"switchboard-pretooluse",
+  "subtype":"hook_callback","callback_id":"omatether-pretooluse",
   "input":{"tool_name":"Bash","tool_input":{"command":"echo hi"}}}}
 
 // answered with
@@ -240,7 +240,7 @@ that bookkeeping stays inside the adapter so seam B remains vendor-neutral.
 ### Environment scrubbing
 
 The agent is spawned with `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
-`CLAUDE_CODE_CHILD_SESSION` and friends removed. Otherwise, when switchboard is
+`CLAUDE_CODE_CHILD_SESSION` and friends removed. Otherwise, when omatether is
 itself launched from inside a Claude Code session, the child inherits them,
 decides it is a nested session, and resolves its configuration from the parent.
 A service's agent environment should be deterministic regardless of what
@@ -347,7 +347,7 @@ Not verified:
 
 - **A successful Codex turn.** `codex login` has never been run on this
   machine, so every request 401s. Everything up to the model call is exercised.
-  `codex login`, then `switchboard repl --agent codex --dir . "say hi"`.
+  `codex login`, then `omatether repl --agent codex --dir . "say hi"`.
 - **Photon attachments and tapbacks**, which are not implemented at all.
 
 ## Notes kept from the build

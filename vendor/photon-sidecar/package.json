@@ -1,5 +1,5 @@
 {
-  "name": "switchboard-photon-sidecar",
+  "name": "omatether-photon-sidecar",
   "private": true,
   "type": "module",
   "main": "index.mjs",

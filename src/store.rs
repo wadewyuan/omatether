@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 
-/// Everything switchboard remembers about one chat thread.
+/// Everything omatether remembers about one chat thread.
 #[derive(Debug, Clone)]
 pub struct ThreadState {
     pub key: String,
@@ -39,7 +39,7 @@ impl Store {
         let conn = Connection::open(path)
             .with_context(|| format!("opening state database at {}", path.display()))?;
 
-        // WAL so a reader (a future `switchboard status`) never blocks the
+        // WAL so a reader (a future `omatether status`) never blocks the
         // service mid-write.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -157,7 +157,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     )
     .ok();
 
-    // `session_id` began as NOT NULL, back when switchboard chose the id
+    // `session_id` began as NOT NULL, back when omatether chose the id
     // itself. Codex assigns its own on the first turn, so a thread now starts
     // without one — and SQLite cannot drop a NOT NULL in place, which means a
     // table rebuild rather than an ALTER.
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(read.agent, "codex");
     }
 
-    /// The schema switchboard shipped before agents chose their own session id.
+    /// The schema omatether shipped before agents chose their own session id.
     fn legacy_database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(

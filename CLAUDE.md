@@ -1,4 +1,4 @@
-# switchboard — notes for whoever works on this next
+# omatether — notes for whoever works on this next
 
 A bridge between chat channels and the coding agent installed in your repo.
 Read `README.md` for what it is and how to run it. This file is only the things
@@ -9,16 +9,16 @@ Where something is unverified, it says so.
 
 ## Running state
 
-Deployed as a systemd **user** service: `systemctl --user {status,restart} switchboard`,
-`journalctl --user -fu switchboard`. Config is `~/.config/switchboard/env`
+Deployed as a systemd **user** service: `systemctl --user {status,restart} omatether`,
+`journalctl --user -fu omatether`. Config is `~/.config/omatether/env`
 (mode 600), read by the unit as `EnvironmentFile`. Both channels are live and
 working end to end.
 
 Two things about that unit are load-bearing. `PATH` is set explicitly, because
 a user service does not source `.bashrc` and would otherwise find neither
 `claude` nor the mise-installed agents nor `node`. And the log filter is
-`switchboard=info`, which is why every subprocess logs under a
-`switchboard::` target — see "diagnostics" below.
+`omatether=info`, which is why every subprocess logs under an
+`omatether::` target — see "diagnostics" below.
 
 ## Claude Code adapter
 
@@ -36,7 +36,7 @@ shape is fussy — matchers carrying `hookCallbackIds` arrays, not nested hook
 objects:
 
 ```jsonc
-"hooks": {"PreToolUse": [{"matcher": "*", "hookCallbackIds": ["switchboard-pretooluse"]}]}
+"hooks": {"PreToolUse": [{"matcher": "*", "hookCallbackIds": ["omatether-pretooluse"]}]}
 ```
 
 Answer with `hookSpecificOutput.permissionDecision` (`allow`/`deny`) plus
@@ -88,7 +88,7 @@ knowledge.
 **Unverified:** a successful Codex turn. `codex login` has never been run on
 this machine, so every request 401s. Everything up to the model call is
 exercised, including a real captured thread id. Run `codex login` and then
-`switchboard repl --agent codex --dir . "say hi"` to close this.
+`omatether repl --agent codex --dir . "say hi"` to close this.
 
 ## Pi adapter
 
@@ -109,7 +109,7 @@ stops to call the tool and again when it has read the result and replied.
 Reading the first as the end is not a cosmetic error — the core flushes and
 *resets the renderer* on `TurnEnd`, so the answer that comes after it is
 discarded and the user gets the tool call alone, reported as a completed turn.
-The A/B is worth keeping in mind: with `turn_end` closing the turn, `switchboard
+The A/B is worth keeping in mind: with `turn_end` closing the turn, `omatether
 repl --agent pi` prints the `[tool]` line and `[turn end] ok` and never prints
 the reply at all.
 
@@ -149,7 +149,7 @@ string. Verified, not assumed.
 ## Telegram
 
 **`getUpdates` is exclusive.** Two pollers on one bot token steal each other's
-messages — this is why switchboard needs its own bot, separate from Hermes.
+messages — this is why omatether needs its own bot, separate from Hermes.
 Outbound `sendMessage` on a shared token is fine.
 
 Roughly one message per second per chat, and `editMessageText` draws on the
@@ -177,7 +177,7 @@ session per reply chain.
 **A shared line cannot initiate a conversation.** Sending to a phone number
 with no existing space is refused with `AuthenticationError: [spectrum-imessage]
 Target not allowed for this project`. This is not a bug and does not affect
-normal use — switchboard only ever replies into a space that messaged it first
+normal use — omatether only ever replies into a space that messaged it first
 — but it means you cannot test outbound before texting the line.
 
 **Hermes runs its own Photon sidecar on port 8789.** Ours defaults to port 0,
@@ -242,9 +242,9 @@ alone.
 
 ## Diagnostics
 
-Subprocess output logs under `switchboard::{photon,claude,codex,pi}` so the
-default `switchboard=info` filter catches it. If you add a subprocess, use a
-`switchboard::` target — a target outside that tree is silently dropped, which
+Subprocess output logs under `omatether::{photon,claude,codex,pi}` so the
+default `omatether=info` filter catches it. If you add a subprocess, use an
+`omatether::` target — a target outside that tree is silently dropped, which
 once produced an error saying "see its log above" when there was no log above.
 
 Failures should quote the reason, not point at a log: the Photon supervisor
@@ -268,15 +268,15 @@ spam-the-phone bug is worth that much.
 Beyond that, the repl drives any agent without a channel:
 
 ```bash
-switchboard repl --dir .                              # interactive
-switchboard repl --agent codex --dir . "run tests"    # one-shot, runs to completion
+omatether repl --dir .                              # interactive
+omatether repl --agent codex --dir . "run tests"    # one-shot, runs to completion
 ```
 
 To exercise the detached tier without launching a real agent, put a stub
 `omarchy-agent` earlier on `PATH` and point `TMUX_TMPDIR` at a scratch
 directory so the test server is isolated from your own tmux.
 
-`switchboard photon-setup --phone +…` is a live, idempotent check of the Photon
+`omatether photon-setup --phone +…` is a live, idempotent check of the Photon
 credentials, registration and assigned line.
 
 For the permission loop, the repl needs stdin held open — feed it from a file

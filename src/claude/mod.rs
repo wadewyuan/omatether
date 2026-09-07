@@ -36,7 +36,7 @@ const EVENT_BUFFER: usize = 256;
 
 /// Session-identity variables Claude Code exports to its own children.
 ///
-/// If switchboard is itself launched from inside a Claude Code session, the
+/// If omatether is itself launched from inside a Claude Code session, the
 /// agent we spawn inherits these, decides it is a nested session, and resolves
 /// its permission mode from the parent instead of from our `--permission-mode`
 /// flag — silently, reporting `default` in the init frame. Scrubbing them also
@@ -59,13 +59,13 @@ const INHERITED_SESSION_VARS: &[&str] = &[
 ];
 
 /// Our handle for the PreToolUse hook registered during the handshake.
-const PRE_TOOL_USE_CALLBACK: &str = "switchboard-pretooluse";
+const PRE_TOOL_USE_CALLBACK: &str = "omatether-pretooluse";
 
 /// Request id for the handshake.
 ///
 /// Fixed rather than taken from the counter because the reader task has to be
 /// watching for the answer before the question is written.
-const INIT_REQUEST_ID: &str = "switchboard-init";
+const INIT_REQUEST_ID: &str = "omatether-init";
 
 /// How long to wait for the agent to confirm the gate is installed.
 ///
@@ -212,7 +212,7 @@ impl ClaudeSession {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "`claude` did not answer switchboard's handshake within {}s, so \
+                    "`claude` did not answer omatether's handshake within {}s, so \
                      there is no confirmed tool gate — refusing to start a session \
                      that would run tools unasked",
                     HANDSHAKE_TIMEOUT.as_secs()
@@ -220,14 +220,14 @@ impl ClaudeSession {
             })?
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "`claude` exited during switchboard's handshake — see the \
-                     switchboard::claude log for what it said"
+                    "`claude` exited during omatether's handshake — see the \
+                     omatether::claude log for what it said"
                 )
             })?;
 
         if let Err(reason) = confirmed {
             bail!(
-                "`claude` refused switchboard's PreToolUse hook, so no tool call \
+                "`claude` refused omatether's PreToolUse hook, so no tool call \
                  would ever be routed here for a decision: {reason}"
             );
         }
@@ -276,7 +276,7 @@ impl ClaudeSession {
 
     fn request_id(&mut self) -> String {
         self.next_request += 1;
-        format!("switchboard-{}", self.next_request)
+        format!("omatether-{}", self.next_request)
     }
 }
 
@@ -497,7 +497,7 @@ fn handshake_outcome(frame: &Value, request_id: &str) -> Option<Result<(), Strin
 async fn log_stderr(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "switchboard::claude", "{line}");
+        tracing::info!(target: "omatether::claude", "{line}");
     }
 }
 
@@ -514,7 +514,7 @@ mod tests {
             "type": "control_response",
             "response": {
                 "subtype": "success",
-                "request_id": "switchboard-init",
+                "request_id": "omatether-init",
                 "response": { "commands": [], "roots": [] }
             }
         })
@@ -535,7 +535,7 @@ mod tests {
             "type": "control_response",
             "response": {
                 "subtype": "error",
-                "request_id": "switchboard-init",
+                "request_id": "omatether-init",
                 "error": "hooks.PreToolUse must be an array of matchers"
             }
         });
@@ -569,7 +569,7 @@ mod tests {
         // handshake's — the wait would otherwise end on the wrong frame.
         let interrupt = json!({
             "type": "control_response",
-            "response": { "subtype": "success", "request_id": "switchboard-1" }
+            "response": { "subtype": "success", "request_id": "omatether-1" }
         });
         assert_eq!(handshake_outcome(&interrupt, INIT_REQUEST_ID), None);
     }

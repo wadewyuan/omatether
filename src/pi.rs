@@ -195,7 +195,7 @@ async fn read_events(
         // any wrapper noise would break serde the same way. Only braces can
         // open a JSON frame; everything else is logged, never surfaced.
         if !trimmed.starts_with('{') {
-            tracing::info!(target: "switchboard::pi", "non-json line: {trimmed}");
+            tracing::info!(target: "omatether::pi", "non-json line: {trimmed}");
             continue;
         }
 
@@ -380,7 +380,7 @@ fn tool_input(part: &Value) -> Value {
 async fn log_stderr(stderr: tokio::process::ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "switchboard::pi", "{line}");
+        tracing::info!(target: "omatether::pi", "{line}");
     }
 }
 

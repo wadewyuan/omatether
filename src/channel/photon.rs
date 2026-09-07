@@ -58,7 +58,7 @@ impl Photon {
     /// Start the sidecar and wait for it to answer.
     pub async fn start(config: Config) -> Result<Self> {
         if config.allowed_users.is_empty() {
-            bail!("refusing to start Photon with an empty allowlist — set SWITCHBOARD_PHOTON_ALLOWED_USERS");
+            bail!("refusing to start Photon with an empty allowlist — set OMATETHER_PHOTON_ALLOWED_USERS");
         }
 
         let entry = config.sidecar_dir.join("index.mjs");
@@ -87,7 +87,7 @@ impl Photon {
             .env("PHOTON_SIDECAR_PORT", port.to_string())
             .env("PHOTON_SIDECAR_TOKEN", &token)
             // Bind the sidecar's life to ours. Without this a crashed
-            // switchboard leaves a process holding the iMessage line.
+            // omatether leaves a process holding the iMessage line.
             .env("PHOTON_SIDECAR_WATCH_STDIN", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -149,7 +149,7 @@ impl Photon {
         let response = self
             .http
             .get(format!("{}/inbound", self.base))
-            .header("x-switchboard-token", &self.token)
+            .header("x-omatether-token", &self.token)
             .send()
             .await?
             .error_for_status()?;
@@ -252,7 +252,7 @@ impl Channel for Photon {
         let response: Value = self
             .http
             .post(format!("{}/send", self.base))
-            .header("x-switchboard-token", &self.token)
+            .header("x-omatether-token", &self.token)
             .timeout(Duration::from_secs(30))
             .json(&json!({ "spaceId": thread.chat_id, "text": clip(text) }))
             .send()
@@ -290,7 +290,7 @@ impl Channel for Photon {
     async fn typing(&self, thread: &ThreadKey) -> Result<()> {
         self.http
             .post(format!("{}/typing", self.base))
-            .header("x-switchboard-token", &self.token)
+            .header("x-omatether-token", &self.token)
             .timeout(Duration::from_secs(10))
             .json(&json!({ "spaceId": thread.chat_id }))
             .send()
@@ -341,7 +341,7 @@ async fn wait_until_ready(
 
         let response = http
             .get(format!("{base}/health"))
-            .header("x-switchboard-token", token)
+            .header("x-omatether-token", token)
             .timeout(Duration::from_secs(2))
             .send()
             .await;
@@ -385,7 +385,7 @@ const RECENT_LINES: usize = 20;
 async fn log_lines(stderr: tokio::process::ChildStderr, recent: RecentLog) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::info!(target: "switchboard::photon", "{line}");
+        tracing::info!(target: "omatether::photon", "{line}");
         if let Ok(mut recent) = recent.lock() {
             recent.push(line);
             if recent.len() > RECENT_LINES {

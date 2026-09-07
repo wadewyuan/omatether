@@ -27,7 +27,7 @@ use crate::store::Store;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// Tools that require a human decision. Everything else is approved by
-/// switchboard without bothering anyone.
+/// omatether without bothering anyone.
 ///
 /// A gate on every tool is unusable from a phone — the agent reads a dozen
 /// files before it does anything consequential. Gating what writes or executes
@@ -553,7 +553,7 @@ impl Core {
                     .session
                     .decide(
                         &request_id,
-                        Decision::deny("switchboard could not deliver the question to the chat"),
+                        Decision::deny("omatether could not deliver the question to the chat"),
                     )
                     .await?;
             }
@@ -936,7 +936,7 @@ mod tests {
         // every channel would clip — leaving the change being approved below
         // the cut.
         let input = serde_json::json!({
-            "file_path": "/home/wy/src/switchboard/src/core.rs",
+            "file_path": "/home/wy/src/omatether/src/core.rs",
             "old_string": "x".repeat(9000),
             "new_string": "y".repeat(9000),
         });

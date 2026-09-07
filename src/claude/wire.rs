@@ -296,7 +296,7 @@ mod tests {
             "request_id": "req-9",
             "request": {
                 "subtype": "hook_callback",
-                "callback_id": "switchboard-pretooluse",
+                "callback_id": "omatether-pretooluse",
                 "input": {
                     "hook_event_name": "PreToolUse",
                     "tool_name": "Bash",
