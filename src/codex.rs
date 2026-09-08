@@ -220,7 +220,10 @@ async fn read_events(
 
 /// Turn one Codex frame into zero or more normalized events.
 pub fn normalize(frame: &Value, announce_ready: bool) -> Vec<AgentEvent> {
-    let kind = frame.get("type").and_then(Value::as_str).unwrap_or_default();
+    let kind = frame
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     match kind {
         "thread.started" => {

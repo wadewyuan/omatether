@@ -124,7 +124,11 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
         Some(backend) => backend,
         None => {
             let known: Vec<&str> = AGENTS.iter().map(|(name, _)| *name).collect();
-            bail!("unknown agent '{}' — try one of: {}", config.agent, known.join(", "));
+            bail!(
+                "unknown agent '{}' — try one of: {}",
+                config.agent,
+                known.join(", ")
+            );
         }
     };
 

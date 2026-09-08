@@ -195,7 +195,10 @@ mod tests {
     #[test]
     fn collections_unwrap_from_every_shape_photon_uses() {
         assert_eq!(as_list(&json!([{ "a": 1 }])).len(), 1);
-        assert_eq!(as_list(&json!({ "data": [{ "a": 1 }, { "b": 2 }] })).len(), 2);
+        assert_eq!(
+            as_list(&json!({ "data": [{ "a": 1 }, { "b": 2 }] })).len(),
+            2
+        );
         assert_eq!(as_list(&json!({ "nothing": true })).len(), 0);
 
         // The shape Photon actually returns, verified against the live API.

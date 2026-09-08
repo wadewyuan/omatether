@@ -99,7 +99,7 @@ impl TurnRenderer {
                     push_line(&mut out, &format!("▸ {name}"));
                 }
                 Segment::Tool { name, summary } => {
-                    push_line(&mut out, &format!("▸ {name}  {summary}"));
+                    push_line(&mut out, &format!("▸ {name}  {}", code_span(summary)));
                 }
             }
         }
@@ -143,6 +143,33 @@ impl TurnRenderer {
     pub fn reset(&mut self) {
         *self = Self::new();
     }
+}
+
+/// Wrap literal text in a markdown code span, so a channel that renders
+/// markdown shows it exactly as it is.
+///
+/// What comes out of [`summarize`] is a command or a path, not prose, and it
+/// travels inside a message the agent wrote in markdown. Left bare it gets
+/// parsed with everything else: `/a/_b_/c.rs` arrives as `/a/b/c.rs`, a path
+/// that is not the one the tool touched. A code span is the one construct that
+/// suppresses all inline parsing.
+///
+/// The fence has to be longer than any backtick run inside — command
+/// substitution puts real backticks in commands — and content that begins or
+/// ends with one needs padding, which CommonMark strips back off.
+fn code_span(text: &str) -> String {
+    let longest_run = text
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat(longest_run + 1);
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
 }
 
 fn push_line(out: &mut String, line: &str) {
@@ -223,8 +250,39 @@ mod tests {
 
         let out = r.compose();
         assert!(out.starts_with("checking"));
-        assert!(out.contains("▸ Bash  ls"));
+        assert!(out.contains("▸ Bash  `ls`"));
         assert!(out.ends_with("done"));
+    }
+
+    /// The composed turn is markdown — the agents write markdown, and a channel
+    /// that renders it must not silently rewrite a path we quoted.
+    #[test]
+    fn tool_summaries_survive_a_markdown_renderer() {
+        let mut r = TurnRenderer::new();
+        r.apply(&AgentEvent::ToolCall {
+            id: "1".into(),
+            name: "Read".into(),
+            input: json!({ "file_path": "/a/_b_/c.rs" }),
+        });
+        assert!(
+            r.compose().contains("`/a/_b_/c.rs`"),
+            "underscores would pair into emphasis and vanish: {}",
+            r.compose()
+        );
+    }
+
+    #[test]
+    fn a_command_containing_backticks_still_closes_its_span() {
+        // Command substitution is not exotic, and a fence the content also
+        // contains ends the span early — the rest of the turn then renders as
+        // code.
+        // Padding is symmetric: CommonMark strips a leading and a trailing
+        // space as a pair, so a span ending in a backtick is padded at both
+        // ends or the spaces stay in the output.
+        assert_eq!(code_span("echo `date`"), "`` echo `date` ``");
+        assert_eq!(code_span("`x`"), "`` `x` ``");
+        assert_eq!(code_span("a ``b`` c"), "```a ``b`` c```");
+        assert_eq!(code_span("plain"), "`plain`");
     }
 
     #[test]
@@ -260,7 +318,9 @@ mod tests {
     fn empty_turn_still_says_something() {
         let mut r = TurnRenderer::new();
         assert_eq!(r.compose(), "working…");
-        r.apply(&AgentEvent::Thinking { text: String::new() });
+        r.apply(&AgentEvent::Thinking {
+            text: String::new(),
+        });
         assert_eq!(r.compose(), "thinking…");
     }
 

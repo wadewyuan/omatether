@@ -111,10 +111,7 @@ impl Agent for PiSession {
         let resume = self.session_id.lock().await.clone();
 
         let mut command = Command::new("pi");
-        command
-            .arg("-p")
-            .arg("--mode")
-            .arg("json");
+        command.arg("-p").arg("--mode").arg("json");
         // `--session <id>` continues the conversation; omitting it starts one.
         if let Some(id) = &resume {
             command.arg("--session").arg(id);
@@ -247,7 +244,10 @@ async fn read_events(
 
 /// Turn one Pi frame into zero or more normalized events.
 pub fn normalize(frame: &Value, announce_ready: bool) -> Vec<AgentEvent> {
-    let kind = frame.get("type").and_then(Value::as_str).unwrap_or_default();
+    let kind = frame
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
 
     match kind {
         "session" => {
@@ -270,8 +270,13 @@ pub fn normalize(frame: &Value, announce_ready: bool) -> Vec<AgentEvent> {
         // echoes what `message_update` streams and `message_end` completes, and
         // `tool_execution_*` re-reports a tool call already announced by the
         // `message_end` that precedes it.
-        "agent_start" | "turn_start" | "message_start" | "agent_settled"
-        | "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => Vec::new(),
+        "agent_start"
+        | "turn_start"
+        | "message_start"
+        | "agent_settled"
+        | "tool_execution_start"
+        | "tool_execution_update"
+        | "tool_execution_end" => Vec::new(),
 
         // NOT the end of the exchange. In Pi's vocabulary a *turn* is one model
         // round-trip, so a prompt answered with a tool call emits `turn_end`
@@ -402,7 +407,9 @@ mod tests {
             "cwd": "/tmp/pi-probe"
         });
         match normalize(&frame, true).as_slice() {
-            [AgentEvent::Ready { session_id, cwd, .. }] => {
+            [AgentEvent::Ready {
+                session_id, cwd, ..
+            }] => {
                 assert_eq!(session_id, "01a074d0-4a3a-7dc5-958a-f6c240d26081");
                 assert_eq!(cwd.as_deref(), Some("/tmp/pi-probe"));
             }

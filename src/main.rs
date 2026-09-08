@@ -268,7 +268,10 @@ fn allowlist(var: &str) -> Result<Vec<String>> {
 }
 
 /// Pump one channel's inbound stream into the shared receiver.
-fn merge(mut source: tokio::sync::mpsc::Receiver<Inbound>, sink: tokio::sync::mpsc::Sender<Inbound>) {
+fn merge(
+    mut source: tokio::sync::mpsc::Receiver<Inbound>,
+    sink: tokio::sync::mpsc::Sender<Inbound>,
+) {
     tokio::spawn(async move {
         while let Some(message) = source.recv().await {
             if sink.send(message).await.is_err() {
@@ -326,7 +329,7 @@ async fn repl(
             "this agent approves its own tools"
         }
     );
-    println!("commands /allow  /deny <why>  /cancel  /status  /quit");
+    println!("commands /allow  /deny <why>  /auto on  /cancel  /status  /quit");
     println!();
 
     if let Some(prompt) = prompt.as_deref() {
@@ -337,6 +340,10 @@ async fn repl(
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut pending: Option<Pending> = None;
     let mut streamed = false;
+    // The repl asks by default even though a chat thread does not: this is the
+    // harness the permission round-trip is verified with, and a harness that
+    // approves everything verifies nothing. `/auto on` for the other case.
+    let mut auto = false;
 
     // A prompt given on the command line with stdin closed should still run to
     // completion — `omatether repl <prompt> < /dev/null` is a one-shot, not a
@@ -352,8 +359,16 @@ async fn repl(
                         if matches!(event, AgentEvent::TurnEnd { .. }) {
                             turn_running = false;
                         }
-                        if render(&event, &mut streamed, &mut pending) {
+                        if render(&event, &mut streamed, &mut pending, auto) {
                             break;
+                        }
+                        // Answer it here rather than inside `render`, which is
+                        // sync and has no session to answer with.
+                        if auto {
+                            if let Some(p) = pending.take() {
+                                session.decide(&p.request_id, Decision::allow()).await?;
+                                println!("[auto-allowed {}]", p.tool);
+                            }
                         }
                         if !input_open && !turn_running {
                             break;
@@ -367,7 +382,7 @@ async fn repl(
                 match line? {
                     Some(line) => {
                         let text = line.trim();
-                        if handle_input(text, &mut session, &mut pending).await? {
+                        if handle_input(text, &mut session, &mut pending, &mut auto).await? {
                             break;
                         }
                         if !text.is_empty() && !text.starts_with('/') {
@@ -390,7 +405,12 @@ async fn repl(
 }
 
 /// Render one event. Returns true when the session is over.
-fn render(event: &AgentEvent, streamed: &mut bool, pending: &mut Option<Pending>) -> bool {
+fn render(
+    event: &AgentEvent,
+    streamed: &mut bool,
+    pending: &mut Option<Pending>,
+    auto: bool,
+) -> bool {
     match event {
         AgentEvent::Ready {
             session_id,
@@ -429,7 +449,11 @@ fn render(event: &AgentEvent, streamed: &mut bool, pending: &mut Option<Pending>
             ..
         } => {
             println!("\n[permission] {tool} {}", compact(input));
-            println!("             /allow or /deny <why>");
+            // Offering /allow next to a request the loop is about to approve
+            // itself reads as a question that was never asked.
+            if !auto {
+                println!("             /allow or /deny <why>");
+            }
             *pending = Some(Pending {
                 request_id: request_id.clone(),
                 tool: tool.clone(),
@@ -479,6 +503,7 @@ async fn handle_input(
     line: &str,
     session: &mut Box<dyn Agent>,
     pending: &mut Option<Pending>,
+    auto: &mut bool,
 ) -> Result<bool> {
     if line.is_empty() {
         return Ok(false);
@@ -519,6 +544,28 @@ async fn handle_input(
                 println!("[denied {}]", p.tool);
             }
             None => println!("[nothing pending]"),
+        },
+
+        command::Command::Auto(want) => match want {
+            Some(want) => {
+                *auto = want;
+                println!(
+                    "[auto {}]",
+                    if want {
+                        "on — tool calls approved as they arrive"
+                    } else {
+                        "off — tool calls wait for /allow"
+                    }
+                );
+                // Whatever is already waiting was asked under the old rule.
+                if want {
+                    if let Some(p) = pending.take() {
+                        session.decide(&p.request_id, Decision::allow()).await?;
+                        println!("[auto-allowed {}]", p.tool);
+                    }
+                }
+            }
+            None => println!("[auto {}]", if *auto { "on" } else { "off" }),
         },
 
         command::Command::Help => println!("{}", command::HELP),

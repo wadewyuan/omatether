@@ -183,7 +183,9 @@ impl ClaudeSession {
             busy.clone(),
             pending.clone(),
             config.raw,
-            Some(Handshake { reply: handshake_tx }),
+            Some(Handshake {
+                reply: handshake_tx,
+            }),
         ));
         tokio::spawn(log_stderr(stderr));
 

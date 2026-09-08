@@ -56,6 +56,11 @@ struct Thread {
     /// The permission question waiting on a human, if any. At most one: the
     /// turn is blocked on it anyway.
     pending: Option<PendingPermission>,
+    /// Approve tool calls without asking. Mirrored from the store when the
+    /// session starts and kept in step by `/auto`, so the hot path — every
+    /// tool call the agent makes — never touches the database. The store stays
+    /// the source of truth across restarts.
+    auto: bool,
 }
 
 struct PendingPermission {
@@ -167,6 +172,8 @@ impl Core {
                 self.on_decision(&message.thread, allow, &ack, &question)
                     .await
             }
+            InboundKind::Unsupported(note) => self.say(&message.thread, &note),
+
             InboundKind::Text(text) => match command::parse(&text) {
                 Command::Help => self.say(&message.thread, command::HELP),
                 Command::New => self.on_new(&message.thread).await,
@@ -175,9 +182,11 @@ impl Core {
                 Command::Cd(path) => self.on_cd(&message.thread, &path).await,
                 Command::Agent(name) => self.on_agent(&message.thread, &name).await,
                 Command::Attach => self.on_attach(&message.thread).await,
+                Command::Auto(want) => self.on_auto(&message.thread, want).await,
                 Command::Allow => self.decide(&message.thread, Decision::allow(), None).await,
                 Command::Deny(why) => {
-                    self.decide(&message.thread, Decision::deny(why), None).await
+                    self.decide(&message.thread, Decision::deny(why), None)
+                        .await
                 }
                 Command::Prompt(text) => self.on_prompt(&message.thread, &text).await,
             },
@@ -223,7 +232,10 @@ impl Core {
         state.session_id = None;
         self.store.put(&state)?;
 
-        self.say(key, &format!("New {} session in {}.", state.agent, state.cwd))
+        self.say(
+            key,
+            &format!("New {} session in {}.", state.agent, state.cwd),
+        )
     }
 
     async fn on_stop(&mut self, key: &ThreadKey) -> Result<()> {
@@ -251,15 +263,67 @@ impl Core {
         };
 
         let mut note = format!(
-            "agent    {}\ndir      {}\nsession  {}\nstate    {}",
+            "agent    {}\ndir      {}\nsession  {}\nstate    {}\ntools    {}",
             live_agent.unwrap_or(&state.agent),
             state.cwd,
             state.session_id.as_deref().unwrap_or("(new)"),
-            if running { "turn running" } else { "idle" }
+            if running { "turn running" } else { "idle" },
+            approvals(&state.agent, state.auto)
         );
         if let Some(tool) = awaiting {
             note.push_str(&format!("\nwaiting  decision on {tool}"));
         }
+        self.say(key, &note)
+    }
+
+    /// Read or change this thread's approval mode.
+    ///
+    /// Per thread rather than global: the phone that runs errands against a
+    /// scratch directory and the one pointed at a repo you care about are the
+    /// same product, and only the person holding it knows which is which.
+    async fn on_auto(&mut self, key: &ThreadKey, want: Option<bool>) -> Result<()> {
+        let mut state = self.state(key)?;
+
+        let want = match want {
+            Some(want) => want,
+            None => {
+                let note = format!(
+                    "Tool calls: {}.\n\n/auto on approves them without asking; \
+                     /auto off asks first, for Bash, Write and Edit.",
+                    approvals(&state.agent, state.auto)
+                );
+                return self.say(key, &note);
+            }
+        };
+
+        if state.auto != want {
+            state.auto = want;
+            self.store.put(&state)?;
+            if let Some(thread) = self.threads.get_mut(key) {
+                thread.auto = want;
+            }
+        }
+
+        // Say what it means, not just which way the switch went. This is the
+        // one setting that decides whether a message can run a shell command
+        // with nobody looking.
+        let note = if want {
+            "Auto mode on. Tool calls run without asking — you will see each \
+             one in the reply as it happens, after it has run. /auto off to be \
+             asked first."
+                .to_string()
+        } else {
+            format!(
+                "Auto mode off. {}",
+                match agent::backend_for(&state.agent) {
+                    Some(agent::Backend::Claude) =>
+                        "Bash, Write and Edit will wait for Allow or Deny.",
+                    _ =>
+                        "This agent approves its own tools, though — the gate \
+                          only applies to claude. /agent claude to get it back.",
+                }
+            )
+        };
         self.say(key, &note)
     }
 
@@ -320,10 +384,12 @@ impl Core {
         let mut note = format!("Now using {name} in {}.", state.cwd);
         match agent::backend_for(name) {
             Some(agent::Backend::Claude) => {}
-            Some(agent::Backend::Codex) => note
-                .push_str("\n\nCodex approves its own tools inside a sandbox — no Allow/Deny here."),
-            Some(agent::Backend::Pi) => note
-                .push_str("\n\nPi runs and approves its own tools — no Allow/Deny here."),
+            Some(agent::Backend::Codex) => note.push_str(
+                "\n\nCodex approves its own tools inside a sandbox — no Allow/Deny here.",
+            ),
+            Some(agent::Backend::Pi) => {
+                note.push_str("\n\nPi runs and approves its own tools — no Allow/Deny here.")
+            }
             // The gate is this product's one safety feature, and this tier does
             // not have it. Someone who just approved a Bash call on claude is
             // one command away from an agent that approves its own — that
@@ -523,11 +589,28 @@ impl Core {
         tool: String,
         input: serde_json::Value,
     ) -> Result<()> {
+        // Auto mode: approve everything, and leave the audit line behind. The
+        // tool call still shows up in the reply as it happens, so the thread
+        // reads as a log of what ran rather than a series of questions.
+        if self.threads.get(key).is_some_and(|thread| thread.auto) {
+            tracing::info!(thread = %key, tool = %tool, by = "auto", "Allowed");
+            if let Some(thread) = self.threads.get_mut(key) {
+                thread
+                    .session
+                    .decide(&request_id, Decision::allow())
+                    .await?;
+            }
+            return Ok(());
+        }
+
         // Auto-approve anything that only reads. Asking about every file the
         // agent opens trains you to tap Allow without reading it.
         if !GATED_TOOLS.iter().any(|t| *t == tool) {
             if let Some(thread) = self.threads.get_mut(key) {
-                thread.session.decide(&request_id, Decision::allow()).await?;
+                thread
+                    .session
+                    .decide(&request_id, Decision::allow())
+                    .await?;
             }
             return Ok(());
         }
@@ -583,7 +666,12 @@ impl Core {
     /// So: show the whole input when the whole input fits, and otherwise say
     /// what the tool is doing in one line and put the complete text in a file.
     /// Never a silent truncation.
-    fn permission_question(&self, key: &ThreadKey, tool: &str, input: &serde_json::Value) -> String {
+    fn permission_question(
+        &self,
+        key: &ThreadKey,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> String {
         let detail = serde_json::to_string_pretty(input).unwrap_or_default();
 
         if detail.chars().count() <= PERMISSION_DETAIL_BUDGET {
@@ -799,9 +887,22 @@ impl Core {
                 session,
                 renderer: TurnRenderer::new(),
                 pending: None,
+                auto: state.auto,
             },
         );
         Ok(())
+    }
+}
+
+/// How this thread's tool calls are approved, in a phrase.
+///
+/// An agent that cannot be gated says so regardless of the switch: "gate on"
+/// would otherwise read as a promise nothing is keeping.
+fn approvals(agent: &str, auto: bool) -> &'static str {
+    match agent::backend_for(agent) {
+        Some(agent::Backend::Claude) if auto => "run without asking (/auto off to be asked)",
+        Some(agent::Backend::Claude) => "Bash, Write and Edit ask first",
+        _ => "run without asking — this agent cannot be gated",
     }
 }
 
@@ -923,7 +1024,10 @@ mod tests {
 
         assert!(question.starts_with("Run Bash?"));
         assert!(question.contains("rm -rf ./build"), "the command itself");
-        assert!(!question.contains("ssh "), "no pointer needed for a short one");
+        assert!(
+            !question.contains("ssh "),
+            "no pointer needed for a short one"
+        );
         assert!(!dir.exists(), "nothing spilled for an input that fits");
     }
 
@@ -1086,6 +1190,7 @@ mod tests {
                 session: Box::new(StubAgent),
                 renderer,
                 pending: None,
+                auto: true,
             },
         );
 
@@ -1109,6 +1214,86 @@ mod tests {
             "an unchanged turn must cost exactly one message"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn auto_mode_approves_without_asking_and_the_gate_comes_back() {
+        // The default a chat thread starts in, and the one it can go back to.
+        // Both halves matter: auto mode that cannot be turned off is a product
+        // with no gate at all, which is not what the flag was for.
+        let dir = std::env::temp_dir().join(format!("sb-auto-{}", std::process::id()));
+        let channel = Arc::new(CountingChannel {
+            sent: std::sync::Mutex::new(Vec::new()),
+        });
+        let key = ThreadKey {
+            channel: "fake",
+            chat_id: "1".into(),
+            topic_id: None,
+        };
+
+        let mut core = Core::new(
+            Store::in_memory().unwrap(),
+            vec![channel.clone()],
+            PathBuf::from("/tmp"),
+            "claude".into(),
+            dir.clone(),
+        );
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+            },
+        );
+
+        let input = serde_json::json!({ "command": "rm -rf ./build" });
+        core.on_permission(&key, "r1".into(), "Bash".into(), input.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            core.threads[&key].pending.is_none(),
+            "auto mode leaves nothing waiting on a human"
+        );
+
+        // Now with the gate back on, the same call has to be asked about.
+        core.threads.get_mut(&key).unwrap().auto = false;
+        core.on_permission(&key, "r2".into(), "Bash".into(), input)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            core.threads[&key].pending.as_ref().map(|p| p.tool.as_str()),
+            Some("Bash"),
+        );
+
+        // Let the outbox drain, then look at what the chat actually saw.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let sent = channel.sent.lock().unwrap().clone();
+        let questions = sent.iter().filter(|m| m.starts_with("Run Bash?")).count();
+        assert_eq!(questions, 1, "exactly one of the two calls was asked about");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_ungatable_agent_says_so_whichever_way_the_switch_is_set() {
+        // "gate on" would be a promise nothing is keeping: codex, pi and the
+        // tmux tier approve their own tools no matter what /auto says.
+        assert!(approvals("claude", false).contains("ask"));
+        assert!(!approvals("claude", true).contains("cannot"));
+        for agent in ["codex", "pi", "omp"] {
+            assert!(
+                approvals(agent, false).contains("cannot be gated"),
+                "{agent}"
+            );
+            assert!(
+                approvals(agent, true).contains("cannot be gated"),
+                "{agent}"
+            );
+        }
     }
 
     #[test]
