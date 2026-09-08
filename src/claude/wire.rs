@@ -28,7 +28,12 @@ pub fn normalize(v: &Value) -> Vec<AgentEvent> {
                 tools: v
                     .get("tools")
                     .and_then(Value::as_array)
-                    .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
                     .unwrap_or_default(),
             }]
         }
@@ -55,7 +60,10 @@ pub fn normalize(v: &Value) -> Vec<AgentEvent> {
         // bookkeeping; an error-shaped one is not.
         Some("control_response") => {
             let response = v.get("response");
-            match response.and_then(|r| r.get("subtype")).and_then(Value::as_str) {
+            match response
+                .and_then(|r| r.get("subtype"))
+                .and_then(Value::as_str)
+            {
                 Some("error") => vec![AgentEvent::Error {
                     message: format!(
                         "control request failed: {}",
@@ -136,9 +144,12 @@ fn assistant(v: &Value) -> Vec<AgentEvent> {
     blocks
         .iter()
         .filter_map(|block| match block.get("type").and_then(Value::as_str) {
-            Some("text") => block.get("text").and_then(Value::as_str).map(|t| AgentEvent::Text {
-                text: t.to_string(),
-            }),
+            Some("text") => block
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|t| AgentEvent::Text {
+                    text: t.to_string(),
+                }),
             Some("tool_use") => Some(AgentEvent::ToolCall {
                 id: text_at(block, "id").unwrap_or_default(),
                 name: text_at(block, "name").unwrap_or_default(),
@@ -234,7 +245,9 @@ mod tests {
             "tools": ["Bash", "Read"]
         });
         match normalize(&frame).as_slice() {
-            [AgentEvent::Ready { session_id, tools, .. }] => {
+            [AgentEvent::Ready {
+                session_id, tools, ..
+            }] => {
                 assert_eq!(session_id, "abc");
                 assert_eq!(tools.len(), 2);
             }
@@ -254,7 +267,9 @@ mod tests {
             }
         });
         match normalize(&frame).as_slice() {
-            [AgentEvent::PermissionRequest { request_id, tool, .. }] => {
+            [AgentEvent::PermissionRequest {
+                request_id, tool, ..
+            }] => {
                 assert_eq!(request_id, "req-1");
                 assert_eq!(tool, "Bash");
             }

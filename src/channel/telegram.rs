@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::{Channel, Inbound, InboundKind, MessageId, ThreadKey};
+use super::{markup, Channel, Inbound, InboundKind, MessageId, ThreadKey};
 
 pub const CHANNEL: &str = "telegram";
 
@@ -47,7 +47,9 @@ pub struct Telegram {
 impl Telegram {
     pub fn new(token: &str, allowed_users: Vec<String>) -> Result<Self> {
         if allowed_users.is_empty() {
-            bail!("refusing to start with an empty allowlist — set OMATETHER_TELEGRAM_ALLOWED_USERS");
+            bail!(
+                "refusing to start with an empty allowlist — set OMATETHER_TELEGRAM_ALLOWED_USERS"
+            );
         }
 
         let http = reqwest::Client::builder()
@@ -106,6 +108,37 @@ impl Telegram {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Post or edit a message, rendered as Telegram HTML.
+    ///
+    /// `text` must already be clipped, and must be the markdown: the fallback
+    /// re-sends it unformatted, and a message that failed to parse as HTML is
+    /// exactly the one whose raw form has to survive.
+    ///
+    /// Telegram counts a message as "1-4096 characters after entities
+    /// parsing", so the tags and the `&amp;`s cost nothing against the limit —
+    /// [`clip`] measures the right string.
+    ///
+    /// The fallback should never fire: [`markup::to_html`] emits every tag
+    /// itself and its tests hold it to balanced output. It is here because the
+    /// failure it covers is losing a reply outright, and because the same
+    /// insurance on the Photon side has a real error to catch.
+    async fn call_rendered(&self, method: &str, mut body: Value, text: &str) -> Result<Value> {
+        body["text"] = json!(markup::to_html(text));
+        body["parse_mode"] = json!("HTML");
+
+        match self.call(method, body.clone()).await {
+            Err(e) if is_parse_failure(&e) => {
+                tracing::warn!("telegram refused our html ({e:#}); resending unformatted");
+                body["text"] = json!(text);
+                if let Some(fields) = body.as_object_mut() {
+                    fields.remove("parse_mode");
+                }
+                self.call(method, body).await
+            }
+            other => other,
+        }
+    }
+
     /// Confirm the token works, and report who we are.
     pub async fn whoami(&self) -> Result<String> {
         let me = self.call("getMe", json!({})).await?;
@@ -136,6 +169,11 @@ impl Telegram {
 
         tokio::spawn(async move {
             let mut offset: i64 = 0;
+            // Only so that a recovery can be logged. A poll that fails for
+            // twenty minutes and then works again is invisible otherwise: the
+            // warnings scroll past and nothing ever says inbound is back, so
+            // "my message got no reply" has no timeline to sit against.
+            let mut failures: u32 = 0;
 
             loop {
                 let body = json!({
@@ -146,13 +184,34 @@ impl Telegram {
 
                 let updates = match self.call("getUpdates", body).await {
                     Ok(Value::Array(updates)) => updates,
-                    Ok(_) => continue,
+                    // Not an array: `ok` was true and `result` was something
+                    // else. Back off like any other failure rather than
+                    // spinning on it — an un-slept `continue` here is a busy
+                    // loop against Telegram.
+                    Ok(other) => {
+                        tracing::warn!("getUpdates returned no update array: {other}");
+                        failures += 1;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
                     Err(e) => {
-                        tracing::warn!("getUpdates failed: {e}");
+                        // `{e:#}` rather than `{e}`: the outer context is
+                        // "telegram getUpdates", which says only which call it
+                        // was. The cause — a timeout, a DNS failure, a 409
+                        // from a second poller on the same token — is the
+                        // whole of the information, and it lives further down
+                        // the chain.
+                        tracing::warn!("getUpdates failed: {e:#}");
+                        failures += 1;
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         continue;
                     }
                 };
+
+                if failures > 0 {
+                    tracing::info!("getUpdates recovered after {failures} failures");
+                    failures = 0;
+                }
 
                 for update in updates {
                     if let Some(id) = update.get("update_id").and_then(Value::as_i64) {
@@ -215,13 +274,38 @@ impl Telegram {
             return None;
         }
 
-        let text = message.get("text").and_then(Value::as_str)?.trim();
+        // A photo or a document carries its words in `caption`, not `text`.
+        // Reading only `text` dropped every screenshot-with-a-question, which
+        // is one of the more natural things to send a coding agent from a
+        // phone.
+        let text = message
+            .get("text")
+            .or_else(|| message.get("caption"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+
+        let thread = thread_key(message)?;
+
         if text.is_empty() {
-            return None;
+            // Silence here is the bug this exists to prevent: a voice note or
+            // a bare photo used to vanish with nothing in the chat and nothing
+            // in the log, which is indistinguishable from the bridge being
+            // down.
+            tracing::info!(thread = %thread, "message with no text to act on");
+            return Some(Inbound {
+                thread,
+                user_id,
+                kind: InboundKind::Unsupported(
+                    "I can only read text. Send words — or a photo with a \
+                     caption — and I will pass it to the agent."
+                        .to_string(),
+                ),
+            });
         }
 
         Some(Inbound {
-            thread: thread_key(message)?,
+            thread,
             user_id,
             kind: InboundKind::Text(text.to_string()),
         })
@@ -243,11 +327,13 @@ impl Channel for Telegram {
         true
     }
 
+    /// A turn is markdown, because the agents write markdown, and Telegram
+    /// renders none of it without a `parse_mode` — this used to arrive as raw
+    /// asterisks and visible backticks. See [`markup`] for why the mode is
+    /// HTML rather than either of Telegram's markdown dialects.
     async fn send(&self, thread: &ThreadKey, text: &str) -> Result<MessageId> {
-        let mut body = self.target(thread);
-        body["text"] = json!(clip(text));
-
-        let result = self.call("sendMessage", body).await?;
+        let body = self.target(thread);
+        let result = self.call_rendered("sendMessage", body, &clip(text)).await?;
         Ok(result
             .get("message_id")
             .and_then(Value::as_i64)
@@ -259,10 +345,12 @@ impl Channel for Telegram {
         let body = json!({
             "chat_id": thread.chat_id,
             "message_id": id.parse::<i64>().unwrap_or_default(),
-            "text": clip(text),
         });
 
-        match self.call("editMessageText", body).await {
+        match self
+            .call_rendered("editMessageText", body, &clip(text))
+            .await
+        {
             Ok(_) => Ok(()),
             // Telegram rejects an edit that would not change anything. That is
             // a no-op for us, not a failure.
@@ -271,6 +359,13 @@ impl Channel for Telegram {
         }
     }
 
+    /// **Sent unformatted**, and deliberately not through [`Self::call_rendered`].
+    ///
+    /// This message quotes a tool's own arguments, and any renderer rewrites
+    /// them: `rm -rf /tmp/*_cache*` would come out as `rm -rf /tmp/_cache`,
+    /// because the asterisks pair into emphasis and are consumed. You would be
+    /// reading one command and tapping Allow on another. Same rule as never
+    /// truncating a question — it goes out exactly as it is, or not at all.
     async fn ask_permission(
         &self,
         thread: &ThreadKey,
@@ -311,8 +406,20 @@ impl Channel for Telegram {
     }
 }
 
+/// Telegram refusing to parse what we sent, as opposed to any other failure.
+///
+/// Matched on the description because that is all the Bot API gives: every
+/// error is a 400 with a sentence in it. Only this one is worth retrying
+/// unformatted; a 429 or a bad chat id would fail the same way twice.
+fn is_parse_failure(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("can't parse entities")
+}
+
 fn user_id(from: Option<&Value>) -> Option<String> {
-    from?.get("id").and_then(Value::as_i64).map(|i| i.to_string())
+    from?
+        .get("id")
+        .and_then(Value::as_i64)
+        .map(|i| i.to_string())
 }
 
 fn thread_key(message: &Value) -> Option<ThreadKey> {
@@ -385,6 +492,74 @@ mod tests {
             InboundKind::Text(t) => assert_eq!(t, "hello"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_photo_caption_is_the_prompt() {
+        // Sending a screenshot with a question is a natural thing to do from a
+        // phone, and the words are in `caption`, not `text`.
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "from": { "id": 42 }, "chat": { "id": 5 },
+                "photo": [{ "file_id": "x" }], "caption": "what is wrong here?"
+            }
+        });
+        match telegram().parse_update(&update).unwrap().kind {
+            InboundKind::Text(t) => assert_eq!(t, "what is wrong here?"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_we_cannot_read_still_gets_an_answer() {
+        // A voice note used to be dropped in silence, which from the phone
+        // looks exactly like the bridge being down.
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "from": { "id": 42 }, "chat": { "id": 5 },
+                "voice": { "file_id": "x", "duration": 3 }
+            }
+        });
+        let inbound = telegram().parse_update(&update).unwrap();
+        assert_eq!(inbound.thread.to_string(), "telegram:5");
+        match inbound.kind {
+            InboundKind::Unsupported(note) => assert!(note.contains("text")),
+            other => panic!("expected unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strangers_get_no_answer_at_all() {
+        // Not even the "I can only read text" note: replying would confirm the
+        // bot exists to whoever found it.
+        let update = json!({
+            "update_id": 1,
+            "message": { "from": { "id": 999 }, "chat": { "id": 5 }, "voice": {} }
+        });
+        assert!(telegram().parse_update(&update).is_none());
+    }
+
+    #[test]
+    fn only_a_parse_failure_is_worth_resending_unformatted() {
+        // The trigger for dropping parse_mode, matched on Telegram's own
+        // sentence because a 400 is all the Bot API ever reports.
+        let parse = anyhow::anyhow!(
+            "telegram sendMessage failed: Bad Request: can't parse entities: \
+             Unsupported start tag \"x\" at byte offset 0"
+        );
+        assert!(is_parse_failure(&parse));
+
+        // Anything else would fail the same way twice.
+        assert!(!is_parse_failure(&anyhow::anyhow!(
+            "telegram sendMessage failed: Bad Request: chat not found"
+        )));
+        assert!(!is_parse_failure(&anyhow::Error::new(
+            super::super::RateLimited {
+                retry_after: Duration::from_secs(3)
+            }
+        )));
     }
 
     #[test]
@@ -462,7 +637,9 @@ mod tests {
                 { "text": "Deny",  "callback_data": format!("{CB_DENY}:{}", "a1b2c3d4")  },
             ]]
         });
-        let allow = sent["inline_keyboard"][0][0]["callback_data"].as_str().unwrap();
+        let allow = sent["inline_keyboard"][0][0]["callback_data"]
+            .as_str()
+            .unwrap();
         assert!(allow.len() <= 64, "Telegram's callback_data limit");
 
         let update = json!({

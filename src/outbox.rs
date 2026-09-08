@@ -118,8 +118,12 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
                 }
                 match &turn {
                     Some(id) => {
-                        if report(&key, "edit", retrying(|| channel.edit(&key, id, &text)).await)
-                            .is_some()
+                        if report(
+                            &key,
+                            "edit",
+                            retrying(|| channel.edit(&key, id, &text)).await,
+                        )
+                        .is_some()
                         {
                             shown = text;
                         }
@@ -171,7 +175,11 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
                         );
                     }
                     _ => {
-                        report(&key, "send", retrying(|| channel.send(&key, &verdict)).await);
+                        report(
+                            &key,
+                            "send",
+                            retrying(|| channel.send(&key, &verdict)).await,
+                        );
                     }
                 }
             }
@@ -282,9 +290,7 @@ mod tests {
         fn rate_limit_if_owed(&self) -> Result<()> {
             if self
                 .rate_limits_left
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                    n.checked_sub(1)
-                })
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
                 return Err(RateLimited {
@@ -366,7 +372,13 @@ mod tests {
         outbox.queue(OutJob::Turn("working, done".into()));
 
         assert!(
-            eventually(Duration::from_secs(2), || channel.edits.lock().unwrap().len() == 2).await,
+            eventually(Duration::from_secs(2), || channel
+                .edits
+                .lock()
+                .unwrap()
+                .len()
+                == 2)
+            .await,
             "expected the first to post and the rest to edit it"
         );
         assert_eq!(channel.sent(), vec!["wor"]);

@@ -81,6 +81,7 @@ thing stays behind the tailnet with nothing exposed.
 | `/attach` | The ssh line to take over at a real terminal |
 | `/status` | Agent, directory, session, whether a turn is running |
 | `/allow`, `/deny <why>` | Answer a permission request without tapping |
+| `/auto [on\|off]` | Approve tool calls without asking. **On by default** |
 | `/help` | The above |
 
 Anything else goes to the agent as typed — including its own slash commands,
@@ -88,10 +89,20 @@ many of which are prompt expansions, so `/review` just works.
 
 ### How a turn looks
 
-Tool calls appear inline as the agent makes them, and permission requests for
-consequential tools block the turn until answered — with **Allow** / **Deny**
-buttons on Telegram, and as a message asking for `/allow` or `/deny` on
-iMessage, which has no buttons.
+Tool calls appear inline as the agent makes them. **By default they run without
+asking** — a thread starts in auto mode, and the reply reads as a log of what
+the agent did rather than a queue of questions.
+
+`/auto off` turns the gate on for that thread. Then a consequential tool call
+blocks the turn until answered — with **Allow** / **Deny** buttons on Telegram,
+and as a message asking for `/allow` or `/deny` on iMessage, which has no
+buttons. `/status` always says which of the two a thread is in.
+
+Auto by default is a considered trade, not an oversight. A gate on every `Bash`
+call from a phone is a tap-Allow reflex within a day, and a prompt nobody reads
+is worse than no prompt at all because it looks like review. The gate is still
+there, per thread, for the directory where it earns its interruption — and the
+setting is stored, so a thread stays where you put it across restarts.
 
 Streaming differs by channel, and the core learns which world it is in from
 `Channel::can_edit` rather than from the channel's name:
@@ -100,16 +111,24 @@ Streaming differs by channel, and the core learns which world it is in from
 |---|---|---|
 | Editing | yes | **never** |
 | A turn arrives as | one message, growing on a 1.5s debounce | one complete message at the end |
+| Markdown | rendered (converted to Telegram's HTML) | rendered natively by iMessage |
 
 iMessage cannot rewrite a sent message under any circumstances, so streaming
 there would mean a stream of fragments. Holding the turn back and delivering it
 whole is the only readable option.
 
-Not every tool asks. Gating all of them is unusable from a phone — the agent
-reads a dozen files before doing anything consequential, and a prompt per read
-trains you to tap Allow without looking. Only `Bash`, `Write`, `Edit` and
-`NotebookEdit` ask; the rest are approved by omatether itself
-(`GATED_TOOLS` in `src/core.rs`).
+Agents write markdown, so both channels render it — bold, bullets, headings,
+and code as code. A permission question is the exception on both: it quotes a
+tool's own arguments and goes out unformatted, because a renderer eats the
+characters it treats as markup and `rm -rf /tmp/*_cache*` must not be shown to
+you as `rm -rf /tmp/_cache`. For the same reason emphasis is read more strictly
+than CommonMark would: a path or a glob keeps its punctuation.
+
+With `/auto off`, not every tool asks even then. Gating all of them is unusable
+from a phone — the agent reads a dozen files before doing anything
+consequential, and a prompt per read trains you to tap Allow without looking.
+Only `Bash`, `Write`, `Edit` and `NotebookEdit` ask; the rest are approved by
+omatether itself (`GATED_TOOLS` in `src/core.rs`).
 
 ### Agents
 
@@ -305,7 +324,8 @@ Deliberately the simplest option in each case; revisit when something hurts.
 | Concurrent turns | Rejected while one runs | More predictable from a phone than queuing, and much simpler than interleaving. |
 | Restart with a turn in flight | Kill the child, resume the conversation | `kill_on_drop` plus `--session-id`. The turn is lost; the conversation is not. |
 | Long output | Truncate | Revisit with a paste file served over the tailnet — chat is a bad place for a 500-line diff. |
-| Which tools ask | Only `Bash`/`Write`/`Edit`/`NotebookEdit` | A prompt per file read trains you to tap Allow without reading it. |
+| Whether tools ask at all | No, by default (`/auto off` per thread) | A gate on every `Bash` from a phone becomes a tap-Allow reflex; a prompt nobody reads only looks like review. |
+| Which tools ask, with the gate on | Only `Bash`/`Write`/`Edit`/`NotebookEdit` | A prompt per file read trains you to tap Allow without reading it. |
 | `/cd` on a live thread | Starts a fresh session | `cwd` is fixed when the agent process starts; the old session stays resumable by id. |
 | Telegram reply threads | Not separate threads | Only forum topics are; otherwise one conversation scatters into a session per reply chain. |
 | Switching agents | Starts a fresh conversation | Transcripts do not move between agents; pretending otherwise would lose context silently. |

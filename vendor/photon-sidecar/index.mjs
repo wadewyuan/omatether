@@ -5,7 +5,8 @@
 // needs over loopback HTTP:
 //
 //   GET  /inbound  -> NDJSON stream, one normalized inbound message per line
-//   POST /send     -> { spaceId, text } -> { ok, messageId }
+//                     (`text` may be empty — an attachment with no words)
+//   POST /send     -> { spaceId, text, format? } -> { ok, messageId }
 //
 // Both require `X-Omatether-Token`. It binds to 127.0.0.1 only; nothing here
 // is safe to expose.
@@ -34,7 +35,7 @@ function requireEnv(name) {
   return value;
 }
 
-const { Spectrum, text: spectrumText } = await import("spectrum-ts");
+const { Spectrum, text: spectrumText, markdown: spectrumMarkdown } = await import("spectrum-ts");
 const { imessage } = await import("spectrum-ts/providers/imessage");
 
 // Spectrum validates credentials against Photon's cloud during construction,
@@ -107,7 +108,12 @@ function normalize(space, message) {
         if (message?.direction && message.direction !== "inbound") continue;
 
         const event = normalize(space, message);
-        if (event.spaceId && event.text) broadcast(event);
+        // Forwarded even with no text: a voice note, a sticker or a bare image
+        // is still someone talking to the bridge, and omatether answers it
+        // rather than leaving them looking at a chat where nothing happened.
+        // Deciding that here would put the rule in two places; the space id is
+        // the only thing that is genuinely unusable.
+        if (event.spaceId) broadcast(event);
       }
       console.error("photon-sidecar: inbound stream ended — re-subscribing");
     } catch (e) {
@@ -157,6 +163,33 @@ async function resolveSpace(spaceId) {
 // ---------------------------------------------------------------------------
 // HTTP
 
+/// Send `text`, asking iMessage to render it as markdown when the caller says
+/// it is markdown.
+///
+/// `markdown` is not a formatting hint the platform may ignore: the iMessage
+/// adapter parses it and sends plain text plus native bold/italic ranges, so
+/// `**bold**` arrives as bold rather than as four asterisks. It also means the
+/// text is *rewritten* — which is why the caller chooses, and why anything that
+/// must arrive verbatim (a permission question quoting a tool's own arguments)
+/// asks for "text" instead. See `Photon::ask_permission`.
+async function sendAs(space, text, format) {
+  if (format !== "markdown") return space.send(spectrumText(text));
+
+  try {
+    return await space.send(spectrumMarkdown(text));
+  } catch (e) {
+    // The renderer refuses text that renders to nothing at all (`**`, an HTML
+    // comment). That is a bad reason to lose a message, and it is raised
+    // before anything is sent, so falling back cannot double-send. Any other
+    // failure is a real one and stays thrown.
+    if (e?.kind === "content" && e?.contentType === "markdown") {
+      console.error("photon-sidecar: markdown render refused, sending as text — " + String(e?.message ?? e));
+      return space.send(spectrumText(text));
+    }
+    throw e;
+  }
+}
+
 function reply(res, status, body) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
@@ -188,12 +221,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && req.url === "/send") {
-      const { spaceId, text } = await readJson(req);
+      const { spaceId, text, format } = await readJson(req);
       if (!spaceId || typeof text !== "string") {
         return reply(res, 400, { ok: false, error: "spaceId and text required" });
       }
+      if (format !== undefined && format !== "text" && format !== "markdown") {
+        return reply(res, 400, { ok: false, error: `unknown format ${format}` });
+      }
       const space = await resolveSpace(spaceId);
-      const result = await space.send(spectrumText(text));
+      // Defaulting to "text" keeps the unsafe direction the explicit one: a
+      // caller that forgets the field gets its string through untouched.
+      const result = await sendAs(space, text, format ?? "text");
       return reply(res, 200, { ok: true, messageId: result?.id ?? null });
     }
 

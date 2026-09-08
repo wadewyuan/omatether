@@ -171,7 +171,7 @@ impl Photon {
                 }
             };
 
-            if let Some(inbound) = self.parse_event(&event, seen) {
+            if let Some(inbound) = parse_event(&self.allowed_users, &event, seen) {
                 if tx.send(inbound).await.is_err() {
                     return Ok(());
                 }
@@ -180,81 +180,20 @@ impl Photon {
         Ok(())
     }
 
-    fn parse_event(
-        &self,
-        event: &Value,
-        seen: &mut std::collections::VecDeque<String>,
-    ) -> Option<Inbound> {
-        let space_id = event.get("spaceId").and_then(Value::as_str)?;
-        let text = event.get("text").and_then(Value::as_str)?.trim();
-        if text.is_empty() {
-            return None;
-        }
-
-        let sender = event
-            .get("senderId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-
-        if !self.is_allowed(&sender) {
-            tracing::info!("dropped photon message from unauthorized sender {sender}");
-            return None;
-        }
-
-        // Dedupe across reconnects. A short window is enough — a replay is
-        // immediate, not hours later.
-        if let Some(id) = event.get("messageId").and_then(Value::as_str) {
-            if seen.contains(&id.to_string()) {
-                return None;
-            }
-            seen.push_back(id.to_string());
-            if seen.len() > 256 {
-                seen.pop_front();
-            }
-        }
-
-        Some(Inbound {
-            thread: ThreadKey {
-                channel: CHANNEL,
-                chat_id: space_id.to_string(),
-                topic_id: None,
-            },
-            user_id: sender,
-            kind: InboundKind::Text(text.to_string()),
-        })
-    }
-
-    fn is_allowed(&self, sender: &str) -> bool {
-        // A sender is a phone number; compare on digits so +1 555 000 and
-        // +1555000 are the same person.
-        let normalized = digits(sender);
-        !normalized.is_empty()
-            && self
-                .allowed_users
-                .iter()
-                .any(|allowed| digits(allowed) == normalized)
-    }
-}
-
-#[async_trait]
-impl Channel for Photon {
-    fn name(&self) -> &'static str {
-        CHANNEL
-    }
-
-    /// iMessage cannot rewrite a sent message.
-    fn can_edit(&self) -> bool {
-        false
-    }
-
-    async fn send(&self, thread: &ThreadKey, text: &str) -> Result<MessageId> {
+    /// Post one message, choosing whether the sidecar renders it as markdown.
+    ///
+    /// The choice is the caller's because it is not cosmetic. `"markdown"`
+    /// means the iMessage adapter *parses* the string and sends plain text plus
+    /// native emphasis ranges, so a decorator becomes actual bold — and so a
+    /// literal `*` in the text is consumed rather than shown. Prose wants that;
+    /// a quoted command does not.
+    async fn post_send(&self, thread: &ThreadKey, text: &str, format: &str) -> Result<MessageId> {
         let response: Value = self
             .http
             .post(format!("{}/send", self.base))
             .header("x-omatether-token", &self.token)
             .timeout(Duration::from_secs(30))
-            .json(&json!({ "spaceId": thread.chat_id, "text": clip(text) }))
+            .json(&json!({ "spaceId": thread.chat_id, "text": clip(text), "format": format }))
             .send()
             .await
             .context("photon /send")?
@@ -277,6 +216,30 @@ impl Channel for Photon {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string())
+    }
+}
+
+#[async_trait]
+impl Channel for Photon {
+    fn name(&self) -> &'static str {
+        CHANNEL
+    }
+
+    /// iMessage cannot rewrite a sent message.
+    fn can_edit(&self) -> bool {
+        false
+    }
+
+    /// A turn is markdown, because the agents write markdown. iMessage has no
+    /// markup of its own, but the Spectrum adapter renders markdown down to
+    /// native styled text — real bold, `•` bullets, headings as bold — so this
+    /// is the platform's own supported path rather than a hack.
+    ///
+    /// Code spans and fences become Unicode mathematical monospace, which reads
+    /// correctly but cannot be pasted into a shell. That is a real cost and it
+    /// was weighed: from a phone these are read far more often than pasted.
+    async fn send(&self, thread: &ThreadKey, text: &str) -> Result<MessageId> {
+        self.post_send(thread, text, "markdown").await
     }
 
     async fn edit(&self, _thread: &ThreadKey, _id: &MessageId, _text: &str) -> Result<()> {
@@ -303,6 +266,15 @@ impl Channel for Photon {
     /// answer arrives as `/allow` or `/deny` text, which is always about
     /// whatever is currently pending. There is no stale tap to guard against
     /// because there is nothing left behind to tap.
+    ///
+    /// **Sent as text, never markdown**, and deliberately not through
+    /// [`Channel::send`]. This message quotes a tool's own arguments, and a
+    /// markdown renderer rewrites them: `rm -rf /tmp/*_cache*` renders as
+    /// `rm -rf /tmp/_cache`, because the asterisks pair into emphasis and are
+    /// consumed. You would be reading one command and approving another. That
+    /// is the same rule as never truncating a question — a permission prompt is
+    /// the one human control here, so it goes out exactly as it is or not at
+    /// all.
     async fn ask_permission(
         &self,
         thread: &ThreadKey,
@@ -310,7 +282,7 @@ impl Channel for Photon {
         _question: &str,
     ) -> Result<MessageId> {
         let question = format!("{text}\n\nReply /allow or /deny <why>");
-        self.send(thread, &question).await
+        self.post_send(thread, &question, "text").await
     }
 }
 
@@ -361,9 +333,7 @@ async fn wait_until_ready(
 fn tokio_util_lines(response: reqwest::Response) -> impl tokio::io::AsyncRead {
     use futures_util::TryStreamExt;
     tokio::io::BufReader::new(tokio_util::io::StreamReader::new(
-        response
-            .bytes_stream()
-            .map_err(std::io::Error::other),
+        response.bytes_stream().map_err(std::io::Error::other),
     ))
 }
 
@@ -406,6 +376,92 @@ fn tail(recent: &RecentLog) -> String {
     }
 }
 
+/// Turn one sidecar line into an inbound message.
+///
+/// A free function rather than a method so the tests can drive the real thing:
+/// `Photon` owns a live child process, and a mirror of these rules in the test
+/// module is a copy that can drift away from the rules it stands in for.
+///
+/// The order of the checks is the load-bearing part. The allowlist comes first,
+/// because a stranger gets silence — not even "I cannot read that", which would
+/// confirm to whoever found the number that something is listening. Only after
+/// that does a message with no words become [`InboundKind::Unsupported`]:
+/// iMessage carries voice notes, stickers and bare images, and dropping them
+/// left the sender looking at a chat where nothing happened, which is exactly
+/// what the bridge being down looks like too.
+fn parse_event(
+    allowed_users: &[String],
+    event: &Value,
+    seen: &mut std::collections::VecDeque<String>,
+) -> Option<Inbound> {
+    let space_id = event.get("spaceId").and_then(Value::as_str)?;
+
+    let sender = event
+        .get("senderId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    if !is_allowed(allowed_users, &sender) {
+        tracing::info!("dropped photon message from unauthorized sender {sender}");
+        return None;
+    }
+
+    // Dedupe across reconnects. A short window is enough — a replay is
+    // immediate, not hours later.
+    if let Some(id) = event.get("messageId").and_then(Value::as_str) {
+        if seen.contains(&id.to_string()) {
+            return None;
+        }
+        seen.push_back(id.to_string());
+        if seen.len() > 256 {
+            seen.pop_front();
+        }
+    }
+
+    let thread = ThreadKey {
+        channel: CHANNEL,
+        chat_id: space_id.to_string(),
+        topic_id: None,
+    };
+
+    let text = event
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+
+    if text.is_empty() {
+        tracing::info!(thread = %thread, "message with no text to act on");
+        return Some(Inbound {
+            thread,
+            user_id: sender,
+            kind: InboundKind::Unsupported(
+                "I can only read text. A voice note or an image on its own has \
+                 nothing in it for me to pass on — send words with it and I \
+                 will."
+                    .to_string(),
+            ),
+        });
+    }
+
+    Some(Inbound {
+        thread,
+        user_id: sender,
+        kind: InboundKind::Text(text.to_string()),
+    })
+}
+
+/// A sender is a phone number; compare on digits so +1 555 000 and +1555000 are
+/// the same person.
+fn is_allowed(allowed_users: &[String], sender: &str) -> bool {
+    let normalized = digits(sender);
+    !normalized.is_empty()
+        && allowed_users
+            .iter()
+            .any(|allowed| digits(allowed) == normalized)
+}
+
 fn digits(value: &str) -> String {
     value.chars().filter(|c| c.is_ascii_digit()).collect()
 }
@@ -423,37 +479,88 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    /// Build one without a sidecar, to exercise the parsing rules.
-    fn parser(allowed: &[&str]) -> ParseOnly {
-        ParseOnly {
-            allowed_users: allowed.iter().map(|s| s.to_string()).collect(),
-        }
+    use serde_json::json;
+
+    /// The one allowed number in these tests.
+    fn allowed() -> Vec<String> {
+        vec!["+1 555 123 4567".to_string()]
     }
 
-    /// The allowlist and event parsing do not need a running process, but
-    /// `Photon` owns a child. This mirrors just those two rules.
-    struct ParseOnly {
-        allowed_users: Vec<String>,
-    }
-
-    impl ParseOnly {
-        fn is_allowed(&self, sender: &str) -> bool {
-            let normalized = digits(sender);
-            !normalized.is_empty()
-                && self
-                    .allowed_users
-                    .iter()
-                    .any(|allowed| digits(allowed) == normalized)
-        }
+    fn parse(event: Value) -> Option<Inbound> {
+        parse_event(&allowed(), &event, &mut VecDeque::new())
     }
 
     #[test]
     fn phone_numbers_compare_on_digits() {
-        let p = parser(&["+1 555 123 4567"]);
-        assert!(p.is_allowed("+15551234567"));
-        assert!(p.is_allowed("+1-555-123-4567"));
-        assert!(!p.is_allowed("+15551234560"));
-        assert!(!p.is_allowed(""));
+        let allowed = allowed();
+        assert!(is_allowed(&allowed, "+15551234567"));
+        assert!(is_allowed(&allowed, "+1-555-123-4567"));
+        assert!(!is_allowed(&allowed, "+15551234560"));
+        assert!(!is_allowed(&allowed, ""));
+    }
+
+    #[test]
+    fn a_message_with_words_is_a_prompt() {
+        let inbound = parse(json!({
+            "spaceId": "space-1",
+            "messageId": "m1",
+            "senderId": "+15551234567",
+            "text": "  run the tests  "
+        }))
+        .expect("an allowed sender with words");
+
+        assert_eq!(inbound.thread.to_string(), "photon:space-1");
+        match inbound.kind {
+            InboundKind::Text(text) => assert_eq!(text, "run the tests"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_message_we_cannot_read_still_gets_an_answer() {
+        // A voice note or a bare image reaches us with an empty `text`. It used
+        // to be dropped — by the sidecar, and then again here — which from the
+        // phone is indistinguishable from the bridge being down.
+        let inbound = parse(json!({
+            "spaceId": "space-1",
+            "messageId": "m1",
+            "senderId": "+15551234567",
+            "text": ""
+        }))
+        .expect("an allowed sender always gets an answer");
+
+        match inbound.kind {
+            InboundKind::Unsupported(note) => assert!(note.contains("text")),
+            other => panic!("expected unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strangers_get_no_answer_at_all() {
+        // Not even the "I can only read text" note: replying would tell whoever
+        // found the number that something is listening on it.
+        assert!(parse(json!({
+            "spaceId": "space-1",
+            "messageId": "m1",
+            "senderId": "+19998887777",
+            "text": ""
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn a_replayed_message_is_parsed_once() {
+        // The sidecar replays after a reconnect, and an unreadable message must
+        // not answer twice any more than a readable one runs twice.
+        let mut seen = VecDeque::new();
+        let event = json!({
+            "spaceId": "space-1",
+            "messageId": "m1",
+            "senderId": "+15551234567",
+            "text": ""
+        });
+        assert!(parse_event(&allowed(), &event, &mut seen).is_some());
+        assert!(parse_event(&allowed(), &event, &mut seen).is_none());
     }
 
     #[test]

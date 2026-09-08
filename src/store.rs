@@ -24,6 +24,14 @@ pub struct ThreadState {
     pub cwd: String,
     /// Which agent this thread talks to.
     pub agent: String,
+    /// Approve tool calls without asking.
+    ///
+    /// On by default, and that is a deliberate product decision rather than an
+    /// oversight: a gate on every Bash call turns a phone into a tap-Allow
+    /// machine, and a prompt nobody reads is worse than no prompt at all
+    /// because it looks like review. `/auto off` puts the gate back, per
+    /// thread, and `/status` always says which world this thread is in.
+    pub auto: bool,
 }
 
 pub struct Store {
@@ -73,7 +81,8 @@ impl Store {
                  session_id TEXT,
                  cwd        TEXT NOT NULL,
                  updated_at INTEGER NOT NULL,
-                 agent      TEXT NOT NULL DEFAULT 'claude'
+                 agent      TEXT NOT NULL DEFAULT 'claude',
+                 auto       INTEGER NOT NULL DEFAULT 1
              );",
         )?;
         Ok(Self { conn })
@@ -96,6 +105,7 @@ impl Store {
             session_id: None,
             cwd: default_cwd.to_string(),
             agent: default_agent.to_string(),
+            auto: true,
         };
         self.put(&state)?;
         Ok(state)
@@ -105,22 +115,24 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT session_id, cwd, agent FROM threads WHERE key = ?1",
+                "SELECT session_id, cwd, agent, auto FROM threads WHERE key = ?1",
                 [key],
                 |row| {
                     let session_id: Option<String> = row.get(0)?;
                     let cwd: String = row.get(1)?;
                     let agent: String = row.get(2)?;
-                    Ok((session_id, cwd, agent))
+                    let auto: i64 = row.get(3)?;
+                    Ok((session_id, cwd, agent, auto != 0))
                 },
             )
             .optional()?;
 
-        Ok(row.map(|(session_id, cwd, agent)| ThreadState {
+        Ok(row.map(|(session_id, cwd, agent, auto)| ThreadState {
             key: key.to_string(),
             session_id,
             cwd,
             agent,
+            auto,
         }))
     }
 
@@ -131,14 +143,22 @@ impl Store {
             .unwrap_or(0);
 
         self.conn.execute(
-            "INSERT INTO threads (key, session_id, cwd, updated_at, agent)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO threads (key, session_id, cwd, updated_at, agent, auto)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(key) DO UPDATE SET
                  session_id = excluded.session_id,
                  cwd        = excluded.cwd,
                  updated_at = excluded.updated_at,
-                 agent      = excluded.agent",
-            rusqlite::params![state.key, state.session_id, state.cwd, now, state.agent],
+                 agent      = excluded.agent,
+                 auto       = excluded.auto",
+            rusqlite::params![
+                state.key,
+                state.session_id,
+                state.cwd,
+                now,
+                state.agent,
+                state.auto as i64
+            ],
         )?;
         Ok(())
     }
@@ -157,6 +177,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     )
     .ok();
 
+    // Whether a thread approves tool calls itself. Defaulting to 1 back-fills
+    // every existing thread into auto mode, which is the point: the prompts
+    // were the complaint.
+    conn.execute(
+        "ALTER TABLE threads ADD COLUMN auto INTEGER NOT NULL DEFAULT 1",
+        [],
+    )
+    .ok();
+
     // `session_id` began as NOT NULL, back when omatether chose the id
     // itself. Codex assigns its own on the first turn, so a thread now starts
     // without one — and SQLite cannot drop a NOT NULL in place, which means a
@@ -169,10 +198,11 @@ fn migrate(conn: &Connection) -> Result<()> {
                  session_id TEXT,
                  cwd        TEXT NOT NULL,
                  updated_at INTEGER NOT NULL,
-                 agent      TEXT NOT NULL DEFAULT 'claude'
+                 agent      TEXT NOT NULL DEFAULT 'claude',
+                 auto       INTEGER NOT NULL DEFAULT 1
              );
-             INSERT INTO threads_migrated (key, session_id, cwd, updated_at, agent)
-                 SELECT key, NULLIF(session_id, ''), cwd, updated_at, agent FROM threads;
+             INSERT INTO threads_migrated (key, session_id, cwd, updated_at, agent, auto)
+                 SELECT key, NULLIF(session_id, ''), cwd, updated_at, agent, auto FROM threads;
              DROP TABLE threads;
              ALTER TABLE threads_migrated RENAME TO threads;
              COMMIT;",
@@ -218,6 +248,7 @@ mod tests {
         assert_eq!(first.session_id, again.session_id);
         assert_eq!(again.cwd, "/home/wy/Work", "default must not overwrite");
         assert_eq!(again.agent, "claude", "default must not overwrite");
+        assert!(first.auto, "a new thread approves its own tools");
     }
 
     #[test]
@@ -229,12 +260,14 @@ mod tests {
         state.cwd = "/b".into();
         state.session_id = Some("thread-from-codex".into());
         state.agent = "codex".into();
+        state.auto = false;
         store.put(&state).unwrap();
 
         let read = store.get("telegram:2").unwrap().unwrap();
         assert_eq!(read.cwd, "/b");
         assert_eq!(read.session_id.as_deref(), Some("thread-from-codex"));
         assert_eq!(read.agent, "codex");
+        assert!(!read.auto, "a thread that asked for the gate keeps it");
     }
 
     /// The schema omatether shipped before agents chose their own session id.
@@ -263,6 +296,7 @@ mod tests {
         assert_eq!(existing.session_id.as_deref(), Some("old-uuid"));
         assert_eq!(existing.cwd, "/home/wy/Work");
         assert_eq!(existing.agent, "claude", "back-filled by the migration");
+        assert!(existing.auto, "back-filled by the migration");
 
         // And a new thread, which has no id until its agent assigns one, no
         // longer trips a NOT NULL constraint.

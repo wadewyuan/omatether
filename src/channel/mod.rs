@@ -8,6 +8,7 @@
 //! there has to arrive whole. [`Channel::can_edit`] is how the core learns
 //! which world it is in without knowing which channel it is talking to.
 
+mod markup;
 pub mod photon;
 pub mod photon_setup;
 pub mod telegram;
@@ -83,6 +84,13 @@ pub enum InboundKind {
         /// now — a decision about a tool the person never saw.
         question: String,
     },
+    /// Something the channel saw, recognized as addressed to us, and cannot
+    /// turn into a prompt — a voice note, a sticker, a photo with no caption.
+    ///
+    /// Carried through rather than dropped at the edge, because from the phone
+    /// a dropped message and a broken bridge look identical: you sent
+    /// something and nothing came back. The text is what to tell the sender.
+    Unsupported(String),
 }
 
 #[async_trait]

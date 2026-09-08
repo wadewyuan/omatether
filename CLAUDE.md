@@ -168,6 +168,49 @@ than acting on it.
 token (`allow:<token>`) and a tap naming a question that is no longer open is
 refused rather than applied to whatever is pending now.
 
+**A message is not always `text`.** A photo or a document carries its words in
+`caption`, and a voice note carries none at all. Reading only `text` dropped
+both — silently, with nothing in the log and nothing in the chat, which from a
+phone is indistinguishable from the bridge being down. Captions are now read as
+prompts, and anything with no words at all comes through as
+`InboundKind::Unsupported` so the sender is told rather than ignored. If you add
+a channel, the rule is: an allowed user who sent something always gets an
+answer, even if the answer is "I cannot read that".
+
+**A failing poller used to say nothing useful.** `getUpdates failed: telegram
+getUpdates` was the whole warning — `{e}` prints only anyhow's outermost
+context, which here is just the name of the call. The cause (a timeout, DNS, a
+409 from a second poller on the same token) is in the chain and needs `{e:#}`.
+Recovery is logged too: without it, a poll that fails for twenty minutes and
+then works again leaves no timeline for "my message got no reply" to sit
+against.
+
+**Telegram renders nothing without a `parse_mode`, and the mode has to be
+HTML.** A turn is markdown — the agents write it — so it used to arrive as raw
+`**asterisks**` and visible backticks. `MarkdownV2` is not the fix: it requires
+`.`, `-`, `(`, `!` and eleven more characters to be escaped everywhere they are
+not markup, so ordinary prose fails to parse, and a message Telegram cannot
+parse is a 400 — a *lost* reply, not an ugly one. Legacy `Markdown` still trips
+on the unbalanced `*` that streaming produces on nearly every flush, because a
+turn is sent mid-sentence. HTML has three characters to escape and cannot be
+unbalanced, since `src/channel/markup.rs` emits every tag itself.
+
+That converter is deliberately stricter than CommonMark about emphasis, and it
+is the same rule as never truncating a permission question: **markup that fires
+by accident deletes its own delimiters.** CommonMark renders `ls /tmp/*_cache*`
+as `ls /tmp/_cache` and `/a/_b_/c.rs` as `/a/b/c.rs` — a name that is not the
+one the agent used, with nothing on screen to say so. So `_` is never emphasis
+(in a chat about code it is `file_path` and `__init__`), and `*` only opens at
+the start of a word and closes at the end of one. Permission questions skip the
+renderer entirely, as they do on Photon.
+
+**Telegram validates entities before it resolves the chat**, which is a free
+test rig: `sendMessage` with `chat_id: 0` answers `can't parse entities: …` for
+HTML it rejects and `chat not found` for HTML it accepts, and nothing is
+delivered to anyone either way. Every rendered string in `markup.rs`'s tests,
+plus a realistic turn, was checked against the live parser that way — the
+unformatted fallback in `call_rendered` has never had to fire.
+
 **Only forum topics are separate threads.** Plain replies in a group also set
 `message_thread_id`; treating those as threads scatters one conversation into a
 session per reply chain.
@@ -202,6 +245,26 @@ its life to ours for free when spawned with a piped stdin.
 exists and why a turn on Photon arrives whole at the end with only a typing
 indicator meanwhile.
 
+**`format: "markdown"` on the sidecar's `/send` is not a hint — the adapter
+*parses* the string** and sends plain text plus native emphasis ranges, so
+`**bold**` becomes real bold and a literal `*` is consumed rather than shown.
+Prose wants that; a permission question quoting a tool's own arguments does not,
+so it asks for `"text"` and the field defaults to `"text"` — the direction that
+cannot silently rewrite anything is the one you get by forgetting. Code spans
+come out as Unicode mathematical monospace: readable, not pasteable, and worth
+it from a phone. The renderer also refuses text that renders to nothing at all
+(`**`, an HTML comment), which is a bad reason to lose a message, so the sidecar
+falls back to plain text on that one error — it is raised before anything is
+sent, so the fallback cannot double-send.
+
+**A textless message was dropped twice over.** The sidecar only broadcast events
+with a non-empty `text`, and `parse_event` dropped them again, so a voice note
+or a bare image vanished with nothing in the chat and nothing in the log — the
+Telegram bug above, in a second place. Both now carry it through as
+`InboundKind::Unsupported`. The order in `parse_event` is load-bearing: the
+allowlist runs *first*, because a stranger gets silence rather than a reply that
+confirms the number is a bridge.
+
 ## Storage
 
 **Databases exist in the wild. Changing `CREATE TABLE` is not a migration.**
@@ -235,7 +298,20 @@ alone.
   regression.
 - **The gate must be confirmed, not assumed.** An agent that claims to gate
   tools has to prove it at startup; a gate that silently failed to install is
-  indistinguishable from an agent that had nothing to ask about.
+  indistinguishable from an agent that had nothing to ask about. This holds
+  even though threads now start with the gate *open* — see below. Auto mode is
+  a decision the core makes about a question it received; a handshake that
+  failed means the question never arrives, and those are not the same state.
+- **Auto mode is the default, and it is a product decision.** A thread approves
+  its own tool calls unless someone types `/auto off`; the bit lives in
+  `threads.auto` and is mirrored into `Thread.auto` so the hot path — every
+  tool call the agent makes — never touches sqlite. It was turned on because
+  gating every `Bash` from a phone produced a tap-Allow reflex within a day,
+  and a prompt nobody reads is worse than no prompt because it looks like
+  review. Two things follow: the gate must stay working (`/auto off` is the
+  reason the whole `PreToolUse` apparatus is still here), and every place that
+  describes the product has to say the default out loud — `/help`, `/status`
+  and the README all do.
 - **Never show a question you had to cut off.** A permission prompt is the one
   human control here, so the full tool input goes out whole or goes to a file
   with a pointer — never clipped by the channel with "… truncated".
