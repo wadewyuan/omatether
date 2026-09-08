@@ -144,6 +144,12 @@ impl TurnRenderer {
         !self.sent.is_empty()
     }
 
+    /// Whether the turn has real content to show, as opposed to the temporary
+    /// `working…`/`thinking…` placeholder used by non-editing channels.
+    pub fn has_content(&self) -> bool {
+        !self.segments.is_empty()
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finished
     }

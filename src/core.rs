@@ -838,7 +838,17 @@ impl Core {
     }
 
     fn flush_all(&mut self) {
-        let keys: Vec<ThreadKey> = self.threads.keys().cloned().collect();
+        // A completed turn is flushed immediately from `on_agent_event`, then
+        // its renderer is reset. Do not let the next debounce tick flush that
+        // fresh renderer, or it would edit the Telegram message back to
+        // `working…`. The final flush itself is still unaffected: it happens
+        // before `turn_running` is cleared.
+        let keys: Vec<ThreadKey> = self
+            .threads
+            .iter()
+            .filter_map(|(key, thread)| thread.turn_running.then_some(key.clone()))
+            .collect();
+
         for key in keys {
             self.flush(&key);
         }
@@ -866,6 +876,14 @@ impl Core {
                 // flush a wasted message.
                 let deliver_whole = !can_edit || !thread.session.streams();
                 if deliver_whole && !thread.renderer.is_finished() {
+                    return;
+                }
+                // Telegram has a typing action for the pre-answer gap. Do not
+                // turn the renderer's fallback placeholder into a real
+                // message; otherwise the first flush posts `working…` and the
+                // answer has to edit over it. The typing action remains active
+                // until actual content reaches the chat.
+                if can_edit && !thread.renderer.has_content() {
                     return;
                 }
                 match thread.renderer.pending() {
@@ -1490,6 +1508,86 @@ mod tests {
             channel.typing(),
             vec![true, false],
             "the growing message took over"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_completed_editing_turn_is_not_flushed_again_on_the_next_tick() {
+        let dir = std::env::temp_dir().join(format!("sb-flush-after-end-{}", std::process::id()));
+        let channel = CountingChannel::editing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+
+        let thread = core.threads.get_mut(&key).unwrap();
+        thread.renderer.apply(&AgentEvent::Text {
+            text: "the complete answer".into(),
+        });
+        thread.renderer.apply(&AgentEvent::TurnEnd {
+            ok: true,
+            detail: None,
+        });
+        core.flush(&key);
+        let thread = core.threads.get_mut(&key).unwrap();
+        thread.renderer.reset();
+        thread.turn_running = false;
+
+        // The next debounce tick must not edit the answer back to `working…`.
+        core.flush_all();
+        settle().await;
+
+        assert_eq!(
+            channel.sent.lock().unwrap().clone(),
+            vec!["the complete answer"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_completed_non_editing_turn_still_flushes_its_complete_answer() {
+        let dir = std::env::temp_dir().join(format!("sb-flush-imessage-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+
+        let thread = core.threads.get_mut(&key).unwrap();
+        thread.renderer.apply(&AgentEvent::Text {
+            text: "the complete iMessage answer".into(),
+        });
+        thread.renderer.apply(&AgentEvent::TurnEnd {
+            ok: true,
+            detail: None,
+        });
+        core.flush(&key);
+        let thread = core.threads.get_mut(&key).unwrap();
+        thread.renderer.reset();
+        thread.turn_running = false;
+        core.flush_all();
+        settle().await;
+
+        assert_eq!(
+            channel.sent.lock().unwrap().clone(),
+            vec!["the complete iMessage answer"]
         );
         std::fs::remove_dir_all(&dir).ok();
     }
