@@ -131,12 +131,17 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
-    /// Show that the agent is working.
+    /// Show, or stop showing, that the agent is working.
     ///
-    /// Only worth sending on channels that cannot stream: where a message grows
-    /// as the turn runs, that *is* the indicator, and an extra one costs rate
-    /// limit for nothing.
-    async fn typing(&self, _thread: &ThreadKey) -> Result<()> {
+    /// Indicators expire: Telegram's lasts about five seconds and cannot be
+    /// extended or withdrawn, iMessage's stays until it is turned off. So this
+    /// is called repeatedly while a turn runs and once with `on` false when it
+    /// is over, and a channel implements whichever half its platform has —
+    /// the core does not know which that is.
+    ///
+    /// Best effort by contract: an indicator that fails to appear must never
+    /// cost the reply it was announcing.
+    async fn typing(&self, _thread: &ThreadKey, _on: bool) -> Result<()> {
         Ok(())
     }
 }

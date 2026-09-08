@@ -65,8 +65,8 @@ pub enum OutJob {
     /// Acknowledge a tap that settled nothing, so the client stops spinning.
     Ack { ack: String, note: String },
 
-    /// Show that the agent is working.
-    Typing,
+    /// Show, or stop showing, that the agent is working.
+    Typing { on: bool },
 }
 
 /// The core's handle on one thread's outbound task.
@@ -192,8 +192,13 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
                 );
             }
 
-            OutJob::Typing => {
-                report(&key, "typing", retrying(|| channel.typing(&key)).await);
+            // The one job that is not worth waiting out a rate limit for.
+            // Retrying would park this task for the platform's whole retry
+            // window with the turn's actual text queued behind an indicator
+            // that will be stale by the time it lands — and another one is due
+            // in a few seconds anyway.
+            OutJob::Typing { on } => {
+                report(&key, "typing", channel.typing(&key, on).await);
             }
         }
     }

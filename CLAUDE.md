@@ -211,6 +211,14 @@ delivered to anyone either way. Every rendered string in `markup.rs`'s tests,
 plus a realistic turn, was checked against the live parser that way — the
 unformatted fallback in `call_rendered` has never had to fire.
 
+**A chat action expires after about five seconds and cannot be withdrawn.**
+So the working indicator is a heartbeat, not a switch: the core re-sends it
+every 4s while a turn is running and there is nothing else on screen yet, and
+`typing(_, false)` is a no-op here because there is nothing to withdraw. It is
+also the one job `src/outbox.rs` does *not* retry through a rate limit —
+waiting out a 429 would park the thread's queue, with the turn's actual text
+behind an indicator that is stale by the time it lands.
+
 **Only forum topics are separate threads.** Plain replies in a group also set
 `message_thread_id`; treating those as threads scatters one conversation into a
 session per reply chain.
@@ -240,6 +248,23 @@ required; `node_modules` is gitignored.
 
 `PHOTON_SIDECAR_WATCH_STDIN=1` makes the sidecar exit on stdin EOF, which binds
 its life to ours for free when spawned with a piped stdin.
+
+**`space.typing(...)` is not a method on a Space, and optional chaining hid
+that.** The sidecar called `await space.typing?.("start")`, which is
+`undefined`, so the call evaluated to nothing: no request, no error, no log,
+and a `{ok:true}` back to Rust. The typing indicator had never once appeared.
+The names the SDK does have are `space.startTyping()` / `space.stopTyping()`
+(sugar over `space.send(typing("start"|"stop"))`) — verified by reading the
+space wrapper in the installed `@spectrum-ts/core` 12.7.0 bundle, which builds
+exactly those two. `?.` on a method you believe exists buys nothing and costs
+the error that would have told you.
+
+**Unlike Telegram's, this indicator does not expire**, so `/typing` takes a
+`state` and the stop half is load-bearing: without it a chat is left showing
+three dots for an agent that finished, was interrupted, or had its session
+dropped by `/cd`. The Rust side checks the HTTP status on this call for the
+same reason the `succeed:false` lesson below exists — silence was the failure
+mode last time.
 
 **iMessage can never edit a sent message**, which is why `Channel::can_edit`
 exists and why a turn on Photon arrives whole at the end with only a typing
@@ -312,6 +337,16 @@ alone.
   reason the whole `PreToolUse` apparatus is still here), and every place that
   describes the product has to say the default out loud — `/help`, `/status`
   and the README all do.
+- **An indicator must never outlive what it is claiming.** The working
+  indicator comes down on the first signal that the turn is over — the event
+  that ends it, or the adapter's busy flag — never the last, because the two
+  clear in different orders per agent (Claude's before the end of the turn goes
+  out, Codex's and pi's a moment after). It also comes down while a permission
+  question is outstanding: what the exchange is waiting for there is a person,
+  and dots under the question say the opposite. The bookkeeping lives beside
+  `outboxes` rather than inside a `Thread` for the same reason that one does —
+  `/new` and `/cd` drop a session mid-turn, and something still has to turn the
+  indicator off afterwards.
 - **Never show a question you had to cut off.** A permission prompt is the one
   human control here, so the full tool input goes out whole or goes to a file
   with a pointer — never clipped by the channel with "… truncated".

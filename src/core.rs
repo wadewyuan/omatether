@@ -26,6 +26,14 @@ use crate::store::Store;
 /// reader is not watching text reflow constantly.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// How often the "working" indicator is refreshed while a turn runs.
+///
+/// Telegram's chat action expires after about five seconds and cannot be
+/// extended, so anything slower leaves the chat looking idle mid-turn. Well
+/// inside the per-chat budget even alongside the flushes, and typing is the
+/// one job the outbox drops rather than retries.
+const TYPING_INTERVAL: Duration = Duration::from_secs(4);
+
 /// Tools that require a human decision. Everything else is approved by
 /// omatether without bothering anyone.
 ///
@@ -61,6 +69,15 @@ struct Thread {
     /// tool call the agent makes — never touches the database. The store stays
     /// the source of truth across restarts.
     auto: bool,
+    /// Whether a turn is running, as the *chat* sees it: set when a prompt is
+    /// accepted, cleared by the event that ends the turn.
+    ///
+    /// Not a duplicate of `session.is_busy()`, which is the adapter's view of
+    /// its own process and clears on its own schedule — Claude's before the
+    /// end of the turn goes out, Codex's and pi's a moment after. The working
+    /// indicator comes down on whichever of the two says the turn is over
+    /// first, so neither a late flag nor a missed event can leave it up.
+    turn_running: bool,
 }
 
 struct PendingPermission {
@@ -90,6 +107,14 @@ pub struct Core {
     outboxes: HashMap<ThreadKey, Outbox>,
     default_cwd: PathBuf,
     threads: HashMap<ThreadKey, Thread>,
+    /// When each thread's "working" indicator was last sent, and by its
+    /// presence, that one is showing at all.
+    ///
+    /// Kept beside `threads` rather than inside a [`Thread`] for the same
+    /// reason `outboxes` is: an indicator has to be turned off after the
+    /// session it belonged to is gone, and `/new` and `/cd` drop sessions
+    /// mid-turn.
+    typing: HashMap<ThreadKey, std::time::Instant>,
     agent_tx: mpsc::Sender<(ThreadKey, AgentEvent)>,
     agent_rx: mpsc::Receiver<(ThreadKey, AgentEvent)>,
 }
@@ -111,6 +136,7 @@ impl Core {
             outboxes: HashMap::new(),
             default_cwd,
             threads: HashMap::new(),
+            typing: HashMap::new(),
             agent_tx,
             agent_rx,
         }
@@ -136,6 +162,9 @@ impl Core {
 
                 _ = ticker.tick() => {
                     self.flush_all();
+                    // After the flush, so that the first text of a turn to
+                    // reach the chat retires the indicator in the same tick.
+                    self.refresh_typing_all();
                 }
 
                 else => break,
@@ -205,19 +234,14 @@ impl Core {
         }
 
         thread.renderer.reset();
+        thread.turn_running = true;
 
         // A new turn grows a new message rather than continuing the last one's.
         self.queue(key, OutJob::NewTurn);
 
-        // Where the reply cannot arrive progressively, this is the only sign
-        // anything is happening.
-        let can_edit = self
-            .channel(key)
-            .map(|channel| channel.can_edit())
-            .unwrap_or(false);
-        if !can_edit {
-            self.queue(key, OutJob::Typing);
-        }
+        // Straight away rather than on the next tick: the gap between sending
+        // a prompt and seeing anything at all is exactly what this is for.
+        self.refresh_typing(key);
         Ok(())
     }
 
@@ -243,6 +267,7 @@ impl Core {
             Some(thread) => {
                 thread.session.cancel().await?;
                 thread.renderer.reset();
+                thread.turn_running = false;
                 thread.pending = None;
                 self.say(key, "Stopped.")
             }
@@ -512,6 +537,8 @@ impl Core {
             },
         );
 
+        // The agent has the answer and is working again.
+        self.refresh_typing(key);
         Ok(())
     }
 
@@ -577,7 +604,11 @@ impl Core {
             self.flush(key);
             if let Some(thread) = self.threads.get_mut(key) {
                 thread.renderer.reset();
+                thread.turn_running = false;
             }
+            // Queued behind the last flush, so the indicator comes down as the
+            // reply lands rather than a tick later.
+            self.stop_typing(key);
         }
         Ok(())
     }
@@ -650,6 +681,9 @@ impl Core {
                 question,
             });
         }
+        // What the exchange is waiting on is now a person. Dots under the
+        // question would say the opposite.
+        self.stop_typing(key);
         Ok(())
     }
 
@@ -730,6 +764,76 @@ impl Core {
         match self.outbox(key) {
             Some(outbox) => outbox.queue(job),
             None => false,
+        }
+    }
+
+    /// Whether this thread has something an indicator would be telling the
+    /// truth about.
+    ///
+    /// Three ways it does not. The turn is over, so there is nothing to wait
+    /// for. A permission question is outstanding, so what the exchange is
+    /// waiting on is a person, not the agent — leaving the dots up there says
+    /// the opposite. Or the turn's own message is already on screen and
+    /// growing, which on a channel that can edit *is* the indicator; a second
+    /// one costs rate limit to say what the first is already saying.
+    ///
+    /// Note the last one does not fire for an agent that does not stream, or a
+    /// channel that cannot edit: those hold the whole turn back until it is
+    /// finished, so the indicator is all there is for as long as it runs.
+    fn is_working(&self, key: &ThreadKey) -> bool {
+        let Some(thread) = self.threads.get(key) else {
+            return false;
+        };
+        if !thread.turn_running || !thread.session.is_busy() || thread.pending.is_some() {
+            return false;
+        }
+        match self.channel(key) {
+            Some(channel) => !(channel.can_edit() && thread.renderer.has_sent()),
+            None => false,
+        }
+    }
+
+    /// Bring one thread's indicator in line with whether it is working.
+    ///
+    /// Idempotent and cheap to call often: it re-sends only once the platform
+    /// would have expired the last one, and turns the indicator off exactly
+    /// once, when it was on.
+    fn refresh_typing(&mut self, key: &ThreadKey) {
+        match (self.is_working(key), self.typing.get(key).copied()) {
+            // Still showing and not stale yet.
+            (true, Some(sent)) if sent.elapsed() < TYPING_INTERVAL => {}
+            (true, _) => {
+                if self.queue(key, OutJob::Typing { on: true }) {
+                    self.typing.insert(key.clone(), std::time::Instant::now());
+                }
+            }
+            (false, _) => self.stop_typing(key),
+        }
+    }
+
+    /// Take the indicator down, if one is up.
+    ///
+    /// Forgotten before it is queued: an indicator nobody can turn off is a
+    /// worse outcome than one turned off twice.
+    fn stop_typing(&mut self, key: &ThreadKey) {
+        if self.typing.remove(key).is_some() {
+            self.queue(key, OutJob::Typing { on: false });
+        }
+    }
+
+    /// Every thread showing an indicator, plus every thread that might need
+    /// one. The two sets differ: a session dropped mid-turn by `/new` or `/cd`
+    /// leaves an indicator behind and no thread to notice it.
+    fn refresh_typing_all(&mut self) {
+        let mut keys: Vec<ThreadKey> = self.threads.keys().cloned().collect();
+        keys.extend(
+            self.typing
+                .keys()
+                .filter(|key| !self.threads.contains_key(*key))
+                .cloned(),
+        );
+        for key in keys {
+            self.refresh_typing(&key);
         }
     }
 
@@ -888,6 +992,7 @@ impl Core {
                 renderer: TurnRenderer::new(),
                 pending: None,
                 auto: state.auto,
+                turn_running: false,
             },
         );
         Ok(())
@@ -1103,6 +1208,33 @@ mod tests {
     /// Counts what reached the chat, so a test can tell one message from ten.
     struct CountingChannel {
         sent: std::sync::Mutex<Vec<String>>,
+        /// Every `typing` call, in order, as `on`.
+        typing: std::sync::Mutex<Vec<bool>>,
+        can_edit: bool,
+    }
+
+    impl CountingChannel {
+        /// Telegram's shape: a turn grows one message.
+        fn editing() -> Arc<Self> {
+            Arc::new(Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                typing: std::sync::Mutex::new(Vec::new()),
+                can_edit: true,
+            })
+        }
+
+        /// iMessage's shape: nothing arrives until the turn is done.
+        fn write_only() -> Arc<Self> {
+            Arc::new(Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                typing: std::sync::Mutex::new(Vec::new()),
+                can_edit: false,
+            })
+        }
+
+        fn typing(&self) -> Vec<bool> {
+            self.typing.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1111,7 +1243,11 @@ mod tests {
             "fake"
         }
         fn can_edit(&self) -> bool {
-            true
+            self.can_edit
+        }
+        async fn typing(&self, _t: &ThreadKey, on: bool) -> Result<()> {
+            self.typing.lock().unwrap().push(on);
+            Ok(())
         }
         async fn send(&self, _t: &ThreadKey, text: &str) -> Result<String> {
             let mut sent = self.sent.lock().unwrap();
@@ -1128,7 +1264,20 @@ mod tests {
     }
 
     /// An agent that runs no process. Enough for the core to have a session.
-    struct StubAgent;
+    struct StubAgent {
+        busy: bool,
+    }
+
+    impl StubAgent {
+        fn idle() -> Self {
+            Self { busy: false }
+        }
+
+        /// A turn in flight, which is the state the working indicator is about.
+        fn busy() -> Self {
+            Self { busy: true }
+        }
+    }
 
     #[async_trait::async_trait]
     impl Agent for StubAgent {
@@ -1142,7 +1291,7 @@ mod tests {
             true
         }
         fn is_busy(&self) -> bool {
-            false
+            self.busy
         }
         async fn prompt(&mut self, _text: &str) -> Result<()> {
             Ok(())
@@ -1163,9 +1312,7 @@ mod tests {
         // turn again every 1.5 seconds — on someone's phone. Verified to fail
         // when that mistake is reintroduced.
         let dir = std::env::temp_dir().join(format!("sb-tick-{}", std::process::id()));
-        let channel = Arc::new(CountingChannel {
-            sent: std::sync::Mutex::new(Vec::new()),
-        });
+        let channel = CountingChannel::editing();
         let key = ThreadKey {
             channel: "fake",
             chat_id: "1".into(),
@@ -1187,10 +1334,11 @@ mod tests {
         core.threads.insert(
             key.clone(),
             Thread {
-                session: Box::new(StubAgent),
+                session: Box::new(StubAgent::idle()),
                 renderer,
                 pending: None,
                 auto: true,
+                turn_running: false,
             },
         );
 
@@ -1222,9 +1370,7 @@ mod tests {
         // Both halves matter: auto mode that cannot be turned off is a product
         // with no gate at all, which is not what the flag was for.
         let dir = std::env::temp_dir().join(format!("sb-auto-{}", std::process::id()));
-        let channel = Arc::new(CountingChannel {
-            sent: std::sync::Mutex::new(Vec::new()),
-        });
+        let channel = CountingChannel::editing();
         let key = ThreadKey {
             channel: "fake",
             chat_id: "1".into(),
@@ -1241,10 +1387,11 @@ mod tests {
         core.threads.insert(
             key.clone(),
             Thread {
-                session: Box::new(StubAgent),
+                session: Box::new(StubAgent::idle()),
                 renderer: TurnRenderer::new(),
                 pending: None,
                 auto: true,
+                turn_running: false,
             },
         );
 
@@ -1275,6 +1422,229 @@ mod tests {
         let questions = sent.iter().filter(|m| m.starts_with("Run Bash?")).count();
         assert_eq!(questions, 1, "exactly one of the two calls was asked about");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Poll until the outbox has drained what the core queued.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    }
+
+    fn core_with(channel: Arc<CountingChannel>, dir: &std::path::Path) -> Core {
+        Core::new(
+            Store::in_memory().unwrap(),
+            vec![channel],
+            PathBuf::from("/tmp"),
+            "claude".into(),
+            dir.to_path_buf(),
+        )
+    }
+
+    fn fake_key() -> ThreadKey {
+        ThreadKey {
+            channel: "fake",
+            chat_id: "1".into(),
+            topic_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_working_indicator_stops_once_the_turn_itself_is_on_screen() {
+        // On a channel that can edit, the gap the indicator exists to cover is
+        // only the one before the first flush: after that the turn's own
+        // message is growing, and a second signal costs rate limit to repeat
+        // what the first is already saying.
+        let dir = std::env::temp_dir().join(format!("sb-typ1-{}", std::process::id()));
+        let channel = CountingChannel::editing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+
+        core.refresh_typing(&key);
+        settle().await;
+        assert_eq!(channel.typing(), vec![true], "nothing shown yet, so say so");
+
+        // The agent says something and it reaches the chat.
+        core.threads
+            .get_mut(&key)
+            .unwrap()
+            .renderer
+            .apply(&AgentEvent::Text {
+                text: "working on it".into(),
+            });
+        core.flush(&key);
+        core.refresh_typing_all();
+        settle().await;
+
+        assert_eq!(
+            channel.typing(),
+            vec![true, false],
+            "the growing message took over"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_cannot_edit_keeps_the_indicator_for_the_whole_turn() {
+        // iMessage: nothing arrives until the turn is finished, so the
+        // indicator is the only sign of life there is, and it has to be
+        // refreshed rather than sent once — Telegram's expires in about five
+        // seconds, and a turn takes longer than that.
+        let dir = std::env::temp_dir().join(format!("sb-typ2-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+
+        core.refresh_typing(&key);
+        // Mid-turn text changes nothing here: it is held back until the end.
+        core.threads
+            .get_mut(&key)
+            .unwrap()
+            .renderer
+            .apply(&AgentEvent::Text {
+                text: "working on it".into(),
+            });
+        core.flush(&key);
+        core.refresh_typing_all();
+        settle().await;
+        assert_eq!(channel.typing(), vec![true], "still the only sign of life");
+
+        // Ticks inside the refresh interval do not re-send it either.
+        core.refresh_typing_all();
+        core.refresh_typing_all();
+        settle().await;
+        assert_eq!(channel.typing(), vec![true]);
+
+        // Once it is stale, it is renewed.
+        *core.typing.get_mut(&key).unwrap() =
+            std::time::Instant::now() - TYPING_INTERVAL - Duration::from_millis(1);
+        core.refresh_typing_all();
+        settle().await;
+        assert_eq!(channel.typing(), vec![true, true], "renewed before expiry");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_indicator_comes_down_with_the_turn_and_while_a_question_waits() {
+        // Both are the same mistake: dots that say the agent is working when
+        // it is finished, or when what it is waiting for is a person. On
+        // iMessage the indicator does not expire on its own, so nothing else
+        // takes it down.
+        let dir = std::env::temp_dir().join(format!("sb-typ3-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: false,
+                turn_running: true,
+            },
+        );
+
+        core.refresh_typing(&key);
+        settle().await;
+        assert_eq!(channel.typing(), vec![true]);
+
+        // A gated tool call: the turn is now blocked on someone reading it.
+        core.on_permission(
+            &key,
+            "r1".into(),
+            "Bash".into(),
+            serde_json::json!({ "command": "ls" }),
+        )
+        .await
+        .unwrap();
+        settle().await;
+        assert_eq!(
+            channel.typing(),
+            vec![true, false],
+            "a question is waiting on a person, not on the agent"
+        );
+
+        // Answering it puts the agent back to work.
+        core.decide(&key, Decision::allow(), None).await.unwrap();
+        settle().await;
+        assert_eq!(channel.typing(), vec![true, false, true]);
+
+        // And the end of the turn takes it down for good, even though this
+        // agent has not got round to clearing its busy flag.
+        core.on_agent_event(
+            &key,
+            AgentEvent::TurnEnd {
+                ok: true,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+        settle().await;
+        assert_eq!(channel.typing(), vec![true, false, true, false]);
+
+        // Nothing left to turn off, so no second one.
+        core.refresh_typing_all();
+        settle().await;
+        assert_eq!(channel.typing().len(), 4);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_session_dropped_mid_turn_does_not_leave_the_dots_up() {
+        // `/new` and `/cd` end a session while a turn is running. The thread
+        // is gone, so anything that looks for the indicator through `threads`
+        // will never find this one to turn it off — which on iMessage means a
+        // chat left showing three dots indefinitely.
+        let dir = std::env::temp_dir().join(format!("sb-typ4-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+        core.refresh_typing(&key);
+        settle().await;
+        assert_eq!(channel.typing(), vec![true]);
+
+        core.on_new(&key).await.unwrap();
+        core.refresh_typing_all();
+        settle().await;
+
+        assert_eq!(channel.typing(), vec![true, false]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

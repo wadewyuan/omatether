@@ -135,6 +135,15 @@ impl TurnRenderer {
         self.sent = text;
     }
 
+    /// Whether any of this turn has reached the chat yet.
+    ///
+    /// What the working indicator is for: until the first flush lands there is
+    /// nothing on screen at all, and on a channel that can edit, the turn's
+    /// own growing message takes over from there.
+    pub fn has_sent(&self) -> bool {
+        !self.sent.is_empty()
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finished
     }

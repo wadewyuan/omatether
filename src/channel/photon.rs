@@ -250,14 +250,23 @@ impl Channel for Photon {
 
     /// The only feedback there is on iMessage: with no editing, nothing else
     /// arrives until the turn is finished.
-    async fn typing(&self, thread: &ThreadKey) -> Result<()> {
+    ///
+    /// Unlike Telegram's, this indicator does not expire on its own, so the
+    /// `off` half is the one that matters here — without it the chat is left
+    /// showing three dots for an agent that stopped.
+    async fn typing(&self, thread: &ThreadKey, on: bool) -> Result<()> {
+        let state = if on { "start" } else { "stop" };
         self.http
             .post(format!("{}/typing", self.base))
             .header("x-omatether-token", &self.token)
             .timeout(Duration::from_secs(10))
-            .json(&json!({ "spaceId": thread.chat_id }))
+            .json(&json!({ "spaceId": thread.chat_id, "state": state }))
             .send()
             .await
+            .context("photon /typing")?
+            // Checked rather than ignored: the sidecar used to call a method
+            // the SDK does not have, which failed in exactly this silence.
+            .error_for_status()
             .context("photon /typing")?;
         Ok(())
     }

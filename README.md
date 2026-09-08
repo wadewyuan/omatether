@@ -329,7 +329,7 @@ Deliberately the simplest option in each case; revisit when something hurts.
 | `/cd` on a live thread | Starts a fresh session | `cwd` is fixed when the agent process starts; the old session stays resumable by id. |
 | Telegram reply threads | Not separate threads | Only forum topics are; otherwise one conversation scatters into a session per reply chain. |
 | Switching agents | Starts a fresh conversation | Transcripts do not move between agents; pretending otherwise would lose context silently. |
-| Typing indicators | Only on channels that cannot edit | Where a message grows as the turn runs, that *is* the indicator. |
+| Typing indicators | On every channel, until the turn's own message appears | The gap before the first word is the one with no other sign of life; after it, a growing message says the same thing for free. Refreshed every 4s, because Telegram's expires in about 5. |
 
 ## Roadmap
 

@@ -389,7 +389,13 @@ impl Channel for Telegram {
             .unwrap_or_default())
     }
 
-    async fn typing(&self, thread: &ThreadKey) -> Result<()> {
+    /// Telegram has no way to withdraw a chat action — it expires by itself
+    /// after about five seconds — so there is nothing to do for `off`, and the
+    /// expiry is why the core re-sends this while a turn is running.
+    async fn typing(&self, thread: &ThreadKey, on: bool) -> Result<()> {
+        if !on {
+            return Ok(());
+        }
         let mut body = self.target(thread);
         body["action"] = json!("typing");
         self.call("sendChatAction", body).await?;

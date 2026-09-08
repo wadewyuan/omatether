@@ -7,6 +7,7 @@
 //   GET  /inbound  -> NDJSON stream, one normalized inbound message per line
 //                     (`text` may be empty — an attachment with no words)
 //   POST /send     -> { spaceId, text, format? } -> { ok, messageId }
+//   POST /typing   -> { spaceId, state? }          -> { ok }
 //
 // Both require `X-Omatether-Token`. It binds to 127.0.0.1 only; nothing here
 // is safe to expose.
@@ -235,13 +236,20 @@ const server = http.createServer(async (req, res) => {
       return reply(res, 200, { ok: true, messageId: result?.id ?? null });
     }
 
+    // `state` defaults to "start" so an older caller keeps working, and
+    // "stop" exists because iMessage's indicator does not expire by itself.
     if (req.method === "POST" && req.url === "/typing") {
-      const { spaceId } = await readJson(req);
+      const { spaceId, state } = await readJson(req);
       if (!spaceId) return reply(res, 400, { ok: false, error: "spaceId required" });
+      if (state !== undefined && state !== "start" && state !== "stop") {
+        return reply(res, 400, { ok: false, error: `unknown state ${state}` });
+      }
       const space = await resolveSpace(spaceId);
-      // Best effort: not every provider surfaces a typing indicator, and a
-      // missing one must not fail the turn.
-      await space.typing?.("start");
+      // These are the names the SDK actually has. This was `space.typing?.()`,
+      // which is not a method on a Space — the optional call swallowed it, so
+      // the indicator never once appeared and nothing anywhere said so.
+      if (state === "stop") await space.stopTyping();
+      else await space.startTyping();
       return reply(res, 200, { ok: true });
     }
 
