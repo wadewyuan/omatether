@@ -928,18 +928,19 @@ impl Core {
                     return;
                 }
                 match thread.renderer.pending() {
-                    Some(text) => text,
+                    Some(text) => (text, thread.renderer.compose_prose()),
                     None => return,
                 }
             }
             None => return,
         };
+        let (text, prose) = text;
 
         // Spilling rewrites the message into a pointer, but what the renderer
         // has to remember is the text it composed: comparing next time against
         // the pointer would make every tick look like a change and re-send the
         // whole turn.
-        let payload = self.spill_if_long(key, text.clone());
+        let payload = self.spill_if_long(key, text.clone(), prose);
 
         // Only once it has been accepted for delivery is it no longer owed.
         if self.queue(key, OutJob::Turn(payload)) {
@@ -949,26 +950,44 @@ impl Core {
         }
     }
 
-    /// Write an over-long reply to a file and hand back a pointer to it.
+    /// Write an over-long reply to a file and hand back something that fits.
+    ///
+    /// Three attempts, in order of how much of the answer survives:
+    ///
+    /// 1. the whole turn, when it fits;
+    /// 2. the turn without its tool log, when *that* fits — the log is the bulk
+    ///    of a working turn and the least of it, so this is nearly always the
+    ///    one that runs, and the answer arrives whole;
+    /// 3. the **end** of the prose, plus a pointer. Cutting from the front is
+    ///    deliberate: a long answer builds to its conclusion, and a reader who
+    ///    can see the file has lost only the run-up.
     ///
     /// Falls back to the untouched text if the file cannot be written — a
     /// clipped reply is worse than a whole one, but both beat no reply.
-    fn spill_if_long(&self, key: &ThreadKey, text: String) -> String {
+    fn spill_if_long(&self, key: &ThreadKey, text: String, prose: String) -> String {
         if text.chars().count() <= SPILL_THRESHOLD {
             return text;
         }
 
+        // The file always holds the whole turn, tool log included: it is the
+        // record, and the thing a pointer would be lying about if it did not.
         let path = match self.spill(key, &text) {
             Some(path) => path,
             None => return text,
         };
+        let pointer = format!("  ssh {} -t 'cat {}'", hostname(), path.display());
 
-        let head: String = text.chars().take(SPILL_THRESHOLD).collect();
+        if !prose.is_empty() && prose.chars().count() <= SPILL_THRESHOLD {
+            return format!("{prose}\n\nFull turn:\n\n{pointer}");
+        }
+
+        // Nothing to prefer between them, so cut whichever is the real answer.
+        let long = if prose.is_empty() { &text } else { &prose };
+        let cut = long.chars().count() - SPILL_THRESHOLD;
+        let tail: String = long.chars().skip(cut).collect();
         format!(
-            "{head}\n\n… {} characters in all. Read the rest with:\n\n  ssh {} -t 'cat {}'",
-            text.chars().count(),
-            hostname(),
-            path.display()
+            "[first {cut} characters omitted — {} in all]\n\n{tail}\n\nFull turn:\n\n{pointer}",
+            long.chars().count(),
         )
     }
 
@@ -1158,10 +1177,14 @@ mod tests {
             topic_id: None,
         };
 
-        assert_eq!(core.spill_if_long(&key, "short".into()), "short");
+        assert_eq!(
+            core.spill_if_long(&key, "short".into(), "short".into()),
+            "short"
+        );
 
+        // A turn with no prose to prefer — all of it is the tool log.
         let long = "x".repeat(SPILL_THRESHOLD + 500);
-        let pointed = core.spill_if_long(&key, long.clone());
+        let pointed = core.spill_if_long(&key, long.clone(), String::new());
         assert!(pointed.chars().count() < long.chars().count());
         assert!(pointed.contains("ssh "), "must say how to read the rest");
         assert!(pointed.contains(&format!("{}", SPILL_THRESHOLD + 500)));
@@ -1172,6 +1195,48 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(written[0].path()).unwrap().len(),
             long.len()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_long_turn_keeps_its_answer_and_spills_the_tool_log() {
+        // The bug this exists for: a 6,500-character turn was cut at 2,500 from
+        // the front, and the front of a working turn is its tool log. What
+        // arrived was Bash lines ending mid-command, and every word of the
+        // answer was in the part that went to the file. From a phone that is
+        // indistinguishable from no reply at all.
+        let dir = std::env::temp_dir().join(format!("sb-spill3-{}", std::process::id()));
+        let core = core_with_spill_dir(&dir);
+        let key = fake_key();
+
+        let log = "▸ Bash  `cargo test`\n".repeat(200);
+        let answer = "Here is what I changed and why.";
+        let whole = format!("{log}{answer}");
+        let prose = answer.to_string();
+
+        let sent = core.spill_if_long(&key, whole, prose);
+        assert!(sent.contains(answer), "the answer survives whole: {sent}");
+        assert!(!sent.contains('▸'), "the log does not: {sent}");
+        assert!(sent.contains("ssh "), "and it is still readable in full");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_answer_too_long_even_alone_is_cut_from_the_front() {
+        // A long answer builds to its conclusion, so the end is the half worth
+        // keeping — the opposite of what cutting by position gives you.
+        let dir = std::env::temp_dir().join(format!("sb-spill4-{}", std::process::id()));
+        let core = core_with_spill_dir(&dir);
+        let key = fake_key();
+
+        let prose = format!("{}THE CONCLUSION", "preamble. ".repeat(400));
+        let sent = core.spill_if_long(&key, prose.clone(), prose);
+
+        assert!(sent.contains("THE CONCLUSION"), "kept the end");
+        assert!(
+            sent.contains("characters omitted"),
+            "and says it cut: {sent}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

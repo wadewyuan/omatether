@@ -372,6 +372,17 @@ worst kind of bug to find.
 - **Never show a question you had to cut off.** A permission prompt is the one
   human control here, so the full tool input goes out whole or goes to a file
   with a pointer — never clipped by the channel with "… truncated".
+- **A length cut must never land on the answer.** `spill_if_long` used to keep
+  the first 2500 characters of a long turn, and the first 2500 characters of a
+  working turn are its tool log: a 6,500-character reply arrived as `▸ Bash`
+  lines ending mid-command, with every word of the answer in the spill file.
+  It reads as *no reply*, not a truncated one, and on Photon — where the whole
+  turn lands at once at the end, unedited — it is the normal case for any real
+  piece of work, not an edge one. So the order is: whole turn, else the turn
+  without its tool log (`TurnRenderer::compose_prose`), else the *end* of the
+  prose. Related, and the reason the first two nearly always suffice: a run of
+  consecutive tool calls renders as one line naming the count and the newest
+  call, rather than a line each.
 
 ## Diagnostics
 

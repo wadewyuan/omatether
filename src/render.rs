@@ -15,7 +15,19 @@ use crate::event::AgentEvent;
 #[derive(Debug, Clone, PartialEq)]
 enum Segment {
     Text(String),
-    Tool { name: String, summary: String },
+    /// A *run* of tool calls with no prose between them, not a single call.
+    ///
+    /// A turn's worth of one-line-per-call is most of its length and almost
+    /// none of its meaning — read from a phone it buries the answer, and on a
+    /// channel that cannot edit, where the whole turn lands at once at the end,
+    /// it buried it past the length limit. So a run collapses to one line: how
+    /// many, and what the most recent one was, which is the useful half while
+    /// the turn is still streaming and a fair summary once it is not.
+    Tool {
+        name: String,
+        summary: String,
+        count: usize,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -59,10 +71,24 @@ impl TurnRenderer {
 
             AgentEvent::ToolCall { name, input, .. } => {
                 self.thinking = false;
-                self.segments.push(Segment::Tool {
-                    name: name.clone(),
-                    summary: summarize(input),
-                });
+                match self.segments.last_mut() {
+                    // Still in the same run: keep the count and the newest
+                    // call, and drop the one it replaces.
+                    Some(Segment::Tool {
+                        name: last,
+                        summary,
+                        count,
+                    }) => {
+                        *last = name.clone();
+                        *summary = summarize(input);
+                        *count += 1;
+                    }
+                    _ => self.segments.push(Segment::Tool {
+                        name: name.clone(),
+                        summary: summarize(input),
+                        count: 1,
+                    }),
+                }
             }
 
             AgentEvent::TurnEnd { ok, detail } => {
@@ -95,11 +121,26 @@ impl TurnRenderer {
         for segment in &self.segments {
             match segment {
                 Segment::Text(text) => out.push_str(text),
-                Segment::Tool { name, summary } if summary.is_empty() => {
-                    push_line(&mut out, &format!("▸ {name}"));
-                }
-                Segment::Tool { name, summary } => {
-                    push_line(&mut out, &format!("▸ {name}  {}", code_span(summary)));
+                Segment::Tool {
+                    name,
+                    summary,
+                    count,
+                } => {
+                    // The name of the newest call when it is the only one, and
+                    // the size of the run when it is not: "▸ Bash `ls`" reads
+                    // as what just happened, "▸ 9 tools · Bash `ls`" as what
+                    // has been happening.
+                    let head = if *count == 1 {
+                        format!("▸ {name}")
+                    } else {
+                        format!("▸ {count} tools · {name}")
+                    };
+                    let line = if summary.is_empty() {
+                        head
+                    } else {
+                        format!("{head}  {}", code_span(summary))
+                    };
+                    push_line(&mut out, &line);
                 }
             }
         }
@@ -118,6 +159,39 @@ impl TurnRenderer {
             return format!("{out}\n\nthinking…");
         }
         out
+    }
+
+    /// The turn with the tool log left out — what the agent actually said.
+    ///
+    /// For the one case where the whole turn will not fit in a chat message.
+    /// Cutting by position keeps the beginning, and the beginning of a working
+    /// turn is its tool log; the answer is at the end, so a length-cut message
+    /// delivers the transcript and drops the conclusion. That is not a
+    /// truncated reply, it is a missing one. Dropping the log instead cuts the
+    /// part that was never the point.
+    pub fn compose_prose(&self) -> String {
+        let mut out = String::new();
+        let mut tools = 0;
+
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => out.push_str(text),
+                Segment::Tool { count, .. } => tools += count,
+            }
+        }
+
+        let out = out.trim();
+        if out.is_empty() {
+            return String::new();
+        }
+
+        // Say that something was left out. A reply that silently omits every
+        // command it ran reads as if it ran none.
+        match tools {
+            0 => out.to_string(),
+            1 => format!("{out}\n\n[1 tool call not shown]"),
+            n => format!("{out}\n\n[{n} tool calls not shown]"),
+        }
     }
 
     /// The text to send now, or `None` when nothing changed since last time.
@@ -361,6 +435,81 @@ mod tests {
         });
         assert!(r.compose().contains('…'));
         assert!(r.compose().len() < 150);
+    }
+
+    fn tool(name: &str, command: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: "1".into(),
+            name: name.to_string(),
+            input: json!({ "command": command }),
+        }
+    }
+
+    #[test]
+    fn a_run_of_tool_calls_is_one_line_not_one_line_each() {
+        // Forty tool calls is forty lines of a turn whose answer is one
+        // paragraph. On a channel that cannot edit, that pushed the answer past
+        // the length limit and it was dropped outright.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("looking"));
+        for i in 0..9 {
+            r.apply(&tool("Bash", &format!("cmd{i}")));
+        }
+        r.apply(&delta("\n\ndone"));
+
+        let out = r.compose();
+        assert_eq!(out.lines().filter(|l| l.starts_with('▸')).count(), 1);
+        assert!(out.contains("▸ 9 tools · Bash  `cmd8`"), "{out}");
+        assert!(out.starts_with("looking"));
+        assert!(out.ends_with("done"), "the answer still lands last");
+    }
+
+    #[test]
+    fn a_lone_tool_call_still_reads_as_itself() {
+        // The collapsed form is for runs. One call is not a run, and "1 tools"
+        // would be noise where the plain line was already right.
+        let mut r = TurnRenderer::new();
+        r.apply(&tool("Bash", "ls"));
+        assert!(r.compose().contains("▸ Bash  `ls`"), "{}", r.compose());
+    }
+
+    #[test]
+    fn prose_between_tool_calls_separates_the_runs() {
+        // The interleaving is the point of segments: a run belongs to the
+        // paragraph that introduced it.
+        let mut r = TurnRenderer::new();
+        r.apply(&tool("Read", "a"));
+        r.apply(&tool("Read", "b"));
+        r.apply(&delta("now editing"));
+        r.apply(&tool("Edit", "c"));
+
+        let out = r.compose();
+        assert!(out.contains("▸ 2 tools · Read"), "{out}");
+        assert!(out.contains("▸ Edit"), "{out}");
+    }
+
+    #[test]
+    fn prose_only_drops_the_log_but_admits_it() {
+        // Used when the whole turn will not fit. A reply that silently omits
+        // every command it ran reads as if it ran none.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("here is what I found"));
+        r.apply(&tool("Bash", "ls"));
+        r.apply(&tool("Bash", "pwd"));
+
+        let prose = r.compose_prose();
+        assert!(prose.starts_with("here is what I found"));
+        assert!(!prose.contains('▸'), "the log is gone: {prose}");
+        assert!(prose.contains("2 tool calls not shown"), "{prose}");
+    }
+
+    #[test]
+    fn a_turn_that_is_only_tool_calls_has_no_prose_to_prefer() {
+        // The caller uses this to decide; an empty string says "nothing here
+        // is better than what you have".
+        let mut r = TurnRenderer::new();
+        r.apply(&tool("Bash", "ls"));
+        assert_eq!(r.compose_prose(), "");
     }
 
     #[test]

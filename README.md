@@ -89,9 +89,14 @@ many of which are prompt expansions, so `/review` just works.
 
 ### How a turn looks
 
-Tool calls appear inline as the agent makes them. **By default they run without
-asking** — a thread starts in auto mode, and the reply reads as a log of what
-the agent did rather than a queue of questions.
+Tool calls appear inline as the agent makes them, a run at a time — one
+`▸ 9 tools · Bash` line rather than nine separate ones, since on a phone the
+log should not outweigh the answer. **By default they run without asking** — a
+thread starts in auto mode, and the reply reads as an account of what the agent
+did rather than a queue of questions.
+
+A reply too long for one chat message keeps the agent's own words and spills
+the tool log to a file, with the ssh line to read it in full.
 
 `/auto off` turns the gate on for that thread. Then a consequential tool call
 blocks the turn until answered — with **Allow** / **Deny** buttons on Telegram,
