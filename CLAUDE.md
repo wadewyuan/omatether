@@ -300,6 +300,12 @@ new thread. SQLite cannot drop `NOT NULL` in place — it needs a table rebuild.
 shipped schema and migrate it. Add to it rather than editing `CREATE TABLE`
 alone.
 
+**Order inside `migrate()` is load-bearing.** The rebuild is last because it
+copies columns by name — every `ADD COLUMN` above it has to have run before its
+`SELECT` can name them. A new column added *after* the rebuild would be dropped
+on any database old enough to take that path, and only on those, which is the
+worst kind of bug to find.
+
 ## Invariants worth preserving
 
 - **Capabilities, not names.** The core branches on `Channel::can_edit`,
@@ -315,6 +321,22 @@ alone.
   shell on this machine.
 - **One turn per thread.** A second message while one runs is rejected, not
   queued. From a phone that is more predictable, and far simpler.
+- **`/new` starts in `~/Work`, not where the last session was.** It matches
+  `omarchy-agent`, which steps out of `$HOME` into `~/Work` before launching
+  because agents refuse to remember trust for a home directory. So a session
+  begun from chat lands where one begun from the keybinding does. The
+  directory's existence is checked per call, not at startup, and a machine
+  without it keeps the thread where it was — a cwd that is not there fails at
+  the spawn, several messages later, where the reason is much harder to see.
+  `/cd` is still the way to point a thread somewhere specific, and it does not
+  survive `/new` on purpose.
+- **The model is remembered, never asked for.** `/new` and `/status` both name
+  it at moments when no agent process exists, so `threads.model` holds whatever
+  the last `AgentEvent::Ready` reported. Two consequences: a `Ready` with
+  `model: None` means "this adapter does not report one" and must not erase
+  what claude already told us (codex, pi and the tmux tier all send `None`
+  today), and `/agent` clears it, because claude's model under codex's name is
+  a confident lie. Unknown prints as unknown.
 - **Nothing slow happens on the core's task.** Every channel call goes through
   the thread's outbox (`src/outbox.rs`); the core queues and moves on. This is
   what keeps "one turn per thread" from quietly meaning "one *anything* at a

@@ -7,7 +7,9 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Abandon the session and start a fresh one in the same thread.
+    /// Abandon the session and start a fresh one in the same thread, back in
+    /// the directory a fresh Omarchy agent starts in rather than the last
+    /// one's.
     New,
     /// Interrupt the running turn.
     Stop,
@@ -67,7 +69,7 @@ pub fn parse(text: &str) -> Command {
 pub const HELP: &str = "\
 omatether — your coding agent, over chat
 
-/new           start a fresh session in this thread
+/new           start a fresh session in this thread, back in ~/Work
 /stop          interrupt the running turn
 /cd <path>     set the working directory (starts a fresh session)
 /agent <name>  switch agent (claude, codex, pi, ...)

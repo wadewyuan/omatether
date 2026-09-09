@@ -24,6 +24,14 @@ pub struct ThreadState {
     pub cwd: String,
     /// Which agent this thread talks to.
     pub agent: String,
+    /// The model the agent last reported for itself.
+    ///
+    /// Remembered rather than asked for, because it is wanted at moments when
+    /// no agent process exists — `/new` answers before anything has spawned.
+    /// It is what the *previous* session ran, so it is cleared whenever the
+    /// answer could have changed underneath it (`/agent`), and stays `None`
+    /// for agents that never report one.
+    pub model: Option<String>,
     /// Approve tool calls without asking.
     ///
     /// On by default, and that is a deliberate product decision rather than an
@@ -82,7 +90,8 @@ impl Store {
                  cwd        TEXT NOT NULL,
                  updated_at INTEGER NOT NULL,
                  agent      TEXT NOT NULL DEFAULT 'claude',
-                 auto       INTEGER NOT NULL DEFAULT 1
+                 auto       INTEGER NOT NULL DEFAULT 1,
+                 model      TEXT
              );",
         )?;
         Ok(Self { conn })
@@ -105,6 +114,8 @@ impl Store {
             session_id: None,
             cwd: default_cwd.to_string(),
             agent: default_agent.to_string(),
+            // Left for the agent to report on its first turn, like the session.
+            model: None,
             auto: true,
         };
         self.put(&state)?;
@@ -115,25 +126,29 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT session_id, cwd, agent, auto FROM threads WHERE key = ?1",
+                "SELECT session_id, cwd, agent, auto, model FROM threads WHERE key = ?1",
                 [key],
                 |row| {
                     let session_id: Option<String> = row.get(0)?;
                     let cwd: String = row.get(1)?;
                     let agent: String = row.get(2)?;
                     let auto: i64 = row.get(3)?;
-                    Ok((session_id, cwd, agent, auto != 0))
+                    let model: Option<String> = row.get(4)?;
+                    Ok((session_id, cwd, agent, auto != 0, model))
                 },
             )
             .optional()?;
 
-        Ok(row.map(|(session_id, cwd, agent, auto)| ThreadState {
-            key: key.to_string(),
-            session_id,
-            cwd,
-            agent,
-            auto,
-        }))
+        Ok(
+            row.map(|(session_id, cwd, agent, auto, model)| ThreadState {
+                key: key.to_string(),
+                session_id,
+                cwd,
+                agent,
+                model,
+                auto,
+            }),
+        )
     }
 
     pub fn put(&self, state: &ThreadState) -> Result<()> {
@@ -143,21 +158,23 @@ impl Store {
             .unwrap_or(0);
 
         self.conn.execute(
-            "INSERT INTO threads (key, session_id, cwd, updated_at, agent, auto)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO threads (key, session_id, cwd, updated_at, agent, auto, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(key) DO UPDATE SET
                  session_id = excluded.session_id,
                  cwd        = excluded.cwd,
                  updated_at = excluded.updated_at,
                  agent      = excluded.agent,
-                 auto       = excluded.auto",
+                 auto       = excluded.auto,
+                 model      = excluded.model",
             rusqlite::params![
                 state.key,
                 state.session_id,
                 state.cwd,
                 now,
                 state.agent,
-                state.auto as i64
+                state.auto as i64,
+                state.model
             ],
         )?;
         Ok(())
@@ -186,10 +203,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     )
     .ok();
 
+    // The model the agent last reported. Nullable with no default: a thread
+    // that existed before this column has genuinely never been told, and
+    // "unknown" is a different answer from a guess.
+    conn.execute("ALTER TABLE threads ADD COLUMN model TEXT", [])
+        .ok();
+
     // `session_id` began as NOT NULL, back when omatether chose the id
     // itself. Codex assigns its own on the first turn, so a thread now starts
     // without one — and SQLite cannot drop a NOT NULL in place, which means a
-    // table rebuild rather than an ALTER.
+    // table rebuild rather than an ALTER. It runs last on purpose: it copies
+    // every column by name, so each `ADD COLUMN` above has to have happened
+    // before the SELECT can name it.
     if !session_id_is_nullable(conn)? {
         conn.execute_batch(
             "BEGIN;
@@ -199,10 +224,11 @@ fn migrate(conn: &Connection) -> Result<()> {
                  cwd        TEXT NOT NULL,
                  updated_at INTEGER NOT NULL,
                  agent      TEXT NOT NULL DEFAULT 'claude',
-                 auto       INTEGER NOT NULL DEFAULT 1
+                 auto       INTEGER NOT NULL DEFAULT 1,
+                 model      TEXT
              );
-             INSERT INTO threads_migrated (key, session_id, cwd, updated_at, agent, auto)
-                 SELECT key, NULLIF(session_id, ''), cwd, updated_at, agent, auto FROM threads;
+             INSERT INTO threads_migrated (key, session_id, cwd, updated_at, agent, auto, model)
+                 SELECT key, NULLIF(session_id, ''), cwd, updated_at, agent, auto, model FROM threads;
              DROP TABLE threads;
              ALTER TABLE threads_migrated RENAME TO threads;
              COMMIT;",
@@ -257,9 +283,12 @@ mod tests {
         let mut state = store.get_or_create("telegram:2", "/a", "claude").unwrap();
         assert_eq!(state.session_id, None, "no id until the agent assigns one");
 
+        assert_eq!(state.model, None, "no model until the agent reports one");
+
         state.cwd = "/b".into();
         state.session_id = Some("thread-from-codex".into());
         state.agent = "codex".into();
+        state.model = Some("gpt-5-codex".into());
         state.auto = false;
         store.put(&state).unwrap();
 
@@ -267,6 +296,7 @@ mod tests {
         assert_eq!(read.cwd, "/b");
         assert_eq!(read.session_id.as_deref(), Some("thread-from-codex"));
         assert_eq!(read.agent, "codex");
+        assert_eq!(read.model.as_deref(), Some("gpt-5-codex"));
         assert!(!read.auto, "a thread that asked for the gate keeps it");
     }
 
@@ -297,6 +327,10 @@ mod tests {
         assert_eq!(existing.cwd, "/home/wy/Work");
         assert_eq!(existing.agent, "claude", "back-filled by the migration");
         assert!(existing.auto, "back-filled by the migration");
+        assert_eq!(
+            existing.model, None,
+            "never told, which is not the same as a default"
+        );
 
         // And a new thread, which has no id until its agent assigns one, no
         // longer trips a NOT NULL constraint.

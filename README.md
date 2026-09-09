@@ -74,12 +74,12 @@ thing stays behind the tailnet with nothing exposed.
 
 | Command | Effect |
 |---|---|
-| `/new` | Fresh session in this thread |
+| `/new` | Fresh session in this thread, back in `~/Work`, and says which agent and model |
 | `/stop` | Interrupt the running turn |
 | `/cd <path>` | Set the working directory (starts a fresh session) |
 | `/agent <name>` | Switch agent — claude, codex, pi, omp, opencode, crush, grok, gemini, copilot |
 | `/attach` | The ssh line to take over at a real terminal |
-| `/status` | Agent, directory, session, whether a turn is running |
+| `/status` | Agent, model, directory, session, whether a turn is running |
 | `/allow`, `/deny <why>` | Answer a permission request without tapping |
 | `/auto [on\|off]` | Approve tool calls without asking. **On by default** |
 | `/help` | The above |

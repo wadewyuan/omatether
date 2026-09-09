@@ -106,6 +106,10 @@ pub struct Core {
     /// something to say about it.
     outboxes: HashMap<ThreadKey, Outbox>,
     default_cwd: PathBuf,
+    /// Where `/new` sends a thread, whatever it was doing before. Held rather
+    /// than recomputed per call so a test can point it at a directory that
+    /// exists; see [`work_dir`] for why it is `~/Work`.
+    fresh_cwd: Option<PathBuf>,
     threads: HashMap<ThreadKey, Thread>,
     /// When each thread's "working" indicator was last sent, and by its
     /// presence, that one is showing at all.
@@ -135,6 +139,7 @@ impl Core {
             channels: channels.into_iter().map(|c| (c.name(), c)).collect(),
             outboxes: HashMap::new(),
             default_cwd,
+            fresh_cwd: work_dir(),
             threads: HashMap::new(),
             typing: HashMap::new(),
             agent_tx,
@@ -254,11 +259,31 @@ impl Core {
         // Forget the agent's handle rather than inventing one: the next turn
         // starts a conversation and the agent tells us what to call it.
         state.session_id = None;
+        // And start where an agent launched from Omarchy starts, rather than
+        // wherever the last session happened to leave this thread. `/new` is
+        // the "begin something else" command, and the directory the previous
+        // task ran in is a worse guess at the next task's than the one place
+        // work is kept. /cd is still one message away.
+        //
+        // Checked here rather than at startup so that creating the directory
+        // takes effect without a restart — and a machine that has no ~/Work
+        // keeps the thread where it was, because sending a session somewhere
+        // that is not there fails later, at the spawn, where the reason is
+        // much harder to see.
+        match self.fresh_cwd.as_ref().filter(|dir| dir.is_dir()) {
+            Some(dir) => state.cwd = dir.to_string_lossy().to_string(),
+            None => tracing::debug!("no fresh-session directory; staying in {}", state.cwd),
+        }
         self.store.put(&state)?;
 
         self.say(
             key,
-            &format!("New {} session in {}.", state.agent, state.cwd),
+            &format!(
+                "New {} session in {}.\nmodel {}",
+                state.agent,
+                state.cwd,
+                model_label(&state)
+            ),
         )
     }
 
@@ -288,8 +313,9 @@ impl Core {
         };
 
         let mut note = format!(
-            "agent    {}\ndir      {}\nsession  {}\nstate    {}\ntools    {}",
+            "agent    {}\nmodel    {}\ndir      {}\nsession  {}\nstate    {}\ntools    {}",
             live_agent.unwrap_or(&state.agent),
+            model_label(&state),
             state.cwd,
             state.session_id.as_deref().unwrap_or("(new)"),
             if running { "turn running" } else { "idle" },
@@ -402,6 +428,10 @@ impl Core {
         let mut state = self.state(key)?;
         state.agent = name.to_string();
         state.session_id = None;
+        // The remembered model belonged to the agent being left. Reporting
+        // claude's model under codex's name would be a confident lie, and
+        // "unknown until the first turn" is true.
+        state.model = None;
         self.store.put(&state)?;
 
         // Say what changes about the experience, not just the name. Waiting for
@@ -573,10 +603,21 @@ impl Core {
 
             // The agent names its own conversation — Codex assigns a thread id
             // on the first turn — so record whatever it reports.
-            AgentEvent::Ready { session_id, .. } if !session_id.is_empty() => {
+            AgentEvent::Ready {
+                session_id, model, ..
+            } if !session_id.is_empty() => {
                 let mut state = self.state(key)?;
-                if state.session_id.as_deref() != Some(session_id.as_str()) {
+                let changed = state.session_id.as_deref() != Some(session_id.as_str())
+                    // Only when the agent said something. A `None` here means
+                    // "this adapter does not report a model", not "the model
+                    // went away", and must not erase what a claude session
+                    // already told us.
+                    || (model.is_some() && state.model != *model);
+                if changed {
                     state.session_id = Some(session_id.clone());
+                    if model.is_some() {
+                        state.model = model.clone();
+                    }
                     self.store.put(&state)?;
                 }
                 return Ok(());
@@ -1065,6 +1106,26 @@ fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|name| name.trim().to_string())
         .unwrap_or_else(|_| "localhost".to_string())
+}
+
+/// Where `/new` starts a thread, before checking that it is there.
+///
+/// The same place `omarchy-agent` steps into before launching an agent from
+/// the keybinding or the menu: agents refuse to remember trust for a home
+/// directory and re-ask on every session, so a launch starts one level down
+/// instead. Spelt the way Omarchy spells it, capital included, since the point
+/// is to land in the directory a terminal agent would have.
+fn work_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Work"))
+}
+
+/// What to call this thread's model in a message sent when no agent process
+/// exists to ask — which is every `/new`, and `/status` on an idle thread.
+fn model_label(state: &crate::store::ThreadState) -> &str {
+    state
+        .model
+        .as_deref()
+        .unwrap_or("(reported on the first turn)")
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -1770,6 +1831,118 @@ mod tests {
         assert!(GATED_TOOLS.contains(&"Edit"));
         assert!(!GATED_TOOLS.contains(&"Read"));
         assert!(!GATED_TOOLS.contains(&"Grep"));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_session_goes_back_to_the_work_directory() {
+        // The point of /new is "begin something else", so it starts where a
+        // terminal agent would rather than in whatever directory the last task
+        // left behind.
+        let dir = std::env::temp_dir().join(format!("sb-new1-{}", std::process::id()));
+        let work = dir.join("Work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        core.fresh_cwd = Some(work.clone());
+
+        let mut state = core.state(&key).unwrap();
+        state.cwd = "/somewhere/else".into();
+        state.session_id = Some("old-session".into());
+        state.model = Some("claude-opus-5".into());
+        core.store.put(&state).unwrap();
+
+        core.on_new(&key).await.unwrap();
+        settle().await;
+
+        let after = core.state(&key).unwrap();
+        assert_eq!(after.cwd, work.to_string_lossy());
+        assert_eq!(after.session_id, None, "the old conversation is let go");
+
+        let sent = channel.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("claude"), "which agent: {}", sent[0]);
+        assert!(
+            sent[0].contains("claude-opus-5"),
+            "which model: {}",
+            sent[0]
+        );
+        assert!(sent[0].contains(&*work.to_string_lossy()), "where");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_missing_work_directory_leaves_the_thread_where_it_was() {
+        // Sending a session to a directory that is not there would fail at the
+        // spawn, several messages later, where the reason is much less clear.
+        let dir = std::env::temp_dir().join(format!("sb-new2-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        core.fresh_cwd = Some(dir.join("no-such-Work"));
+
+        let mut state = core.state(&key).unwrap();
+        state.cwd = "/somewhere/else".into();
+        core.store.put(&state).unwrap();
+
+        core.on_new(&key).await.unwrap();
+        settle().await;
+
+        assert_eq!(core.state(&key).unwrap().cwd, "/somewhere/else");
+
+        // And with no session ever run, the model is admitted as unknown
+        // rather than guessed at.
+        let sent = channel.sent.lock().unwrap().clone();
+        assert!(sent[0].contains("first turn"), "{}", sent[0]);
+    }
+
+    #[tokio::test]
+    async fn the_model_is_remembered_from_the_session_that_reported_it() {
+        // It is wanted when no agent process exists to ask — /new answers
+        // before anything has spawned — so it has to survive the session.
+        let dir = std::env::temp_dir().join(format!("sb-model-{}", std::process::id()));
+        let key = fake_key();
+        let mut core = core_with(CountingChannel::write_only(), &dir);
+
+        core.on_agent_event(
+            &key,
+            AgentEvent::Ready {
+                session_id: "s1".into(),
+                model: Some("claude-opus-5".into()),
+                cwd: None,
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            core.state(&key).unwrap().model.as_deref(),
+            Some("claude-opus-5")
+        );
+
+        // An adapter that reports no model is saying it does not know, not
+        // that the model went away.
+        core.on_agent_event(
+            &key,
+            AgentEvent::Ready {
+                session_id: "s2".into(),
+                model: None,
+                cwd: None,
+                tools: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let after = core.state(&key).unwrap();
+        assert_eq!(after.session_id.as_deref(), Some("s2"));
+        assert_eq!(after.model.as_deref(), Some("claude-opus-5"));
+
+        // But it belongs to the agent that said it. Switching agents must not
+        // report claude's model under codex's name.
+        core.on_agent(&key, "codex").await.unwrap();
+        assert_eq!(core.state(&key).unwrap().model, None);
     }
 
     #[test]
