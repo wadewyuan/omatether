@@ -30,6 +30,13 @@ use crate::event::{AgentEvent, Decision};
 /// in. Shared with the reader task, which is where the questions arrive.
 type PendingMap = Arc<std::sync::Mutex<HashMap<String, PermissionKind>>>;
 
+/// Control requests we sent and are waiting on, by request id.
+///
+/// Shared with the reader task for the same reason as [`PendingMap`]: the
+/// answers arrive on stdout, and the caller that asked is somewhere else.
+type RepliesMap =
+    Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<(), String>>>>>;
+
 /// How many events may queue before the reader task applies backpressure to
 /// the agent's stdout. Generous: a tool-heavy turn is bursty.
 const EVENT_BUFFER: usize = 256;
@@ -74,10 +81,31 @@ const INIT_REQUEST_ID: &str = "omatether-init";
 /// machine is not mistaken for a missing gate.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long to wait for the answer to a control request sent mid-session.
+///
+/// Shorter than the handshake's: the process is up and answering by now, and
+/// someone is waiting on a chat message rather than on a service starting.
+const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The reader task's half of the handshake: it watches for the answer to
-/// [`INIT_REQUEST_ID`] and reports it back to `spawn`.
+/// [`INIT_REQUEST_ID`] and reports it back to `spawn`, along with anything in
+/// the answer worth keeping.
 struct Handshake {
-    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<ModelChoice>, String>>,
+}
+
+/// One entry from the model list the CLI volunteers in its handshake reply.
+///
+/// Kept because it is the only catalog anywhere in reach: `claude` has no
+/// "list models" command, so a hard-coded list here would be a copy that rots
+/// against a CLI that already knows the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    /// What to pass back — an alias like `opus`, or a full id.
+    pub value: String,
+    /// What that turns into, when the CLI says. This is what actually runs,
+    /// and so what `/status` should print.
+    pub resolved: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +122,14 @@ pub struct Config {
     /// Conflating them is what broke every returning thread the first time
     /// this adapter tried to resume one.
     pub session_id: Option<Uuid>,
+    /// Which model to start on, or `None` for the CLI's own choice.
+    ///
+    /// Unvalidated by the CLI at this end: `--model no-such-thing` starts
+    /// anyway, reports the name back verbatim in its init frame, and only
+    /// falls over when a turn is asked of it. Verified against 2.1.235. So
+    /// this is where a *remembered* model goes, and [`Agent::set_model`] —
+    /// which the CLI does check — is where a newly typed one goes.
+    pub model: Option<String>,
     /// `manual` makes the agent ask before every tool, which is what exercises
     /// the permission round-trip. `auto` approves most things itself.
     pub permission_mode: String,
@@ -106,6 +142,7 @@ impl Default for Config {
         Self {
             cwd: PathBuf::from("."),
             session_id: None,
+            model: None,
             permission_mode: "manual".to_string(),
             raw: false,
         }
@@ -119,6 +156,9 @@ pub struct ClaudeSession {
     /// Shared with the reader task, which clears it when a turn ends.
     busy: Arc<AtomicBool>,
     pending: PendingMap,
+    replies: RepliesMap,
+    /// What the CLI said it would accept, captured from the handshake reply.
+    models: Vec<ModelChoice>,
     next_request: u64,
 }
 
@@ -146,6 +186,9 @@ impl ClaudeSession {
         } else {
             command.args(["--session-id", &session_id.to_string()]);
         }
+        if let Some(model) = &config.model {
+            command.args(["--model", model]);
+        }
         command
             .args(["--permission-mode", &config.permission_mode])
             .current_dir(&config.cwd)
@@ -172,6 +215,7 @@ impl ClaudeSession {
         let (tx, rx) = mpsc::channel(EVENT_BUFFER);
         let busy = Arc::new(AtomicBool::new(false));
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let replies: RepliesMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // Started before the handshake is written, so the answer cannot arrive
         // before there is anything listening for it.
@@ -182,6 +226,7 @@ impl ClaudeSession {
             tx.clone(),
             busy.clone(),
             pending.clone(),
+            replies.clone(),
             config.raw,
             Some(Handshake {
                 reply: handshake_tx,
@@ -195,6 +240,8 @@ impl ClaudeSession {
             session_id: session_id.to_string(),
             busy,
             pending,
+            replies,
+            models: Vec::new(),
             next_request: 0,
         };
 
@@ -227,11 +274,12 @@ impl ClaudeSession {
                 )
             })?;
 
-        if let Err(reason) = confirmed {
-            bail!(
+        match confirmed {
+            Ok(models) => session.models = models,
+            Err(reason) => bail!(
                 "`claude` refused omatether's PreToolUse hook, so no tool call \
                  would ever be routed here for a decision: {reason}"
-            );
+            ),
         }
 
         Ok((session, rx))
@@ -279,6 +327,58 @@ impl ClaudeSession {
     fn request_id(&mut self) -> String {
         self.next_request += 1;
         format!("omatether-{}", self.next_request)
+    }
+
+    /// Send a control request and wait for the CLI's verdict on it.
+    ///
+    /// Unlike `prompt` and `decide`, which write and move on, this is for the
+    /// requests whose answer is the whole point — where "did that work?" has to
+    /// be answered to whoever asked rather than left to show up later as an
+    /// unattributed error in the middle of somebody's turn.
+    async fn ask(&mut self, request: Value) -> Result<()> {
+        let id = self.request_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Registered before the write, so the answer cannot arrive before
+        // there is anything listening for it.
+        self.replies
+            .lock()
+            .expect("replies map poisoned")
+            .insert(id.clone(), tx);
+
+        let frame = json!({
+            "type": "control_request",
+            "request_id": id,
+            "request": request,
+        });
+
+        let forget = |session: &Self| {
+            session
+                .replies
+                .lock()
+                .expect("replies map poisoned")
+                .remove(&id);
+        };
+
+        if let Err(e) = self.write_frame(&frame).await {
+            forget(self);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(CONTROL_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            // The CLI's own words. It knows what it rejected and why, and
+            // rewording it here would only make it vaguer.
+            Ok(Ok(Err(reason))) => bail!("{reason}"),
+            Ok(Err(_)) => bail!("`claude` exited before answering"),
+            Err(_) => {
+                forget(self);
+                bail!(
+                    "`claude` did not answer within {}s",
+                    CONTROL_TIMEOUT.as_secs()
+                )
+            }
+        }
     }
 }
 
@@ -347,6 +447,27 @@ impl Agent for ClaudeSession {
         self.write_frame(&frame).await
     }
 
+    /// Switch models on the live session, and wait to be told it took.
+    ///
+    /// The CLI checks the name here — `Model "x" is not a recognized model id`
+    /// comes back as an error response — which is the only check anywhere in
+    /// reach: `--model` at spawn accepts anything and fails a turn later.
+    async fn set_model(&mut self, model: Option<&str>) -> Result<Option<String>> {
+        // A null model is the CLI's own spelling of "back to the default", and
+        // `serde_json` writes `None` as exactly that.
+        self.ask(json!({ "subtype": "set_model", "model": model }))
+            .await?;
+
+        // Say what will actually run rather than what was typed. The catalog
+        // came from this session's own handshake, so `opus` resolves to the id
+        // this CLI would have resolved it to, not one assumed here.
+        Ok(resolve_model(&self.models, model.unwrap_or("default")))
+    }
+
+    fn models(&self) -> Vec<String> {
+        self.models.iter().map(|m| m.value.clone()).collect()
+    }
+
     async fn cancel(&mut self) -> Result<()> {
         let id = self.request_id();
         let frame = json!({
@@ -380,6 +501,7 @@ async fn read_events(
     tx: mpsc::Sender<AgentEvent>,
     busy: Arc<AtomicBool>,
     pending: PendingMap,
+    replies: RepliesMap,
     raw: bool,
     mut handshake: Option<Handshake>,
 ) {
@@ -422,9 +544,24 @@ async fn read_events(
         if let Some(waiting) = handshake.take() {
             match handshake_outcome(&frame, INIT_REQUEST_ID) {
                 Some(outcome) => {
-                    let _ = waiting.reply.send(outcome);
+                    let _ = waiting.reply.send(outcome.map(|_| models_offered(&frame)));
                 }
                 None => handshake = Some(waiting),
+            }
+        }
+
+        // An answer somebody is waiting on belongs to them, not to the chat:
+        // `wire::normalize` turns a rejection into an `Error` event, and a
+        // `/model` that already reported the reason should not also drop a
+        // second copy of it into whatever turn happens to be on screen.
+        if let Some(answered) = answered_request(&frame) {
+            let waiting = replies
+                .lock()
+                .expect("replies map poisoned")
+                .remove(&answered.0);
+            if let Some(waiting) = waiting {
+                let _ = waiting.send(answered.1);
+                continue;
             }
         }
 
@@ -461,6 +598,76 @@ async fn read_events(
             })
             .await;
     }
+}
+
+/// Which control request this frame answers, and what it said.
+///
+/// `None` for anything that is not an answer, or one that names no request —
+/// unlike the handshake, which claims unattributed errors because it is the
+/// only thing outstanding that early, a mid-session request has no such claim.
+fn answered_request(frame: &Value) -> Option<(String, Result<(), String>)> {
+    if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+        return None;
+    }
+
+    let response = frame.get("response")?;
+    let id = response.get("request_id").and_then(Value::as_str)?;
+
+    let outcome = match response.get("subtype").and_then(Value::as_str) {
+        Some("success") => Ok(()),
+        _ => Err(error_text(response)),
+    };
+    Some((id.to_string(), outcome))
+}
+
+/// The `error` field as a person should read it.
+///
+/// A JSON string rendered with `to_string` keeps its quotes and escapes, and
+/// this text goes to a phone.
+fn error_text(response: &Value) -> String {
+    match response.get("error") {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => "unspecified".to_string(),
+    }
+}
+
+/// The model list the CLI volunteers in its handshake reply, if it does.
+///
+/// Tolerant like everything else here: a CLI that stops sending this leaves
+/// `/model` unable to list, not broken.
+fn models_offered(frame: &Value) -> Vec<ModelChoice> {
+    frame
+        .get("response")
+        .and_then(|r| r.get("response"))
+        .and_then(|r| r.get("models"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| {
+                    Some(ModelChoice {
+                        value: model.get("value").and_then(Value::as_str)?.to_string(),
+                        resolved: model
+                            .get("resolvedModel")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What an alias runs as, according to the catalog this session was given.
+///
+/// `None` when the name is not in it — which is not an error: full model ids
+/// are accepted by the CLI and never appear in the list.
+fn resolve_model(models: &[ModelChoice], name: &str) -> Option<String> {
+    models
+        .iter()
+        .find(|model| model.value == name)
+        .and_then(|model| model.resolved.clone())
 }
 
 /// Whether this frame answers the handshake, and what it said.
@@ -559,6 +766,113 @@ mod tests {
             handshake_outcome(&frame, INIT_REQUEST_ID),
             Some(Err(_))
         ));
+    }
+
+    /// The handshake reply's model list, verbatim from 2.1.235 (trimmed to
+    /// three entries). This is the only catalog `claude` offers anywhere: the
+    /// CLI has no "list models" command, so what it volunteers here is it.
+    fn handshake_with_models() -> Value {
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "omatether-init",
+                "response": {
+                    "commands": [],
+                    "models": [
+                        {"value": "default", "resolvedModel": "claude-sonnet-5",
+                         "displayName": "Default (recommended)"},
+                        {"value": "opus", "resolvedModel": "claude-opus-5",
+                         "displayName": "Opus"},
+                        {"value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001",
+                         "displayName": "Haiku"}
+                    ]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn the_handshake_hands_back_the_models_it_offers() {
+        let models = models_offered(&handshake_with_models());
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[1].value, "opus");
+        assert_eq!(models[1].resolved.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn a_cli_that_offers_no_list_leaves_one_empty_rather_than_failing() {
+        // The list is a convenience; the switch is not. A CLI version that
+        // stops sending it must not take the session down with it.
+        assert!(models_offered(&success()).is_empty());
+    }
+
+    #[test]
+    fn an_alias_is_reported_as_what_it_actually_runs() {
+        // `/status` should say claude-opus-5, not the `opus` that was typed.
+        let models = models_offered(&handshake_with_models());
+        assert_eq!(
+            resolve_model(&models, "opus").as_deref(),
+            Some("claude-opus-5")
+        );
+        // Including the default, which is a name for something rather than an
+        // absence of one.
+        assert_eq!(
+            resolve_model(&models, "default").as_deref(),
+            Some("claude-sonnet-5")
+        );
+        // A full id is accepted by the CLI and never appears in the list.
+        // Unresolvable is not unknown.
+        assert_eq!(resolve_model(&models, "claude-opus-5"), None);
+    }
+
+    #[test]
+    fn a_rejected_control_request_comes_back_with_the_clis_reason() {
+        // Verbatim from 2.1.235, answering a set_model for a name it does not
+        // know. The reason is what reaches the phone, so it must arrive
+        // unquoted and unescaped rather than as a JSON blob.
+        let frame = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": "omatether-4",
+                "error": "Model \"definitely-not-a-model\" is not a recognized model id. \
+                          Run /model to see available models."
+            }
+        });
+
+        match answered_request(&frame) {
+            Some((id, Err(reason))) => {
+                assert_eq!(id, "omatether-4");
+                assert!(reason.starts_with("Model \"definitely-not-a-model\""));
+                assert!(!reason.starts_with('"'), "not a quoted JSON string");
+            }
+            other => panic!("expected a named refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_accepted_control_request_is_attributed_to_the_one_that_asked() {
+        let frame = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "omatether-2" }
+        });
+        assert_eq!(
+            answered_request(&frame),
+            Some(("omatether-2".to_string(), Ok(())))
+        );
+
+        // Nothing else is an answer to anything, least of all a turn's frames.
+        let text = json!({ "type": "assistant", "message": { "content": [] } });
+        assert_eq!(answered_request(&text), None);
+
+        // An error naming no request belongs to the handshake's special case,
+        // not to whoever happens to be waiting.
+        let unattributed = json!({
+            "type": "control_response",
+            "response": { "subtype": "error", "error": "unsupported" }
+        });
+        assert_eq!(answered_request(&unattributed), None);
     }
 
     #[test]

@@ -39,12 +39,18 @@ pub struct Config {
     pub cwd: PathBuf,
     /// Codex's own thread id, when resuming.
     pub thread_id: Option<String>,
+    /// `-m`, or `None` to let Codex pick.
+    pub model: Option<String>,
 }
 
 pub struct CodexSession {
     cwd: PathBuf,
     /// Assigned by Codex on the first turn; used to resume every turn after.
     thread_id: Arc<Mutex<Option<String>>>,
+    /// Passed to every turn's process. A plain field rather than shared state:
+    /// nothing but `set_model` writes it, and the process it applies to has not
+    /// started yet.
+    model: Option<String>,
     events: mpsc::Sender<AgentEvent>,
     busy: Arc<AtomicBool>,
     /// The running turn's process, so `cancel` has something to kill.
@@ -58,6 +64,7 @@ impl CodexSession {
             Self {
                 cwd: config.cwd,
                 thread_id: Arc::new(Mutex::new(config.thread_id)),
+                model: config.model,
                 events: tx,
                 busy: Arc::new(AtomicBool::new(false)),
                 child: Arc::new(Mutex::new(None)),
@@ -101,6 +108,9 @@ impl Agent for CodexSession {
         if let Some(id) = &resume {
             command.arg("resume").arg(id);
         }
+        if let Some(model) = &self.model {
+            command.args(["-m", model]);
+        }
         command
             .arg("--json")
             // The only non-interactive approval mode there is.
@@ -141,6 +151,14 @@ impl Agent for CodexSession {
         tokio::spawn(log_stderr(stderr));
 
         Ok(())
+    }
+
+    /// Nothing to tell: the model is a flag on the next turn's process, and
+    /// there is no process between turns to reject a bad name. Codex will,
+    /// when it runs.
+    async fn set_model(&mut self, model: Option<&str>) -> Result<Option<String>> {
+        self.model = model.map(String::from);
+        Ok(None)
     }
 
     async fn cancel(&mut self) -> Result<()> {

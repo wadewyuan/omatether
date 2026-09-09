@@ -17,6 +17,8 @@ pub enum Command {
     Cd(String),
     /// Switch which agent this thread talks to.
     Agent(String),
+    /// Read or change the model the agent runs.
+    Model(ModelRequest),
     /// Get the line to type to take over at a real terminal.
     Attach,
     /// Report agent, directory, session and whether a turn is running.
@@ -32,6 +34,20 @@ pub enum Command {
     Help,
     /// Anything else — hand it to the agent as typed.
     Prompt(String),
+}
+
+/// What `/model` was asked to do.
+///
+/// Three cases rather than an `Option`, because "tell me" and "let the agent
+/// decide" are different instructions and both have to be sayable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRequest {
+    /// `/model` — what is running, and what else there is.
+    Report,
+    /// `/model <name>` — run this one from now on.
+    Set(String),
+    /// `/model default` — back to whatever the agent picks for itself.
+    Reset,
 }
 
 pub fn parse(text: &str) -> Command {
@@ -54,6 +70,15 @@ pub fn parse(text: &str) -> Command {
         "/help" | "/start" => Command::Help,
         "/cd" => Command::Cd(rest.to_string()),
         "/agent" => Command::Agent(rest.to_string()),
+        // `default` is the agent's own word for it — Claude Code's set_model
+        // treats a null model as "back to the session default" — and `reset`
+        // is what people type when they don't know that.
+        "/model" => Command::Model(match rest.to_ascii_lowercase().as_str() {
+            "" => ModelRequest::Report,
+            "default" | "reset" => ModelRequest::Reset,
+            // Not lowercased: a model id is the agent's to spell, not ours.
+            _ => ModelRequest::Set(rest.to_string()),
+        }),
         "/attach" => Command::Attach,
         "/auto" | "/yolo" => Command::Auto(match rest.to_ascii_lowercase().as_str() {
             "" => None,
@@ -73,8 +98,9 @@ omatether — your coding agent, over chat
 /stop          interrupt the running turn
 /cd <path>     set the working directory (starts a fresh session)
 /agent <name>  switch agent (claude, codex, pi, ...)
+/model [name]  which model the agent runs (/model default to undo)
 /attach        how to take over at a real terminal
-/status        agent, directory, session, whether a turn is running
+/status        agent, model, directory, session, whether a turn is running
 /allow         approve a pending tool call
 /deny <why>    refuse it, and tell the agent why
 /auto [on|off] approve tool calls without asking (on by default)
@@ -117,6 +143,36 @@ mod tests {
         assert_eq!(parse("/agent codex"), Command::Agent("codex".into()));
         assert_eq!(parse("/attach"), Command::Attach);
         assert_eq!(parse("/agent"), Command::Agent(String::new()));
+    }
+
+    #[test]
+    fn model_reads_sets_and_resets() {
+        assert_eq!(parse("/model"), Command::Model(ModelRequest::Report));
+        assert_eq!(
+            parse("/model opus"),
+            Command::Model(ModelRequest::Set("opus".into()))
+        );
+        assert_eq!(parse("/model default"), Command::Model(ModelRequest::Reset));
+        assert_eq!(parse("/model RESET"), Command::Model(ModelRequest::Reset));
+    }
+
+    #[test]
+    fn a_model_id_keeps_the_case_it_was_typed_in() {
+        // Pi takes `provider/id` and a `:thinking` suffix, Codex takes whatever
+        // its provider calls a model. Lower-casing on the way through would
+        // quietly break names we have no business normalizing.
+        assert_eq!(
+            parse("/model anthropic/Claude-Opus-5:high"),
+            Command::Model(ModelRequest::Set("anthropic/Claude-Opus-5:high".into()))
+        );
+    }
+
+    #[test]
+    fn model_is_omatethers_command_not_the_agents() {
+        // Claude Code has a /model of its own, but it is an interactive picker
+        // that does nothing in --print mode — so passing this through would
+        // land a message that silently accomplishes nothing.
+        assert!(matches!(parse("/model haiku"), Command::Model(_)));
     }
 
     #[test]

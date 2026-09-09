@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::{self, Agent};
 use crate::channel::{Channel, Inbound, InboundKind, ThreadKey};
-use crate::command::{self, Command};
+use crate::command::{self, Command, ModelRequest};
 use crate::event::{AgentEvent, Decision};
 use crate::outbox::{OutJob, Outbox};
 use crate::render::TurnRenderer;
@@ -215,6 +215,7 @@ impl Core {
                 Command::Status => self.on_status(&message.thread).await,
                 Command::Cd(path) => self.on_cd(&message.thread, &path).await,
                 Command::Agent(name) => self.on_agent(&message.thread, &name).await,
+                Command::Model(want) => self.on_model(&message.thread, want).await,
                 Command::Attach => self.on_attach(&message.thread).await,
                 Command::Auto(want) => self.on_auto(&message.thread, want).await,
                 Command::Allow => self.decide(&message.thread, Decision::allow(), None).await,
@@ -430,8 +431,12 @@ impl Core {
         state.session_id = None;
         // The remembered model belonged to the agent being left. Reporting
         // claude's model under codex's name would be a confident lie, and
-        // "unknown until the first turn" is true.
+        // "unknown until the first turn" is true. What was *asked* for goes
+        // with it: `opus` means nothing to codex, and pi wants a
+        // `provider/id` — a model name is one agent's vocabulary, not a
+        // setting that travels.
         state.model = None;
+        state.requested_model = None;
         self.store.put(&state)?;
 
         // Say what changes about the experience, not just the name. Waiting for
@@ -458,6 +463,127 @@ impl Core {
             ),
             None => {}
         }
+        self.say(key, &note)
+    }
+
+    /// Read or change the model this thread's agent runs.
+    ///
+    /// The one switch here that keeps the conversation. `/cd` and `/agent`
+    /// start a fresh session because a directory is fixed when a process
+    /// starts and a transcript cannot move between agents; a model is neither.
+    /// Claude Code changes it on the live session, and the two agents that run
+    /// a process per turn simply pass a different flag to the next one.
+    async fn on_model(&mut self, key: &ThreadKey, want: ModelRequest) -> Result<()> {
+        let mut state = self.state(key)?;
+
+        let wanted = match want {
+            ModelRequest::Report => return self.report_model(key, &state),
+            ModelRequest::Reset => None,
+            // Never a valid name in any of the three vocabularies, and the
+            // shape of a sentence typed at a command: "/model use opus please".
+            ModelRequest::Set(name) if name.split_whitespace().count() > 1 => {
+                let note = format!(
+                    "Usage: /model <name>\n\nNo model is called '{name}'. \
+                     /model on its own says what is running."
+                );
+                return self.say(key, &note);
+            }
+            ModelRequest::Set(name) => Some(name),
+        };
+
+        if !agent::takes_model(&state.agent) {
+            let note = format!(
+                "{} runs through omarchy-agent, which takes no model. Set it in \
+                 {}'s own config, or /attach and change it there. /agent claude, \
+                 codex or pi for one that can be told from here.",
+                state.agent, state.agent
+            );
+            return self.say(key, &note);
+        }
+
+        // Tell the session, when one is up. This is also the only place a name
+        // is checked: Claude Code answers a bad one with a reason, while
+        // `--model` at spawn takes anything and fails a turn later instead.
+        let confirmed = match self.threads.get_mut(key) {
+            Some(thread) => match thread.session.set_model(wanted.as_deref()).await {
+                Ok(resolved) => Some(resolved),
+                Err(e) => {
+                    let note = format!("{} would not take that: {e}", state.agent);
+                    return self.say(key, &note);
+                }
+            },
+            None => None,
+        };
+
+        // What the agent resolved it to, else what was typed, else nothing —
+        // and nothing is the right answer after a reset nobody confirmed,
+        // because the default is the agent's to know, not ours to guess.
+        let checked = confirmed.is_some();
+        state.model = confirmed.flatten().or_else(|| wanted.clone());
+        state.requested_model = wanted.clone();
+        self.store.put(&state)?;
+
+        let mut note = match (&wanted, &state.model) {
+            (Some(_), Some(model)) => {
+                format!("From the next turn, {} runs {model}.", state.agent)
+            }
+            (None, Some(model)) => format!("{} picks its own model again ({model}).", state.agent),
+            (_, None) => format!("{} picks its own model again.", state.agent),
+        };
+
+        // Said only when it is true. A name nobody checked is a turn that fails
+        // later for a reason nothing here will have mentioned.
+        if !checked && wanted.is_some() {
+            note.push_str(
+                "\n\nNothing is running to check the name against — if the agent \
+                 does not know it, the next turn is where that shows up.",
+            );
+        }
+        self.say(key, &note)
+    }
+
+    /// What `/model` says when asked nothing: what is running, and what else
+    /// this agent has said it will take.
+    fn report_model(&mut self, key: &ThreadKey, state: &crate::store::ThreadState) -> Result<()> {
+        let mut note = match state.model.as_deref().or(state.requested_model.as_deref()) {
+            Some(model) => format!("{} is running {model}.", state.agent),
+            None => format!(
+                "{} has not said which model it runs; it reports one on the \
+                 first turn.",
+                state.agent
+            ),
+        };
+
+        // Worth saying when they differ, and only then: it is the difference
+        // between what runs now and what the next session will ask for.
+        match &state.requested_model {
+            Some(asked) if Some(asked.as_str()) != state.model.as_deref() => {
+                note.push_str(&format!(" Asked for: {asked}."));
+            }
+            _ => {}
+        }
+
+        if !agent::takes_model(&state.agent) {
+            note.push_str(
+                "\n\nThis one launches through omarchy-agent, which takes no \
+                 model, so /model cannot change it from here.",
+            );
+            return self.say(key, &note);
+        }
+
+        note.push_str("\n\n/model <name> switches; /model default hands the choice back.");
+
+        // Only ever a list an agent volunteered — nothing here can ask for one,
+        // and a list hard-coded here would rot against the agent that knows.
+        let offered = self
+            .threads
+            .get(key)
+            .map(|thread| thread.session.models())
+            .unwrap_or_default();
+        if !offered.is_empty() {
+            note.push_str(&format!("\nIt offers: {}", offered.join(", ")));
+        }
+
         self.say(key, &note)
     }
 
@@ -1056,6 +1182,10 @@ impl Core {
             agent: state.agent.clone(),
             cwd: PathBuf::from(&state.cwd),
             session_id: state.session_id.clone(),
+            // What was asked for, not what was reported: a thread that never
+            // ran /model has to keep letting the agent choose, rather than
+            // pinning itself to whatever it happened to default to once.
+            model: state.requested_model.clone(),
             label: key.to_string(),
         })
         .await
@@ -1140,10 +1270,15 @@ fn work_dir() -> Option<PathBuf> {
 
 /// What to call this thread's model in a message sent when no agent process
 /// exists to ask — which is every `/new`, and `/status` on an idle thread.
+///
+/// The reported name first: it is the resolved one (`claude-opus-5` for an
+/// `opus` that was asked for), and it is what actually ran. What was asked for
+/// is the fallback for the agents that never report anything.
 fn model_label(state: &crate::store::ThreadState) -> &str {
     state
         .model
         .as_deref()
+        .or(state.requested_model.as_deref())
         .unwrap_or("(reported on the first turn)")
 }
 
@@ -1410,16 +1545,56 @@ mod tests {
     /// An agent that runs no process. Enough for the core to have a session.
     struct StubAgent {
         busy: bool,
+        /// What `set_model` resolves the name to, when it resolves one.
+        resolves: Option<String>,
+        /// Set to refuse the way a real CLI refuses a name it does not know.
+        refuses: Option<String>,
+        /// What it offers, and what it was last told, for asserting on both.
+        offers: Vec<String>,
+        told: Arc<std::sync::Mutex<Option<Option<String>>>>,
     }
 
     impl StubAgent {
         fn idle() -> Self {
-            Self { busy: false }
+            Self {
+                busy: false,
+                resolves: None,
+                refuses: None,
+                offers: Vec::new(),
+                told: Arc::new(std::sync::Mutex::new(None)),
+            }
         }
 
         /// A turn in flight, which is the state the working indicator is about.
         fn busy() -> Self {
-            Self { busy: true }
+            Self {
+                busy: true,
+                ..Self::idle()
+            }
+        }
+
+        /// Answers `/model` the way Claude Code does: with the id the alias it
+        /// was given actually resolves to.
+        fn resolving(to: &str) -> Self {
+            Self {
+                resolves: Some(to.to_string()),
+                ..Self::idle()
+            }
+        }
+
+        /// Refuses it, the way the CLI refuses a name it does not know.
+        fn refusing(why: &str) -> Self {
+            Self {
+                refuses: Some(why.to_string()),
+                ..Self::idle()
+            }
+        }
+
+        fn offering(models: &[&str]) -> Self {
+            Self {
+                offers: models.iter().map(|m| m.to_string()).collect(),
+                ..Self::idle()
+            }
         }
     }
 
@@ -1439,6 +1614,16 @@ mod tests {
         }
         async fn prompt(&mut self, _text: &str) -> Result<()> {
             Ok(())
+        }
+        async fn set_model(&mut self, model: Option<&str>) -> Result<Option<String>> {
+            *self.told.lock().unwrap() = Some(model.map(String::from));
+            match &self.refuses {
+                Some(why) => anyhow::bail!("{why}"),
+                None => Ok(self.resolves.clone()),
+            }
+        }
+        fn models(&self) -> Vec<String> {
+            self.offers.clone()
         }
         async fn cancel(&mut self) -> Result<()> {
             Ok(())
@@ -2008,6 +2193,258 @@ mod tests {
         // report claude's model under codex's name.
         core.on_agent(&key, "codex").await.unwrap();
         assert_eq!(core.state(&key).unwrap().model, None);
+    }
+
+    #[tokio::test]
+    async fn a_live_session_is_told_and_answers_with_what_will_run() {
+        // The alias is what was typed; the resolved id is what runs. /status
+        // should say the second, and the next spawn should ask for the first.
+        let dir = std::env::temp_dir().join(format!("sb-model1-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        let agent = StubAgent::resolving("claude-opus-5");
+        let told = agent.told.clone();
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(agent),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: false,
+            },
+        );
+
+        core.on_model(&key, ModelRequest::Set("opus".into()))
+            .await
+            .unwrap();
+        settle().await;
+
+        assert_eq!(
+            told.lock().unwrap().clone(),
+            Some(Some("opus".to_string())),
+            "the session is told, not just the database"
+        );
+
+        let after = core.state(&key).unwrap();
+        assert_eq!(after.model.as_deref(), Some("claude-opus-5"), "what runs");
+        assert_eq!(
+            after.requested_model.as_deref(),
+            Some("opus"),
+            "what to ask"
+        );
+
+        let sent = channel.sent.lock().unwrap().clone();
+        assert!(sent[0].contains("claude-opus-5"), "{}", sent[0]);
+        assert!(
+            !sent[0].contains("Nothing is running"),
+            "it was checked: {}",
+            sent[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_model_changes_nothing() {
+        // The one place a bad name can be caught before a turn is spent on it,
+        // so the agent's own reason has to survive to the phone — and nothing
+        // may be remembered, or the next spawn would ask for it again.
+        let dir = std::env::temp_dir().join(format!("sb-model2-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::refusing(
+                    "Model \"opus-9\" is not a recognized model id",
+                )),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: false,
+            },
+        );
+
+        core.on_model(&key, ModelRequest::Set("opus-9".into()))
+            .await
+            .unwrap();
+        settle().await;
+
+        let after = core.state(&key).unwrap();
+        assert_eq!(after.requested_model, None, "nothing is remembered");
+        assert_eq!(after.model, None);
+
+        let sent = channel.sent.lock().unwrap().clone();
+        assert!(
+            sent[0].contains("not a recognized model id"),
+            "the agent's own reason: {}",
+            sent[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_session_the_name_is_remembered_but_said_to_be_unchecked() {
+        // Nothing is running to reject a typo, and a model the agent does not
+        // know fails at the next turn instead — where the reason is much
+        // harder to connect to the message that caused it.
+        let dir = std::env::temp_dir().join(format!("sb-model3-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.on_model(&key, ModelRequest::Set("haiku".into()))
+            .await
+            .unwrap();
+        settle().await;
+
+        let after = core.state(&key).unwrap();
+        assert_eq!(after.requested_model.as_deref(), Some("haiku"));
+        assert_eq!(
+            after.model.as_deref(),
+            Some("haiku"),
+            "the best answer there is until something reports one"
+        );
+
+        let sent = channel.sent.lock().unwrap().clone();
+        assert!(sent[0].contains("Nothing is running"), "{}", sent[0]);
+    }
+
+    #[tokio::test]
+    async fn resetting_hands_the_choice_back_to_the_agent() {
+        // Not the same as setting the model the agent happens to default to:
+        // this thread has to keep asking for nothing, so that a later default
+        // is picked up rather than frozen out.
+        let dir = std::env::temp_dir().join(format!("sb-model4-{}", std::process::id()));
+        let key = fake_key();
+        let mut core = core_with(CountingChannel::write_only(), &dir);
+
+        let agent = StubAgent::resolving("claude-sonnet-5");
+        let told = agent.told.clone();
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(agent),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: false,
+            },
+        );
+
+        core.on_model(&key, ModelRequest::Set("opus".into()))
+            .await
+            .unwrap();
+        core.on_model(&key, ModelRequest::Reset).await.unwrap();
+        settle().await;
+
+        assert_eq!(
+            told.lock().unwrap().clone(),
+            Some(None),
+            "the agent is told to choose for itself"
+        );
+        let after = core.state(&key).unwrap();
+        assert_eq!(after.requested_model, None, "and nothing is asked for");
+        assert_eq!(
+            after.model.as_deref(),
+            Some("claude-sonnet-5"),
+            "what the default resolved to is still worth reporting"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_nowhere_to_put_a_model_says_so() {
+        // The detached tier launches through omarchy-agent, which takes no
+        // model. Remembering one would mean promising a switch that never
+        // happens.
+        let dir = std::env::temp_dir().join(format!("sb-model5-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.on_agent(&key, "opencode").await.unwrap();
+        core.on_model(&key, ModelRequest::Set("gpt-5".into()))
+            .await
+            .unwrap();
+        settle().await;
+
+        assert_eq!(core.state(&key).unwrap().requested_model, None);
+        let sent = channel.sent.lock().unwrap().clone();
+        let last = sent.last().unwrap();
+        assert!(last.contains("omarchy-agent"), "why not: {last}");
+        assert!(last.contains("/attach"), "and what to do instead: {last}");
+    }
+
+    #[tokio::test]
+    async fn asking_for_nothing_reports_what_is_running_and_what_is_on_offer() {
+        let dir = std::env::temp_dir().join(format!("sb-model6-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::offering(&["default", "opus", "haiku"])),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: false,
+            },
+        );
+
+        let mut state = core.state(&key).unwrap();
+        state.model = Some("claude-opus-5".into());
+        state.requested_model = Some("opus".into());
+        core.store.put(&state).unwrap();
+
+        core.on_model(&key, ModelRequest::Report).await.unwrap();
+        settle().await;
+
+        let sent = channel.sent.lock().unwrap().clone();
+        assert!(sent[0].contains("claude-opus-5"), "{}", sent[0]);
+        assert!(sent[0].contains("Asked for: opus"), "{}", sent[0]);
+        // The list is the agent's, not a copy kept here.
+        assert!(sent[0].contains("default, opus, haiku"), "{}", sent[0]);
+    }
+
+    #[tokio::test]
+    async fn a_sentence_is_not_a_model_name() {
+        let dir = std::env::temp_dir().join(format!("sb-model7-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.on_model(&key, ModelRequest::Set("use opus please".into()))
+            .await
+            .unwrap();
+        settle().await;
+
+        assert_eq!(core.state(&key).unwrap().requested_model, None);
+        assert!(channel.sent.lock().unwrap()[0].contains("Usage:"));
+    }
+
+    #[tokio::test]
+    async fn switching_agents_forgets_the_model_that_was_asked_for() {
+        // A model name is one agent's vocabulary: `opus` means nothing to
+        // codex, and carrying it across would spawn a process with a flag its
+        // agent rejects.
+        let dir = std::env::temp_dir().join(format!("sb-model8-{}", std::process::id()));
+        let key = fake_key();
+        let mut core = core_with(CountingChannel::write_only(), &dir);
+
+        core.on_model(&key, ModelRequest::Set("opus".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            core.state(&key).unwrap().requested_model.as_deref(),
+            Some("opus")
+        );
+
+        core.on_agent(&key, "codex").await.unwrap();
+        assert_eq!(core.state(&key).unwrap().requested_model, None);
     }
 
     #[test]

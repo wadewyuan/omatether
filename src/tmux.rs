@@ -95,6 +95,20 @@ impl Agent for TmuxSession {
         self.busy.load(Ordering::SeqCst)
     }
 
+    /// This tier launches through `omarchy-agent`, which takes `--inline`,
+    /// `--pick` and `--prompt` and exits on anything else. Building the command
+    /// line here instead would mean copying its table of per-agent
+    /// auto-approve flags, which is exactly the knowledge worth not owning a
+    /// second copy of.
+    async fn set_model(&mut self, _model: Option<&str>) -> Result<Option<String>> {
+        bail!(
+            "{} runs through omarchy-agent, which takes no model — \
+             set it in {}'s own config, or /attach and change it there",
+            self.agent,
+            self.agent
+        )
+    }
+
     async fn prompt(&mut self, text: &str) -> Result<()> {
         if self.session_exists().await {
             // Feed an existing session instead of starting a second one: the

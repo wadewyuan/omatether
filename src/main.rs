@@ -83,6 +83,10 @@ enum Mode {
         #[arg(long)]
         session_id: Option<String>,
 
+        /// Start on this model instead of the agent's own choice.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Send this prompt immediately on start.
         prompt: Option<String>,
     },
@@ -117,8 +121,9 @@ async fn main() -> Result<()> {
             dir,
             agent,
             session_id,
+            model,
             prompt,
-        } => repl(dir, agent, session_id, prompt).await,
+        } => repl(dir, agent, session_id, model, prompt).await,
     }
 }
 
@@ -306,6 +311,7 @@ async fn repl(
     dir: PathBuf,
     agent: Option<String>,
     session_id: Option<String>,
+    model: Option<String>,
     prompt: Option<String>,
 ) -> Result<()> {
     let name = agent.unwrap_or_else(omarchy_default_agent);
@@ -315,6 +321,7 @@ async fn repl(
         agent: name.clone(),
         cwd: dir.clone(),
         session_id,
+        model,
         label: "repl".to_string(),
     })
     .await?;
@@ -569,6 +576,37 @@ async fn handle_input(
         },
 
         command::Command::Help => println!("{}", command::HELP),
+
+        // Not a thread concept: the model belongs to the session, which is
+        // exactly what the repl is holding — and this is the harness the live
+        // switch is verified against.
+        command::Command::Model(want) => {
+            let asked = match &want {
+                command::ModelRequest::Report => {
+                    let offered = session.models();
+                    println!(
+                        "[model] {}",
+                        if offered.is_empty() {
+                            "this agent did not say what it offers".to_string()
+                        } else {
+                            format!("offers {}", offered.join(", "))
+                        }
+                    );
+                    return Ok(false);
+                }
+                command::ModelRequest::Reset => None,
+                command::ModelRequest::Set(name) => Some(name.clone()),
+            };
+
+            match session.set_model(asked.as_deref()).await {
+                Ok(Some(resolved)) => println!("[model] now {resolved}"),
+                Ok(None) => println!(
+                    "[model] accepted{}",
+                    asked.map(|a| format!(" {a}")).unwrap_or_default()
+                ),
+                Err(e) => println!("[model] refused: {e}"),
+            }
+        }
 
         // Thread concepts; the repl drives one session in one place.
         command::Command::New

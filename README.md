@@ -78,6 +78,7 @@ thing stays behind the tailnet with nothing exposed.
 | `/stop` | Interrupt the running turn |
 | `/cd <path>` | Set the working directory (starts a fresh session) |
 | `/agent <name>` | Switch agent — claude, codex, pi, omp, opencode, crush, grok, gemini, copilot |
+| `/model [name]` | Which model the agent runs. `/model default` hands the choice back |
 | `/attach` | The ssh line to take over at a real terminal |
 | `/status` | Agent, model, directory, session, whether a turn is running |
 | `/allow`, `/deny <why>` | Answer a permission request without tapping |
@@ -86,6 +87,21 @@ thing stays behind the tailnet with nothing exposed.
 
 Anything else goes to the agent as typed — including its own slash commands,
 many of which are prompt expansions, so `/review` just works.
+
+### Models
+
+`/model opus` switches the model without starting a new session — the only one
+of these commands that keeps the conversation, because unlike a directory or an
+agent, a model can be changed underneath a running one. On Claude Code the
+switch goes to the live session and comes back checked, so a name it does not
+know is refused in the reply rather than discovered a turn later; `/model` on
+its own lists what that agent said it offers. Codex and Pi take the flag on
+their next turn instead, and neither reports a model back, so what you asked
+for is what gets shown.
+
+The detached tier (omp, opencode, crush, grok, gemini, copilot) cannot be told:
+it launches through `omarchy-agent`, which takes no model. `/model` says so
+rather than remembering something that would never be used.
 
 ### How a turn looks
 

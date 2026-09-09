@@ -57,6 +57,26 @@ The older `can_use_tool` control request is also accepted (`{behavior:
 remembers which dialect each question came in and answers in kind; that
 bookkeeping stays inside the adapter so seam B stays vendor-neutral.
 
+**`set_model` is a control request, and it is the only place a model name gets
+checked.** `{"subtype":"set_model","model":"opus"}` on the live session's stdin
+comes back `success`; an unknown name comes back
+`{"subtype":"error","error":"Model \"x\" is not a recognized model id…"}`, and
+`"model":null` resets to the session default. Verified against 2.1.235, all
+three. **`--model` at spawn checks nothing**: `--model definitely-not-a-model`
+starts fine, reports that name back in its own `system/init` frame, and only
+falls over when a turn is asked of it. So a name typed at `/model` goes through
+the control request when a session is up, and `--model` is for replaying a name
+that was already accepted.
+
+Two things fall out of that. `ClaudeSession::ask` waits for the answer through a
+`RepliesMap` keyed by request id — and a frame claimed that way is *not* passed
+to `wire::normalize`, or the rejection reported to whoever asked would also
+arrive a second time as an `Error` event in the middle of somebody's turn. And
+the handshake reply carries a **`models` array** (`value`, `resolvedModel`),
+which is the only catalog anywhere in reach — `claude` has no "list models"
+command — so `/model` lists what that array said and resolves `opus` to
+`claude-opus-5` with it rather than with a table kept here.
+
 **Claude Code exports session-identity env vars to its children**
 (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, …). A
 spawned agent inherits them, decides it is a nested session, and resolves
@@ -85,6 +105,12 @@ Event vocabulary, read out of codex-cli 0.152.1 rather than guessed:
 Claude uses (`Bash`) so the renderer and the gate list need no per-agent
 knowledge.
 
+`-m <model>` is accepted by both `codex exec` and `codex exec resume <id>`
+(checked against 0.153.4's own `--help`), so the flag goes on every turn's
+process and a `/model` needs no session restart. Nothing validates the name
+here — there is no process between turns to ask — so a bad one surfaces as a
+failed turn.
+
 **Unverified:** a successful Codex turn. `codex login` has never been run on
 this machine, so every request 401s. Everything up to the model call is
 exercised, including a real captured thread id. Run `codex login` and then
@@ -112,6 +138,14 @@ discarded and the user gets the tool call alone, reported as a completed turn.
 The A/B is worth keeping in mind: with `turn_end` closing the turn, `omatether
 repl --agent pi` prints the `[tool]` line and `[turn end] ok` and never prints
 the reply at all.
+
+**Pi checks the model itself, and says so outside the JSON.** `--model
+definitely-not-a-model` exits before any turn with `Error: Model "…" not found.
+Use --list-models to see available models.` on a plain line — which this adapter
+logs as non-JSON and drops, so what reaches the chat is the generic "pi exited
+without completing the turn". The reason is in the `omatether::pi` log. Worth
+fixing by carrying the last non-JSON line into that detail; it would improve
+every pi startup failure, not just this one.
 
 **A failed turn is quiet.** Pi exits 0 and still emits a well-formed `agent_end`
 on an API error; the only sign is the last message's `stopReason` of `"error"`,
@@ -145,6 +179,13 @@ a message starting with `-` is parsed as flags. Verified against tmux 3.7c.
 The `new-session` path is fine as it is: tmux passes the prompt to
 `omarchy-agent` as argv with no shell in between, so `foo; rm -rf ~` stays a
 string. Verified, not assumed.
+
+**No model can be passed through this tier.** `omarchy-agent` takes `--inline`,
+`--pick` and `--prompt`, exits on anything else, and holds each agent's own
+spelling of "don't stop to ask". Getting a model in would mean either changing
+Omarchy or building these command lines here — and a stale second copy of the
+flags that decide whether an agent pauses for permission is the wrong thing to
+own. `agent::takes_model` is false for the tier and `/model` says why.
 
 ## Telegram
 
@@ -337,6 +378,22 @@ worst kind of bug to find.
   what claude already told us (codex, pi and the tmux tier all send `None`
   today), and `/agent` clears it, because claude's model under codex's name is
   a confident lie. Unknown prints as unknown.
+- **`threads.model` and `threads.requested_model` are different facts, and
+  collapsing them is a bug waiting to happen.** The first is what came back —
+  resolved, `claude-opus-5` — and is only ever for saying out loud. The second
+  is what `/model` asked for, spelt as typed (`opus`), and is the only one
+  passed to the next process. Pass the reported one to a spawn and a thread
+  that never ran `/model` pins itself for good to whatever the agent defaulted
+  to on the day it was first asked; show the requested one in preference to the
+  reported one and an alias hides the id that is really running. `/agent`
+  clears both, because a model name is one agent's vocabulary — `opus` means
+  nothing to codex, and pi wants a `provider/id`.
+- **`/model` keeps the session; `/cd` and `/agent` do not.** A directory is
+  fixed when a process starts and a transcript cannot move between agents, but
+  a model can change underneath a live conversation — Claude Code takes a
+  `set_model` control request, and the per-turn agents just get a different
+  flag next time. Do not copy the shutdown-and-forget shape from the commands
+  either side of it.
 - **Nothing slow happens on the core's task.** Every channel call goes through
   the thread's outbox (`src/outbox.rs`); the core queues and moves on. This is
   what keeps "one turn per thread" from quietly meaning "one *anything* at a
@@ -414,7 +471,22 @@ Beyond that, the repl drives any agent without a channel:
 ```bash
 omatether repl --dir .                              # interactive
 omatether repl --agent codex --dir . "run tests"    # one-shot, runs to completion
+omatether repl --agent claude --model haiku --dir . # start on a given model
 ```
+
+`/model` works in the repl, and that is how the live switch was checked against
+the real CLI without spending a turn: `/model` lists, `/model haiku` answers
+`now claude-haiku-4-5-20251001`, an unknown name comes back refused in the
+CLI's own words, and `/model default` returns to `claude-sonnet-5`. None of
+that costs an API call, which makes it a cheap thing to re-run when the CLI
+moves under us.
+
+**Do not run a second `omatether serve` while the user unit is active.** A
+scratch `--state` keeps the databases apart but not the bot: `getUpdates` is
+exclusive, so for as long as the second one runs the two steal each other's
+messages and some arrive nowhere. Check `systemctl --user is-active omatether`
+first, and use the repl — which touches no channel — for anything that does not
+specifically need one.
 
 To exercise the detached tier without launching a real agent, put a stub
 `omarchy-agent` earlier on `PATH` and point `TMUX_TMPDIR` at a scratch

@@ -49,6 +49,29 @@ pub trait Agent: Send {
         Ok(())
     }
 
+    /// Run a different model from the next turn on. `None` means "whatever you
+    /// would have picked yourself".
+    ///
+    /// Returns the name the agent resolved it to, when it says: `opus` is not
+    /// what `/status` should print if `claude-opus-5` is what will run. `None`
+    /// means the switch was accepted but unnamed, which is the honest answer
+    /// from an agent that takes the flag and never reports back.
+    ///
+    /// The error is shown to whoever asked, so it has to read as a reason —
+    /// this is the one place a bad model name can be caught before a turn is
+    /// spent on it.
+    async fn set_model(&mut self, _model: Option<&str>) -> Result<Option<String>> {
+        bail!("{} cannot be told which model to run", self.name())
+    }
+
+    /// Model names this agent has said it accepts, if it ever said.
+    ///
+    /// Empty is "it did not say", not "there are none" — no agent here can be
+    /// asked for a list, so this is only ever what one volunteered.
+    fn models(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Interrupt the running turn. Harmless when nothing is running.
     async fn cancel(&mut self) -> Result<()>;
 
@@ -114,8 +137,24 @@ pub struct SpawnConfig {
     /// resume. Claude accepts one we choose; Codex assigns its own and reports
     /// it back through [`AgentEvent::Ready`].
     pub session_id: Option<String>,
+    /// The model `/model` asked for, or `None` to let the agent choose.
+    pub model: Option<String>,
     /// Label for a detached tmux session, so it can be found again.
     pub label: String,
+}
+
+/// Whether this agent can be told which model to run at all.
+///
+/// The detached tier cannot: it launches through `omarchy-agent`, which takes
+/// `--inline`, `--pick` and `--prompt`, rejects anything else, and holds each
+/// agent's own auto-approve spelling. Passing a model would mean either
+/// changing Omarchy or copying that table in here, and a stale copy of the
+/// flags that decide whether an agent stops to ask is the wrong thing to own.
+pub fn takes_model(agent: &str) -> bool {
+    matches!(
+        backend_for(agent),
+        Some(Backend::Claude) | Some(Backend::Codex) | Some(Backend::Pi)
+    )
 }
 
 /// Start an agent, whichever backend drives it.
@@ -141,6 +180,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
                 session_id: config
                     .session_id
                     .and_then(|id| uuid::Uuid::parse_str(&id).ok()),
+                model: config.model,
                 permission_mode: "default".to_string(),
                 raw: false,
             })
@@ -152,6 +192,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
             let (session, events) = crate::codex::CodexSession::new(crate::codex::Config {
                 cwd: config.cwd,
                 thread_id: config.session_id,
+                model: config.model,
             });
             Ok((Box::new(session), events))
         }
@@ -160,6 +201,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
             let (session, events) = crate::pi::PiSession::new(crate::pi::Config {
                 cwd: config.cwd,
                 session_id: config.session_id,
+                model: config.model,
             });
             Ok((Box::new(session), events))
         }
@@ -192,6 +234,19 @@ mod tests {
     #[test]
     fn unknown_agents_are_rejected() {
         assert!(backend_for("emacs").is_none());
+    }
+
+    #[test]
+    fn only_the_agents_omatether_spawns_itself_can_be_told_a_model() {
+        // The three with a command line of our own making. The detached tier
+        // runs through omarchy-agent, which has nowhere to put one.
+        for name in ["claude", "codex", "pi"] {
+            assert!(takes_model(name), "{name} takes a model");
+        }
+        for name in ["omp", "opencode", "crush", "grok", "gemini", "copilot"] {
+            assert!(!takes_model(name), "{name} has no way to be told one");
+        }
+        assert!(!takes_model("emacs"));
     }
 
     #[test]

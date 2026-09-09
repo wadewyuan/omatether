@@ -54,6 +54,9 @@ pub struct Config {
     pub cwd: PathBuf,
     /// Pi's own session id, when resuming a conversation.
     pub session_id: Option<String>,
+    /// `--model`, or `None` to let Pi pick. Pi's own vocabulary: a pattern, a
+    /// `provider/id`, or either with a `:<thinking>` suffix.
+    pub model: Option<String>,
 }
 
 pub struct PiSession {
@@ -61,6 +64,9 @@ pub struct PiSession {
     /// Assigned by Pi in the first `session` frame; used to resume every turn
     /// after.
     session_id: Arc<Mutex<Option<String>>>,
+    /// Passed to every turn's process; see the Codex adapter's note on why it
+    /// is a plain field.
+    model: Option<String>,
     events: mpsc::Sender<AgentEvent>,
     busy: Arc<AtomicBool>,
     /// The running turn's process, so `cancel` has something to kill.
@@ -74,6 +80,7 @@ impl PiSession {
             Self {
                 cwd: config.cwd,
                 session_id: Arc::new(Mutex::new(config.session_id)),
+                model: config.model,
                 events: tx,
                 busy: Arc::new(AtomicBool::new(false)),
                 child: Arc::new(Mutex::new(None)),
@@ -116,6 +123,9 @@ impl Agent for PiSession {
         if let Some(id) = &resume {
             command.arg("--session").arg(id);
         }
+        if let Some(model) = &self.model {
+            command.arg("--model").arg(model);
+        }
         command
             // The prompt goes after `--` so a leading `-` in the text is not
             // read as a pi flag. One caveat, pi's own: `@file` tokens in a
@@ -156,6 +166,12 @@ impl Agent for PiSession {
         tokio::spawn(log_stderr(stderr));
 
         Ok(())
+    }
+
+    /// Recorded for the next turn's process; nothing is running to ask.
+    async fn set_model(&mut self, model: Option<&str>) -> Result<Option<String>> {
+        self.model = model.map(String::from);
+        Ok(None)
     }
 
     async fn cancel(&mut self) -> Result<()> {
