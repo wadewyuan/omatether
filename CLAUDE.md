@@ -12,7 +12,14 @@ Where something is unverified, it says so.
 Deployed as a systemd **user** service: `systemctl --user {status,restart} omatether`,
 `journalctl --user -fu omatether`. Config is `~/.config/omatether/env`
 (mode 600), read by the unit as `EnvironmentFile`. Both channels are live and
-working end to end.
+working end to end. First-time setup on a fresh machine is `omatether setup`
+(`src/setup.rs`) — interactive, idempotent, validates credentials live,
+detects the Telegram user id off the first message the bot receives, writes
+the env file and generates the unit pointing at the binary that ran it.
+Two setup behaviours with sharp edges: its getUpdates poll backs off to a
+manual id prompt on a 409 **Conflict**, because a running service holds the
+poll exclusively; and a saved token that no longer passes getMe stops the
+flow with an offer to replace it rather than being kept.
 
 Two things about that unit are load-bearing. `PATH` is set explicitly, because
 a user service does not source `.bashrc` and would otherwise find neither

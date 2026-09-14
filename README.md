@@ -22,32 +22,42 @@ omatether repl  --dir .         # one session, driven from this terminal
 
 ### Setup
 
-At least one channel must be configured; both is fine.
+At least one channel must be configured; both is fine. The easy way is the
+guided setup, which validates every credential as you type it, detects your
+Telegram user id from the first message you send the bot, writes the env
+file, and installs and starts the service:
+
+```bash
+omatether setup
+```
+
+It is idempotent — what is already configured is reported and kept, so a
+half-finished run can simply be run again. What it asks for, and why:
 
 **Telegram.** Create a bot with [@BotFather](https://t.me/BotFather). **Mint a
 new one** — `getUpdates` is exclusive, so sharing a token with another bot means
-the two steal each other's messages. Get your numeric user id from
-[@userinfobot](https://t.me/userinfobot).
+the two steal each other's messages. Setup checks the token against Telegram
+the moment you paste it, then asks you to send the bot any message and reads
+your numeric user id off it — no trip to @userinfobot.
 
 **iMessage (Photon).** Photon is a managed service — no Mac relay. Create a
 project at [app.photon.codes](https://app.photon.codes/) and note its id and
-secret, then:
+secret. Credentials alone are not enough: a fresh project knows nothing about
+you, so your phone has to be registered as a Spectrum user before inbound
+messages route anywhere, and **the number you text to reach the agent is
+assigned per user, per project** — a new project means a new number, not
+whatever an older one used. Setup runs that registration for you and prints
+the line to text; `omatether photon-setup --phone <E.164>` re-checks it later
+if the line has not been assigned yet.
+
+From a source checkout the Photon sidecar also needs its dependencies once:
 
 ```bash
 cd vendor/photon-sidecar && npm install
-
-export OMATETHER_PHOTON_PROJECT_ID=... OMATETHER_PHOTON_PROJECT_SECRET=...
-omatether photon-setup --phone <your phone, E.164>
 ```
 
-Credentials alone are not enough. A fresh project knows nothing about you: your
-phone has to be registered as a Spectrum user before inbound messages route
-anywhere, and **the number you text to reach the agent is assigned per user,
-per project** — so a new project means a new number, not whatever an older one
-used. `photon-setup` registers the phone if absent and prints that number. It
-is idempotent; re-run it if the line has not been assigned yet.
-
-Then write `~/.config/omatether/env`, `chmod 600`:
+The manual path, if you prefer it: write `~/.config/omatether/env`,
+`chmod 600`:
 
 ```
 OMATETHER_TELEGRAM_TOKEN=123456:AA...
@@ -58,9 +68,9 @@ OMATETHER_PHOTON_PROJECT_SECRET=...
 OMATETHER_PHOTON_ALLOWED_USERS=<your phone, E.164>
 ```
 
-Install the service. The unit in `contrib/` is written for a packaged
-install (the binary at `/usr/bin/omatether`); from a source checkout, point
-`ExecStart` at your `target/release/omatether` instead:
+and install the service by hand. The unit in `contrib/` is written for a
+packaged install (the binary at `/usr/bin/omatether`); from a source
+checkout, point `ExecStart` at your `target/release/omatether` instead:
 
    ```bash
    cargo build --release

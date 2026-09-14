@@ -14,6 +14,7 @@ mod event;
 mod outbox;
 mod pi;
 mod render;
+mod setup;
 mod store;
 mod tmux;
 
@@ -70,6 +71,10 @@ enum Mode {
         phone: String,
     },
 
+    /// Guided first-run setup: credentials, env file, systemd service.
+    /// Safe to re-run — what is configured is kept.
+    Setup,
+
     /// Drive one agent session from this terminal.
     Repl {
         #[arg(long, default_value = ".")]
@@ -124,6 +129,7 @@ async fn main() -> Result<()> {
             model,
             prompt,
         } => repl(dir, agent, session_id, model, prompt).await,
+        Mode::Setup => setup::run().await,
     }
 }
 
