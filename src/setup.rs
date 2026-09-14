@@ -17,12 +17,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::channel::photon_setup;
-
-const TELEGRAM_API: &str = "https://api.telegram.org";
+use crate::channel::telegram_setup::{self, Wait};
 
 /// The whole flow, top to bottom. Steps that find their work already done
 /// say so and move on.
@@ -35,8 +33,13 @@ pub async fn run() -> Result<()> {
     let mut env = EnvFile::load(&env_path)?;
     let mut prompter = Prompter::new();
 
+    // Saved after each channel, not once at the end: a Photon step that fails
+    // — a rejected secret, a closed stdin, a Ctrl-C — must not take a working
+    // Telegram setup down with it.
     telegram(&mut env, &mut prompter).await?;
+    env.save()?;
     photon(&mut env, &mut prompter).await?;
+    env.save()?;
 
     if env.telegram().is_none() && env.photon().is_none() {
         bail!(
@@ -44,7 +47,6 @@ pub async fn run() -> Result<()> {
              `omatether setup` and answer at least one of them."
         );
     }
-    env.save()?;
 
     install_service().await?;
 
@@ -100,7 +102,7 @@ async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
     println!("Telegram:");
 
     if let Some((token, allowed)) = env.telegram() {
-        match get_me(&token).await {
+        match telegram_setup::get_me(&token).await {
             Ok(name) => {
                 println!("  ✓ already configured: @{name}, allowed: {allowed}\n");
                 return Ok(());
@@ -127,24 +129,31 @@ async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
             println!("  (skipping Telegram)\n");
             return Ok(());
         }
-        match get_me(&token).await {
+        match telegram_setup::get_me(&token).await {
             Ok(name) => break (token, name),
             Err(e) => println!("  ✗ Telegram refused it: {e:#} — try again, or empty to skip"),
         }
     };
     println!("  ✓ the bot is @{bot_name}");
 
+    // Asked again rather than bailed on: a typo here used to throw away the
+    // token that had just been validated.
     let user_id = match detect_sender(&token, &bot_name, prompter).await? {
         Some(id) => id,
-        None => {
-            prompter
-                .ask("  Your numeric Telegram user id (@userinfobot will tell you)")
-                .await?
-        }
+        None => loop {
+            let id = prompter
+                .ask("  Your numeric Telegram user id (@userinfobot will tell you), or empty to skip")
+                .await?;
+            if id.is_empty() {
+                println!("  (skipping Telegram)\n");
+                return Ok(());
+            }
+            if id.chars().all(|c| c.is_ascii_digit()) {
+                break id;
+            }
+            println!("  ✗ a Telegram user id is numeric — got '{id}'");
+        },
     };
-    if user_id.is_empty() || !user_id.chars().all(|c| c.is_ascii_digit()) {
-        bail!("a Telegram user id is numeric — got '{user_id}'");
-    }
 
     env.set("OMATETHER_TELEGRAM_TOKEN", &token);
     env.set("OMATETHER_TELEGRAM_ALLOWED_USERS", &user_id);
@@ -152,20 +161,10 @@ async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
     Ok(())
 }
 
-/// getMe, the cheapest possible proof that a token is real.
-async fn get_me(token: &str) -> Result<String> {
-    let response = telegram_call(token, "get_me", serde_json::json!({})).await?;
-    response
-        .get("username")
-        .and_then(Value::as_str)
-        .map(String::from)
-        .context("Telegram's getMe named no username")
-}
-
 /// The allowlist entry, read off the next message the bot receives rather
-/// than looked up by hand. Long-poll-free short polls for two minutes; a
-/// running service holds getUpdates exclusively, so a conflict falls back
-/// to typing the id rather than fighting the service for it.
+/// than looked up by hand. Every way that can fail — a running service
+/// holding the poll, nobody writing in time, "that isn't me" — ends at the
+/// manual prompt rather than an error.
 async fn detect_sender(
     token: &str,
     bot_name: &str,
@@ -174,87 +173,29 @@ async fn detect_sender(
     println!("  Now open a chat with @{bot_name} and send it any message —");
     println!("  your user id is read from that. Waiting two minutes…");
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        match telegram_call(
-            token,
-            "get_updates",
-            serde_json::json!({ "offset": -1, "timeout": 0 }),
-        )
-        .await
-        {
-            Ok(updates) => {
-                if let Some((id, name)) = updates
-                    .as_array()
-                    .and_then(|all| all.iter().find_map(private_sender))
-                {
-                    println!("  Got a message from {name} (id {id}).");
-                    return match prompter.confirm("  Is that you?", true).await? {
-                        true => Ok(Some(id)),
-                        false => Ok(None),
-                    };
-                }
+    let wait =
+        telegram_setup::wait_for_private_sender(token, std::time::Duration::from_secs(120)).await?;
+    match wait {
+        Wait::Found(sender) => {
+            println!("  Got a message from {} (id {}).", sender.name, sender.id);
+            let mine = prompter.confirm("  Is that you?", true).await?;
+            // Read or not, it was sent to setup, not to the agent.
+            if let Err(e) = telegram_setup::acknowledge(token, sender.update_id).await {
+                println!("  · could not mark it read ({e:#}); the service may");
+                println!("    answer it as a prompt when it starts.");
             }
-            Err(e) => {
-                if e.to_string().contains("Conflict") {
-                    println!("  The running omatether service holds the poll, so the id");
-                    println!("  cannot be detected while it is up.");
-                    return Ok(None);
-                }
-                return Err(e).context("asking Telegram for updates");
-            }
+            Ok(mine.then_some(sender.id))
         }
-
-        if tokio::time::Instant::now() > deadline {
+        Wait::Conflict => {
+            println!("  The running omatether service holds the poll, so the id");
+            println!("  cannot be detected while it is up.");
+            Ok(None)
+        }
+        Wait::TimedOut => {
             println!("  No message arrived in time.");
-            return Ok(None);
+            Ok(None)
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-}
-
-/// The sender of a private-chat message in one update, if this update is one.
-fn private_sender(update: &Value) -> Option<(String, String)> {
-    let message = update.get("message")?;
-    if message.get("chat")?.get("type")?.as_str()? != "private" {
-        return None;
-    }
-    let from = message.get("from")?;
-    let id = from.get("id")?.as_u64()?.to_string();
-    let name = from
-        .get("first_name")
-        .and_then(Value::as_str)
-        .unwrap_or("someone")
-        .to_string();
-    Some((id, name))
-}
-
-/// A thin getMe/getUpdates caller, separate from the channel adapter: this
-/// one reports rather than retries, and runs before an allowlist exists.
-async fn telegram_call(token: &str, method: &str, body: Value) -> Result<Value> {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
-    let response: Value = http
-        .post(format!("{TELEGRAM_API}/bot{token}/{method}"))
-        .json(&body)
-        .send()
-        .await
-        .with_context(|| format!("reaching Telegram for {method}"))?
-        .json()
-        .await
-        .with_context(|| format!("decoding Telegram's {method} reply"))?;
-
-    if response.get("ok").and_then(Value::as_bool) != Some(true) {
-        bail!(
-            "{}",
-            response
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-        );
-    }
-    Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
 // ---- photon ------------------------------------------------------------
@@ -334,6 +275,9 @@ async fn photon(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
 struct EnvFile {
     path: PathBuf,
     values: BTreeMap<String, String>,
+    /// Set by `set`, cleared by `save`, so saving after every step writes
+    /// only when a step actually changed something.
+    changed: bool,
 }
 
 impl EnvFile {
@@ -357,6 +301,7 @@ impl EnvFile {
         Ok(Self {
             path: path.to_path_buf(),
             values,
+            changed: false,
         })
     }
 
@@ -365,7 +310,10 @@ impl EnvFile {
     }
 
     fn set(&mut self, key: &str, value: &str) {
-        self.values.insert(key.to_string(), value.to_string());
+        if self.values.get(key).map(String::as_str) != Some(value) {
+            self.values.insert(key.to_string(), value.to_string());
+            self.changed = true;
+        }
     }
 
     /// Telegram is configured only with both halves: a token and the
@@ -387,9 +335,18 @@ impl EnvFile {
 
     /// Written with 600 from the first byte — the contents are a shell on
     /// this machine. An existing file with looser permissions is tightened
-    /// rather than left as found.
-    fn save(&self) -> Result<()> {
+    /// rather than left as found, even when there is nothing new to write.
+    fn save(&mut self) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !self.changed {
+            if self.path.exists() {
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("tightening {}", self.path.display()))?;
+            }
+            return Ok(());
+        }
 
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
@@ -410,10 +367,8 @@ impl EnvFile {
         use std::io::Write as _;
         file.write_all(text.as_bytes())?;
         drop(file);
-        std::fs::set_permissions(
-            &self.path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )?;
+        std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+        self.changed = false;
 
         println!("  ✓ wrote {} (mode 600)", self.path.display());
         Ok(())
@@ -569,7 +524,6 @@ impl Prompter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn env_round_trip_and_comments_are_ignored() {
@@ -611,31 +565,26 @@ mod tests {
     }
 
     #[test]
-    fn the_sender_comes_from_a_private_message_only() {
-        let private = json!({
-            "update_id": 1,
-            "message": {
-                "chat": {"id": 7, "type": "private"},
-                "from": {"id": 424242, "first_name": "Ada"},
-                "text": "hi"
-            }
-        });
+    fn saving_with_nothing_changed_writes_nothing() {
+        // Setup saves after every channel; a skipped one must not leave an
+        // empty env file behind, nor rewrite an existing one.
+        let dir = std::env::temp_dir().join(format!("omatether-setup-noop-{}", std::process::id()));
+        let path = dir.join("env");
+        let mut env = EnvFile::load(&path).unwrap();
+        env.save().unwrap();
+        assert!(!path.exists());
+
+        env.set("OTHER", "1");
+        env.save().unwrap();
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        env.set("OTHER", "1");
+        env.save().unwrap();
         assert_eq!(
-            private_sender(&private),
-            Some(("424242".to_string(), "Ada".to_string()))
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written
         );
 
-        // A group message must not become the allowlist entry — anyone can
-        // add a bot to a group.
-        let group = json!({
-            "update_id": 2,
-            "message": {
-                "chat": {"id": -9, "type": "group"},
-                "from": {"id": 424242, "first_name": "Ada"},
-                "text": "hi"
-            }
-        });
-        assert_eq!(private_sender(&group), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

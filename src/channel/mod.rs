@@ -12,6 +12,7 @@ mod markup;
 pub mod photon;
 pub mod photon_setup;
 pub mod telegram;
+pub mod telegram_setup;
 
 use std::time::Duration;
 
