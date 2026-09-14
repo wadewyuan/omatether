@@ -42,13 +42,23 @@ const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 /// keeps the prompts meaningful.
 const GATED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
 
-/// Above this many characters, a reply is spilled to a file and the chat gets a
-/// pointer instead.
+/// Above this many characters, a reply on a channel that cannot edit is spilled
+/// to a file and the chat gets a pointer instead.
 ///
-/// Chat is a bad place for a 500-line diff, and both channels clip long
-/// messages anyway — which loses the tail silently. A file plus the command to
-/// read it loses nothing, and the tailnet already makes it reachable.
+/// iMessage delivers a turn whole, at the end, and clips a long message — which
+/// loses the tail silently. A file plus the command to read it loses nothing,
+/// and the tailnet already makes it reachable. A channel that can edit pages
+/// instead: see [`PAGE_BUDGET`].
 const SPILL_THRESHOLD: usize = 2500;
+
+/// The most a turn puts in one message on a channel that can edit, before it
+/// carries on in the next.
+///
+/// Under Telegram's 4096 — and under the adapter's own clip at 3900, which
+/// measures the markdown rather than what Telegram counts, so this is a safe
+/// bound on both. The pages are markdown too, and rendering only ever removes
+/// characters (fences, `**`, `#`), never adds them.
+const PAGE_BUDGET: usize = 3500;
 
 /// How much of a tool's input a permission question will show inline.
 ///
@@ -1046,10 +1056,11 @@ impl Core {
 
     /// Push a thread's pending text.
     ///
-    /// On a channel that can edit, this grows one message as the turn runs. On
-    /// one that cannot — iMessage — mid-turn flushes are skipped entirely and
-    /// the turn arrives as a single finished message, because the alternative
-    /// is a stream of fragments nobody wants to read on a phone.
+    /// On a channel that can edit, this grows the turn's message as it runs,
+    /// and carries on in a new one when that fills up. On one that cannot —
+    /// iMessage — mid-turn flushes are skipped entirely and the turn arrives as
+    /// a single finished message, because the alternative is a stream of
+    /// fragments nobody wants to read on a phone.
     /// Handing the text over cannot fail slowly: the outbox takes it or says it
     /// is full, and either way the core moves on to the next thread.
     fn flush(&mut self, key: &ThreadKey) {
@@ -1085,6 +1096,11 @@ impl Core {
         };
         let (text, prose) = text;
 
+        if can_edit {
+            self.flush_pages(key, text);
+            return;
+        }
+
         // Spilling rewrites the message into a pointer, but what the renderer
         // has to remember is the text it composed: comparing next time against
         // the pointer would make every tick look like a change and re-send the
@@ -1093,6 +1109,45 @@ impl Core {
 
         // Only once it has been accepted for delivery is it no longer owed.
         if self.queue(key, OutJob::Turn(payload)) {
+            if let Some(thread) = self.threads.get_mut(key) {
+                thread.renderer.mark_sent(text);
+            }
+        }
+    }
+
+    /// A turn on a channel that can edit, as however many messages it takes.
+    ///
+    /// This replaced spilling there. The ssh pointer is an answer at a desk and
+    /// a non-answer from a phone, and on a channel that streams it was worse
+    /// than that: every tick of a long turn wrote another file, and the moment
+    /// the turn passed the threshold its progress was replaced by the pointer.
+    /// Now a message that fills up is finished and the turn carries on below
+    /// it, so nothing is cut and nothing leaves the chat.
+    ///
+    /// `text` is the whole turn as composed, which is what the renderer compares
+    /// against next time — not the current page, which would look unchanged
+    /// while a new page was owed.
+    fn flush_pages(&mut self, key: &ThreadKey, text: String) {
+        let Some(pages) = self
+            .threads
+            .get(key)
+            .map(|thread| thread.renderer.paginate(PAGE_BUDGET))
+        else {
+            return;
+        };
+
+        // One page at a time, and each is remembered only once accepted, so a
+        // full queue leaves the rest owed rather than skipped.
+        for (page, next) in pages.sealed {
+            if !self.queue(key, OutJob::Seal(page)) {
+                return;
+            }
+            if let Some(thread) = self.threads.get_mut(key) {
+                thread.renderer.begin_page(next);
+            }
+        }
+
+        if self.queue(key, OutJob::Turn(pages.current)) {
             if let Some(thread) = self.threads.get_mut(key) {
                 thread.renderer.mark_sent(text);
             }
@@ -1509,7 +1564,11 @@ mod tests {
 
     /// Counts what reached the chat, so a test can tell one message from ten.
     struct CountingChannel {
+        /// Every send and edit, in order.
         sent: std::sync::Mutex<Vec<String>>,
+        /// Each message as it reads now, by position: what scrolling back
+        /// through the chat would show.
+        messages: std::sync::Mutex<Vec<String>>,
         /// Every `typing` call, in order, as `on`.
         typing: std::sync::Mutex<Vec<bool>>,
         can_edit: bool,
@@ -1520,6 +1579,7 @@ mod tests {
         fn editing() -> Arc<Self> {
             Arc::new(Self {
                 sent: std::sync::Mutex::new(Vec::new()),
+                messages: std::sync::Mutex::new(Vec::new()),
                 typing: std::sync::Mutex::new(Vec::new()),
                 can_edit: true,
             })
@@ -1529,6 +1589,7 @@ mod tests {
         fn write_only() -> Arc<Self> {
             Arc::new(Self {
                 sent: std::sync::Mutex::new(Vec::new()),
+                messages: std::sync::Mutex::new(Vec::new()),
                 typing: std::sync::Mutex::new(Vec::new()),
                 can_edit: false,
             })
@@ -1536,6 +1597,10 @@ mod tests {
 
         fn typing(&self) -> Vec<bool> {
             self.typing.lock().unwrap().clone()
+        }
+
+        fn messages(&self) -> Vec<String> {
+            self.messages.lock().unwrap().clone()
         }
     }
 
@@ -1552,12 +1617,15 @@ mod tests {
             Ok(())
         }
         async fn send(&self, _t: &ThreadKey, text: &str) -> Result<String> {
-            let mut sent = self.sent.lock().unwrap();
-            sent.push(text.to_string());
-            Ok(format!("m{}", sent.len()))
-        }
-        async fn edit(&self, _t: &ThreadKey, _id: &String, text: &str) -> Result<()> {
             self.sent.lock().unwrap().push(text.to_string());
+            let mut messages = self.messages.lock().unwrap();
+            messages.push(text.to_string());
+            Ok((messages.len() - 1).to_string())
+        }
+        async fn edit(&self, _t: &ThreadKey, id: &String, text: &str) -> Result<()> {
+            self.sent.lock().unwrap().push(text.to_string());
+            let index: usize = id.parse()?;
+            self.messages.lock().unwrap()[index] = text.to_string();
             Ok(())
         }
         async fn ask_permission(&self, t: &ThreadKey, text: &str, _q: &str) -> Result<String> {
@@ -1662,9 +1730,10 @@ mod tests {
         // what the renderer remembers is that pointer rather than the text it
         // composed, every tick compares unequal, and the thread gets the whole
         // turn again every 1.5 seconds — on someone's phone. Verified to fail
-        // when that mistake is reintroduced.
+        // when that mistake is reintroduced. Only a channel that cannot edit
+        // spills now, so that is the one this runs against.
         let dir = std::env::temp_dir().join(format!("sb-tick-{}", std::process::id()));
-        let channel = CountingChannel::editing();
+        let channel = CountingChannel::write_only();
         let key = ThreadKey {
             channel: "fake",
             chat_id: "1".into(),
@@ -1682,6 +1751,10 @@ mod tests {
         let mut renderer = TurnRenderer::new();
         renderer.apply(&AgentEvent::Text {
             text: "x".repeat(SPILL_THRESHOLD + 500),
+        });
+        renderer.apply(&AgentEvent::TurnEnd {
+            ok: true,
+            detail: None,
         });
         core.threads.insert(
             key.clone(),
@@ -1844,6 +1917,70 @@ mod tests {
             "the growing message took over"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_long_turn_on_an_editing_channel_pages_instead_of_spilling() {
+        // What a working turn looked like from a phone: its progress replaced
+        // by an ssh line the moment it passed 2,500 characters, a new file
+        // written on every tick after that, and the answer behind the pointer.
+        let dir = std::env::temp_dir().join(format!("sb-pages-{}", std::process::id()));
+        let channel = CountingChannel::editing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+
+        let paragraphs: Vec<String> = (0..40)
+            .map(|i| format!("Finding {i}: {}", "detail ".repeat(30).trim_end()))
+            .collect();
+        for paragraph in &paragraphs {
+            let thread = core.threads.get_mut(&key).unwrap();
+            thread.renderer.apply(&AgentEvent::TextDelta {
+                text: format!("{paragraph}\n\n"),
+            });
+            core.flush(&key);
+        }
+        let thread = core.threads.get_mut(&key).unwrap();
+        thread.renderer.apply(&AgentEvent::TurnEnd {
+            ok: true,
+            detail: None,
+        });
+        core.flush(&key);
+        settle().await;
+
+        let messages = channel.messages();
+        assert!(messages.len() >= 3, "{} messages", messages.len());
+        for message in &messages {
+            assert!(message.chars().count() <= PAGE_BUDGET, "{message:?}");
+            assert!(!message.contains("ssh "), "no pointer: {message:?}");
+        }
+        for paragraph in &paragraphs {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.contains(paragraph.as_str()))
+                    .count(),
+                1,
+                "{paragraph:?} arrives whole, once"
+            );
+        }
+        assert!(!dir.exists(), "nothing spilled");
+
+        // And ticks with nothing new cost nothing, pages or not.
+        let before = channel.sent.lock().unwrap().len();
+        core.flush(&key);
+        core.flush(&key);
+        settle().await;
+        assert_eq!(channel.sent.lock().unwrap().len(), before);
     }
 
     #[tokio::test]

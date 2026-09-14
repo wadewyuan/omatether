@@ -453,9 +453,10 @@ fn thread_key(message: &Value) -> Option<ThreadKey> {
     })
 }
 
-/// Chat is a bad place for a 500-line diff. Truncate rather than split: a
-/// stream of continuation messages is worse to read on a phone than a clipped
-/// one, and the full transcript is a `/attach` away.
+/// Insurance, not the way a long turn is handled. The core pages a turn into
+/// messages well under this before it gets here (`PAGE_BUDGET` in `core.rs`), so
+/// what this still catches is a standalone note — and it says it cut, rather
+/// than letting Telegram refuse the message outright.
 fn clip(text: &str) -> String {
     if text.chars().count() <= MAX_TEXT {
         return text.to_string();

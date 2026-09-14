@@ -38,9 +38,38 @@ pub struct TurnRenderer {
     /// Which *message* that went into is the outbox's business, not this
     /// type's: the core never waits for a send, so it never learns an id.
     sent: String,
+    /// Where the message this turn is growing begins, once the messages before
+    /// it have filled up. See [`Self::paginate`].
+    page: PageStart,
     thinking: bool,
     finished: bool,
 }
+
+/// Where the message a turn is currently growing begins.
+///
+/// A turn too long for one chat message carries on in the next, and every
+/// message before that one is finished. This is the boundary: a byte offset
+/// into [`TurnRenderer::compose`], plus the code fence the last page was cut
+/// inside, when it was — the next page has to reopen it, or the rest of the
+/// block renders as prose.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PageStart {
+    at: usize,
+    reopen: Option<String>,
+}
+
+/// A turn cut into chat messages that each fit.
+#[derive(Debug, PartialEq)]
+pub struct Pages {
+    /// Messages that are full, in order: each one's final text, and where the
+    /// page after it begins.
+    pub sealed: Vec<(String, PageStart)>,
+    /// The message still growing.
+    pub current: String,
+}
+
+/// What closes a fence a page was cut inside.
+const FENCE_CLOSE: &str = "\n```";
 
 impl TurnRenderer {
     pub fn new() -> Self {
@@ -116,9 +145,36 @@ impl TurnRenderer {
 
     /// The message as it should currently read.
     pub fn compose(&self) -> String {
-        let mut out = String::new();
+        self.composed().0
+    }
 
-        for segment in &self.segments {
+    /// The turn cut into messages of at most `budget` characters, starting
+    /// from the page the last flush left off in.
+    ///
+    /// A page is only ever sealed where the text in front of the cut can no
+    /// longer change. Prose grows at the end and nowhere else, but the newest
+    /// tool line is rewritten with every call in its run, and a message that has
+    /// been left behind is never edited again — a count sealed mid-run would sit
+    /// there wrong for good.
+    pub fn paginate(&self, budget: usize) -> Pages {
+        let (text, stable) = self.composed();
+        paginate(&text, stable, &self.page, budget)
+    }
+
+    /// Record that the pages before `start` are on their way and finished.
+    pub fn begin_page(&mut self, start: PageStart) {
+        self.page = start;
+    }
+
+    /// [`Self::compose`], and how many bytes at the front of it no later event
+    /// can change.
+    fn composed(&self) -> (String, usize) {
+        let mut out = String::new();
+        // Where the newest tool line begins, when it is the last thing in the
+        // turn: the one part of the text that is rewritten rather than grown.
+        let mut settled = None;
+
+        for (i, segment) in self.segments.iter().enumerate() {
             match segment {
                 Segment::Text(text) => out.push_str(text),
                 Segment::Tool {
@@ -141,24 +197,35 @@ impl TurnRenderer {
                         format!("{head}  {}", code_span(summary))
                     };
                     push_line(&mut out, &line);
+                    // The start of the line itself, past any newline pushed to
+                    // separate it: a cut right in front of it is a safe one.
+                    if i + 1 == self.segments.len() {
+                        settled = Some(out.len() - line.len() - 1);
+                    }
                 }
             }
         }
 
-        let out = out.trim().to_string();
+        let lead = out.len() - out.trim_start().len();
+        let body = out.trim();
 
-        if out.is_empty() {
-            return if self.thinking {
-                "thinking…".to_string()
+        if body.is_empty() {
+            let placeholder = if self.thinking {
+                "thinking…"
             } else {
-                "working…".to_string()
+                "working…"
             };
+            return (placeholder.to_string(), 0);
         }
+
+        // Trimming only ever takes whitespace off the end, which the next word
+        // puts back, so the whole trimmed body is as settled as the segments.
+        let stable = settled.map_or(body.len(), |at| at.saturating_sub(lead).min(body.len()));
 
         if self.thinking && !self.finished {
-            return format!("{out}\n\nthinking…");
+            return (format!("{body}\n\nthinking…"), stable);
         }
-        out
+        (body.to_string(), stable)
     }
 
     /// The turn with the tool log left out — what the agent actually said.
@@ -259,6 +326,175 @@ fn code_span(text: &str) -> String {
         ""
     };
     format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+/// Cut `text` into pages of at most `budget` characters, the first beginning
+/// at `start`, cutting only inside the first `stable` bytes.
+///
+/// The last page can come back over budget when the only place to cut is in
+/// the part that can still change; the next flush, once it has settled, cuts
+/// it then.
+fn paginate(text: &str, stable: usize, start: &PageStart, budget: usize) -> Pages {
+    let mut start = start.clone();
+    let mut sealed = Vec::new();
+    loop {
+        let current = page_text(text, &start);
+        if current.chars().count() <= budget {
+            return Pages { sealed, current };
+        }
+        match page_break(text, stable, &start, budget) {
+            Some((page, next)) => {
+                sealed.push((page, next.clone()));
+                start = next;
+            }
+            None => return Pages { sealed, current },
+        }
+    }
+}
+
+/// Everything from `start` on, as one message.
+fn page_text(text: &str, start: &PageStart) -> String {
+    let body = text.get(start.at..).unwrap_or(text);
+    match &start.reopen {
+        Some(fence) => format!("{fence}\n{body}"),
+        None => body.to_string(),
+    }
+}
+
+/// Where to end the page that begins at `start`: its final text, and where the
+/// next page begins. `None` when nowhere settled will do.
+///
+/// Preference, among cuts that leave the page at least half full: a paragraph
+/// break, then a line break, both outside a code block; then a line break
+/// inside one, closing the fence here and reopening it on the next page. Below
+/// half full the order stops mattering — a page of two lines followed by a
+/// page of forty is worse than a code block that continues overleaf. Only when
+/// a single line is longer than a page is a line cut, at a space if there is
+/// one in its second half.
+fn page_break(
+    text: &str,
+    stable: usize,
+    start: &PageStart,
+    budget: usize,
+) -> Option<(String, PageStart)> {
+    struct Cut {
+        at: usize,
+        fence: Option<String>,
+        rank: u8,
+        cost: usize,
+    }
+
+    let body = text.get(start.at..)?;
+    let limit = stable.checked_sub(start.at)?;
+    let opener = start.reopen.as_ref().map_or(0, |f| f.chars().count() + 1);
+
+    let mut cuts = Vec::new();
+    let mut fence = start.reopen.clone();
+    let mut offset = 0;
+    // Characters of `body[..offset]`, and of it with trailing whitespace off.
+    let mut chars = 0;
+    let mut kept = 0;
+    let mut blank_before = false;
+
+    for line in body.split_inclusive('\n') {
+        if offset > limit {
+            break;
+        }
+        let blank = line.trim().is_empty();
+        let is_fence = is_fence(line);
+
+        // Never between a fence's last line and its closing one: that page
+        // would end on a block reopened only to be closed again.
+        if offset > 0 && !blank && kept > 0 && !(fence.is_some() && is_fence) {
+            let close = if fence.is_some() {
+                FENCE_CLOSE.len()
+            } else {
+                0
+            };
+            let cost = opener + kept + close;
+            if cost > budget {
+                break;
+            }
+            let rank = match (&fence, blank_before) {
+                (None, true) => 2,
+                (None, false) => 1,
+                (Some(_), _) => 0,
+            };
+            cuts.push(Cut {
+                at: offset,
+                fence: fence.clone(),
+                rank,
+                cost,
+            });
+        }
+
+        if is_fence {
+            fence = match fence {
+                Some(_) => None,
+                None => Some(line.trim().to_string()),
+            };
+        }
+        if !blank {
+            kept = chars + line.trim_end().chars().count();
+        }
+        chars += line.chars().count();
+        blank_before = blank;
+        offset += line.len();
+    }
+
+    let cut = cuts
+        .iter()
+        .filter(|cut| cut.cost >= budget / 2)
+        .max_by_key(|cut| (cut.rank, cut.at))
+        .or_else(|| cuts.last());
+
+    let (at, fence) = match cut {
+        Some(cut) => (cut.at, cut.fence.clone()),
+        None => {
+            // One line longer than a whole page, at the top of this one.
+            let close = if start.reopen.is_some() {
+                FENCE_CLOSE.len()
+            } else {
+                0
+            };
+            let room = budget.checked_sub(opener + close)?;
+            let line_end = body.find('\n').unwrap_or(body.len()).min(limit);
+            let hard = body[..line_end].char_indices().nth(room)?.0;
+            let at = body[..hard]
+                .rfind(' ')
+                .filter(|space| *space >= hard / 2)
+                .map_or(hard, |space| space + 1);
+            (at, start.reopen.clone())
+        }
+    };
+
+    let kept = body[..at].trim_end();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut page = String::new();
+    if let Some(reopen) = &start.reopen {
+        page.push_str(reopen);
+        page.push('\n');
+    }
+    page.push_str(kept);
+    if fence.is_some() {
+        page.push_str(FENCE_CLOSE);
+    }
+
+    Some((
+        page,
+        PageStart {
+            at: start.at + at,
+            reopen: fence,
+        },
+    ))
+}
+
+/// A line that opens or closes a code block — the rule `channel::markup` reads
+/// them by.
+fn is_fence(line: &str) -> bool {
+    line.trim_start().starts_with("```")
 }
 
 fn push_line(out: &mut String, line: &str) {
@@ -510,6 +746,198 @@ mod tests {
         let mut r = TurnRenderer::new();
         r.apply(&tool("Bash", "ls"));
         assert_eq!(r.compose_prose(), "");
+    }
+
+    fn fences(page: &str) -> usize {
+        page.lines().filter(|line| is_fence(line)).count()
+    }
+
+    /// Pages until nothing more can be sealed, the way successive flushes would.
+    fn seal_all(r: &mut TurnRenderer, budget: usize) -> Vec<String> {
+        let pages = r.paginate(budget);
+        let mut sealed = Vec::new();
+        for (page, next) in pages.sealed {
+            sealed.push(page);
+            r.begin_page(next);
+        }
+        sealed
+    }
+
+    #[test]
+    fn a_turn_that_fits_is_one_page() {
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("short"));
+        assert_eq!(
+            r.paginate(100),
+            Pages {
+                sealed: Vec::new(),
+                current: "short".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_long_turn_breaks_between_paragraphs_and_loses_nothing() {
+        let paragraphs: Vec<String> = (0..12)
+            .map(|i| format!("Paragraph {i} {}", "word ".repeat(15).trim_end()))
+            .collect();
+        let mut r = TurnRenderer::new();
+        r.apply(&delta(&paragraphs.join("\n\n")));
+
+        let pages = r.paginate(300);
+        assert!(pages.sealed.len() >= 2, "{pages:?}");
+        let mut all: Vec<&str> = pages.sealed.iter().map(|(p, _)| p.as_str()).collect();
+        all.push(&pages.current);
+
+        for page in &all {
+            assert!(page.chars().count() <= 300, "over budget: {page:?}");
+            assert!(!page.starts_with('\n') && !page.ends_with('\n'), "{page:?}");
+        }
+        // Every paragraph whole, on exactly one page.
+        for paragraph in &paragraphs {
+            assert_eq!(
+                all.iter()
+                    .filter(|page| page.contains(paragraph.as_str()))
+                    .count(),
+                1,
+                "{paragraph:?} in {all:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_block_cut_across_pages_is_closed_and_reopened() {
+        // Left open, the rest of the block on the next page renders as prose —
+        // and on Telegram `*` and `_` in it become emphasis and vanish.
+        let code: String = (0..60).map(|i| format!("let x{i} = *p_{i};\n")).collect();
+        let mut r = TurnRenderer::new();
+        r.apply(&delta(&format!("Here:\n\n```rust\n{code}```\n\nDone.")));
+
+        let pages = r.paginate(400);
+        assert!(!pages.sealed.is_empty());
+        let mut all: Vec<String> = pages.sealed.iter().map(|(p, _)| p.clone()).collect();
+        all.push(pages.current.clone());
+
+        for page in &all[1..all.len() - 1] {
+            assert!(
+                page.starts_with("```rust\n"),
+                "reopened with its language: {page:?}"
+            );
+        }
+        for page in &all {
+            assert!(page.chars().count() <= 400, "over budget: {page:?}");
+            assert_eq!(fences(page) % 2, 0, "balanced fences: {page:?}");
+        }
+        for i in 0..60 {
+            let line = format!("let x{i} = *p_{i};");
+            assert_eq!(
+                all.iter().filter(|p| p.contains(&line)).count(),
+                1,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_longer_than_a_page_is_still_cut_to_fit() {
+        let mut r = TurnRenderer::new();
+        r.apply(&delta(&"token ".repeat(200)));
+
+        let pages = r.paginate(250);
+        assert!(!pages.sealed.is_empty());
+        for (page, _) in &pages.sealed {
+            assert!(page.chars().count() <= 250, "{page:?}");
+        }
+        assert!(pages.current.chars().count() <= 250);
+        let rejoined: usize = pages
+            .sealed
+            .iter()
+            .map(|(p, _)| p.matches("token").count())
+            .sum::<usize>()
+            + pages.current.matches("token").count();
+        assert_eq!(rejoined, 200, "no word lost at a cut");
+    }
+
+    #[test]
+    fn a_sealed_page_is_never_contradicted_by_what_the_turn_says_later() {
+        // A message left behind is never edited again, so whatever it says has
+        // to still be true once the turn is over. The tool line is the part
+        // that moves: sealed with "2 tools" in it, it would say 2 for good.
+        // Across a spread of budgets, because where the cuts fall depends on
+        // it, and a single one can happen never to put a cut anywhere risky.
+        for budget in (250..=450).step_by(10) {
+            let mut r = TurnRenderer::new();
+            let mut sealed = Vec::new();
+
+            for round in 0..8 {
+                r.apply(&delta(&format!(
+                    "\n\nRound {round}: {}",
+                    "some findings ".repeat(12)
+                )));
+                for call in 0..5 {
+                    r.apply(&tool("Bash", &format!("step {round}.{call}")));
+                    // "thinking…" under the run is a line start after it — the
+                    // one place a careless cut would take the run's line along.
+                    r.apply(&AgentEvent::Thinking {
+                        text: String::new(),
+                    });
+                    sealed.extend(seal_all(&mut r, budget));
+                }
+            }
+            r.apply(&AgentEvent::TurnEnd {
+                ok: true,
+                detail: None,
+            });
+            sealed.extend(seal_all(&mut r, budget));
+            let last = r.paginate(budget).current;
+
+            assert!(sealed.len() >= 2, "budget {budget}: {sealed:?}");
+            for page in &sealed {
+                for line in page.lines().filter(|l| l.starts_with('▸')) {
+                    assert!(
+                        line.contains("5 tools"),
+                        "budget {budget}: a run sealed half-counted: {page:?}"
+                    );
+                }
+            }
+            let mut rejoined = sealed.join("\n\n");
+            rejoined.push_str("\n\n");
+            rejoined.push_str(&last);
+            for round in 0..8 {
+                assert!(
+                    rejoined.contains(&format!("Round {round}:")),
+                    "budget {budget}"
+                );
+            }
+            assert_eq!(
+                rejoined.matches('▸').count(),
+                8,
+                "budget {budget}: each run exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_line_still_counting_stays_on_the_page_that_can_still_change() {
+        // 95 + 1 + "▸ Bash  `ls`" (12) + "\n\nthinking…" (11) = 119. Under a
+        // budget of 115 the best-looking cut is the paragraph break before
+        // "thinking…" — which would seal the tool line while its run is open.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta(&"x".repeat(95)));
+        r.apply(&tool("Bash", "ls"));
+        r.apply(&AgentEvent::Thinking {
+            text: String::new(),
+        });
+
+        let pages = r.paginate(115);
+        assert_eq!(pages.sealed.len(), 1, "{pages:?}");
+        assert!(!pages.sealed[0].0.contains('▸'), "{pages:?}");
+        assert!(pages.current.starts_with("▸ Bash"), "{pages:?}");
+
+        // Which is what lets the run go on counting where it is shown.
+        r.begin_page(pages.sealed[0].1.clone());
+        r.apply(&tool("Bash", "pwd"));
+        assert!(r.paginate(115).current.starts_with("▸ 2 tools"));
     }
 
     #[test]

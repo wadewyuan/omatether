@@ -290,6 +290,24 @@ also the one job `src/outbox.rs` does *not* retry through a rate limit —
 waiting out a 429 would park the thread's queue, with the turn's actual text
 behind an indicator that is stale by the time it lands.
 
+**A long turn pages; it does not spill.** Once the turn's message reaches
+`PAGE_BUDGET` (3500) it is sealed — edited one last time to its final text —
+and the turn carries on in a new message. That is `OutJob::Seal`, one job
+rather than `Turn` + `NewTurn` so a full queue cannot accept half the pair. Spilling
+used to happen here, and on a streaming channel it was worse than
+inconvenient: every tick of a long turn wrote a new file, and the live message
+turned into an ssh pointer the moment it passed 2500, hiding the progress.
+Two rules in the cut, both in `render.rs`. **A page is only cut where nothing
+in front of it can still change** (`TurnRenderer::composed` reports how far
+that is): prose only grows at the end, but the newest tool line is rewritten
+on every call in its run, and a sealed message is never edited again — a
+"▸ 2 tools" sealed mid-run says 2 for good. And **a cut inside a code block
+closes the fence and reopens it**, language included, on the next page;
+`markup.rs` reads each message on its own, so the rest of the block would
+otherwise render as prose, with `*` and `_` in the code eaten as emphasis.
+**Unverified:** paging against the live bot. The unit tests cover the cut and
+the outbox; a real multi-page turn has not yet been watched arrive.
+
 **Only forum topics are separate threads.** Plain replies in a group also set
 `message_thread_id`; treating those as threads scatters one conversation into a
 session per reply chain.
@@ -481,7 +499,8 @@ worst kind of bug to find.
   without its tool log (`TurnRenderer::compose_prose`), else the *end* of the
   prose. Related, and the reason the first two nearly always suffice: a run of
   consecutive tool calls renders as one line naming the count and the newest
-  call, rather than a line each.
+  call, rather than a line each. This is now the path for channels that cannot
+  edit only; one that can pages the turn instead (see Telegram).
 
 ## Packaging
 

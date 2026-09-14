@@ -146,8 +146,11 @@ log should not outweigh the answer. **By default they run without asking** — a
 thread starts in auto mode, and the reply reads as an account of what the agent
 did rather than a queue of questions.
 
-A reply too long for one chat message keeps the agent's own words and spills
-the tool log to a file, with the ssh line to read it in full.
+A reply too long for one Telegram message carries on in the next, so a long
+run keeps reporting progress and nothing is cut. On iMessage, where a turn
+arrives whole at the end, a reply too long for one message keeps the agent's
+own words and spills the tool log to a file, with the ssh line to read it in
+full.
 
 `/auto off` turns the gate on for that thread. Then a consequential tool call
 blocks the turn until answered — with **Allow** / **Deny** buttons on Telegram,
@@ -227,7 +230,14 @@ the id round-trips through the store, so a restart resumes.
 
 ### Long replies
 
-Above ~2500 characters a reply is written to
+On Telegram a turn pages. Once its message reaches ~3500 characters that
+message is finished, and the turn carries on in a new one below it. Pages end
+at a paragraph break where they can, and a code block split across two is
+closed on the first and reopened, with its language, on the second. Nothing
+goes to a file.
+
+On iMessage, which cannot edit a message and so gets each turn whole, above
+~2500 characters a reply is written to
 `$XDG_STATE_HOME/omatether/out/` and the chat gets the head plus the command
 to read the rest:
 
@@ -237,7 +247,7 @@ to read the rest:
   ssh <host> -t 'cat ~/.local/state/omatether/out/telegram-5-1788.txt'
 ```
 
-Both channels clip long messages anyway, which loses the tail silently. A file
+iMessage clips long messages anyway, which loses the tail silently. A file
 plus a way to read it loses nothing, and the tailnet already makes it
 reachable.
 

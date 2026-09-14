@@ -46,6 +46,14 @@ pub enum OutJob {
     /// because the next one carries the whole text again.
     Turn(String),
 
+    /// The turn's message is full: make it read this, for good, and carry the
+    /// turn on in a new message.
+    ///
+    /// One job rather than a `Turn` and a `NewTurn`, so that the core cannot
+    /// have one of the pair accepted and the other refused — which would leave
+    /// the next page rewriting the last one, or the last one never finished.
+    Seal(String),
+
     /// Begin a new turn: stop growing the message the last one was using.
     NewTurn,
 
@@ -117,31 +125,14 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
                 shown.clear();
             }
 
-            OutJob::Turn(text) => {
-                if text == shown {
-                    continue;
-                }
-                match &turn {
-                    Some(id) => {
-                        if report(
-                            &key,
-                            "edit",
-                            retrying(|| channel.edit(&key, id, &text)).await,
-                        )
-                        .is_some()
-                        {
-                            shown = text;
-                        }
-                    }
-                    None => {
-                        if let Some(id) =
-                            report(&key, "send", retrying(|| channel.send(&key, &text)).await)
-                        {
-                            turn = Some(id);
-                            shown = text;
-                        }
-                    }
-                }
+            OutJob::Turn(text) => grow(&key, &*channel, &mut turn, &mut shown, text).await,
+
+            // Moving on even if the last write failed: the alternative is the
+            // next page landing on top of this one.
+            OutJob::Seal(text) => {
+                grow(&key, &*channel, &mut turn, &mut shown, text).await;
+                turn = None;
+                shown.clear();
             }
 
             OutJob::Say(text) => {
@@ -204,6 +195,33 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
             // in a few seconds anyway.
             OutJob::Typing { on } => {
                 report(&key, "typing", channel.typing(&key, on).await);
+            }
+        }
+    }
+}
+
+/// Make the turn's message read `text`: post it if there is no message yet,
+/// edit it if there is, and do nothing if it already says that.
+async fn grow(
+    key: &ThreadKey,
+    channel: &dyn Channel,
+    turn: &mut Option<MessageId>,
+    shown: &mut String,
+    text: String,
+) {
+    if text == *shown {
+        return;
+    }
+    match turn {
+        Some(id) => {
+            if report(key, "edit", retrying(|| channel.edit(key, id, &text)).await).is_some() {
+                *shown = text;
+            }
+        }
+        None => {
+            if let Some(id) = report(key, "send", retrying(|| channel.send(key, &text)).await) {
+                *turn = Some(id);
+                *shown = text;
             }
         }
     }
@@ -461,6 +479,31 @@ mod tests {
         );
         assert_eq!(channel.sent(), vec!["first turn", "second turn"]);
         assert!(channel.edits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sealed_page_is_finished_and_the_turn_carries_on_in_a_new_message() {
+        let channel = FakeChannel::new();
+        let outbox = Outbox::spawn(key("1"), channel.clone());
+
+        outbox.queue(OutJob::Turn("page one, so f".into()));
+        outbox.queue(OutJob::Seal("page one, so far and no further".into()));
+        outbox.queue(OutJob::Turn("page two".into()));
+
+        assert!(
+            eventually(Duration::from_secs(2), || channel.sent().len() == 2).await,
+            "the rest of the turn posts a message of its own"
+        );
+        assert_eq!(channel.sent(), vec!["page one, so f", "page two"]);
+        let edits = channel.edits.lock().unwrap().clone();
+        assert_eq!(
+            edits,
+            vec![(
+                "m1".to_string(),
+                "page one, so far and no further".to_string()
+            )],
+            "the full page is finished where it was growing"
+        );
     }
 
     #[tokio::test]
