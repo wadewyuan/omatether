@@ -12,7 +12,7 @@
 //! those differences are capabilities on the trait rather than checks against a
 //! name — the same shape as [`crate::channel::Channel::can_edit`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -66,8 +66,9 @@ pub trait Agent: Send {
 
     /// Model names this agent has said it accepts, if it ever said.
     ///
-    /// Empty is "it did not say", not "there are none" — no agent here can be
-    /// asked for a list, so this is only ever what one volunteered.
+    /// Empty is "it did not say", not "there are none". Claude Code
+    /// volunteers its catalog in the handshake; codex and pi volunteer
+    /// nothing, and the way to ask their CLIs is [`list_models`].
     fn models(&self) -> Vec<String> {
         Vec::new()
     }
@@ -155,6 +156,28 @@ pub fn takes_model(agent: &str) -> bool {
         backend_for(agent),
         Some(Backend::Claude) | Some(Backend::Codex) | Some(Backend::Pi)
     )
+}
+
+/// Ask the agent's CLI for its model catalog, without a session.
+///
+/// Where [`Agent::models`] is what an agent volunteered on its own — Claude
+/// Code's handshake, which only exists while that session is up — this asks
+/// the CLI directly: `codex debug models`, `pi --list-models`. Both are local
+/// and cost no API call, which is what makes a list possible before the first
+/// turn or after a `/new`. Claude Code has no such command, so its answer is
+/// how to get one; the error is worded that way because it is shown to the
+/// person who asked.
+pub async fn list_models(agent: &str, cwd: &Path) -> Result<Vec<String>> {
+    match backend_for(agent) {
+        Some(Backend::Codex) => crate::codex::list_models(cwd).await,
+        Some(Backend::Pi) => crate::pi::list_models(cwd).await,
+        Some(Backend::Claude) => bail!(
+            "claude's model list comes with a live session — send it a message \
+             first, and /model will show it"
+        ),
+        Some(Backend::Tmux) => bail!("{agent} runs through omarchy-agent, which takes no model"),
+        None => bail!("unknown agent '{agent}'"),
+    }
 }
 
 /// Start an agent, whichever backend drives it.
@@ -247,6 +270,19 @@ mod tests {
             assert!(!takes_model(name), "{name} has no way to be told one");
         }
         assert!(!takes_model("emacs"));
+    }
+
+    #[tokio::test]
+    async fn asking_an_agent_that_cannot_be_asked_fails_with_a_reason() {
+        let dir = std::env::temp_dir();
+        let e = list_models("claude", &dir).await.unwrap_err();
+        assert!(
+            e.to_string().contains("live session"),
+            "the claude answer has to say how to get a list: {e}"
+        );
+        let e = list_models("omp", &dir).await.unwrap_err();
+        assert!(e.to_string().contains("omarchy-agent"), "{e}");
+        assert!(list_models("emacs", &dir).await.is_err());
     }
 
     #[test]

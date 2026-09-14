@@ -77,6 +77,20 @@ which is the only catalog anywhere in reach — `claude` has no "list models"
 command — so `/model` lists what that array said and resolves `opus` to
 `claude-opus-5` with it rather than with a table kept here.
 
+**`/model` on its own shows a list, and each agent answers from a different
+place.** Claude's is the handshake array, so it exists only while a session
+is up — `/model` before the first message or after `/new` says "send it a
+message first" rather than inventing one. Codex and pi volunteer nothing, so
+the list comes from asking their CLI, both local and no API call: `codex
+debug models` (JSON catalog, works **without** `codex login` on this
+machine; `-m` takes the `slug`; entries with `visibility:"hide"` are the
+ones codex keeps out of its own picker and are left off) and `pi
+--list-models` (a table; `provider/model` is the name `--model` takes —
+the very command pi's "Model … not found" error points at). Both CLIs
+print the mise activation line to *stdout* first, which is why the parsers
+find the payload rather than assume line one. The detached tier still
+answers "takes no model", which is the honest answer there.
+
 **Claude Code exports session-identity env vars to its children**
 (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, …). A
 spawned agent inherits them, decides it is a nested session, and resolves
@@ -399,7 +413,12 @@ worst kind of bug to find.
   what keeps "one turn per thread" from quietly meaning "one *anything* at a
   time, globally" — which is what it meant when a 429 slept in the shared loop.
   If you find yourself awaiting a `Channel` method from `core.rs`, that is the
-  regression.
+  regression — and a `Channel` method is not the only shape it takes. `/model`
+  with no argument asks codex or pi's CLI for a catalog, which is a process to
+  wait on; it runs on a task of its own holding a cloned `Outbox`, because
+  waiting for it here would stop every other thread's events and flushes for as
+  long as it took. Twelve milliseconds in the normal case is exactly what makes
+  this kind of thing invisible until the day it is not.
 - **The gate must be confirmed, not assumed.** An agent that claims to gate
   tools has to prove it at startup; a gate that silently failed to install is
   indistinguishable from an agent that had nothing to ask about. This holds

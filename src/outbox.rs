@@ -70,6 +70,11 @@ pub enum OutJob {
 }
 
 /// The core's handle on one thread's outbound task.
+///
+/// Cloneable because a handle sometimes has to outlive the call that took it:
+/// anything the core cannot afford to wait for goes to a task of its own, and
+/// that task still needs somewhere to put its answer.
+#[derive(Clone)]
 pub struct Outbox {
     jobs: mpsc::Sender<OutJob>,
 }

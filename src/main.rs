@@ -18,7 +18,7 @@ mod store;
 mod tmux;
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -389,7 +389,9 @@ async fn repl(
                 match line? {
                     Some(line) => {
                         let text = line.trim();
-                        if handle_input(text, &mut session, &mut pending, &mut auto).await? {
+                        if handle_input(text, &name, &dir, &mut session, &mut pending, &mut auto)
+                            .await?
+                        {
                             break;
                         }
                         if !text.is_empty() && !text.starts_with('/') {
@@ -508,6 +510,8 @@ fn render(
 /// Handle one line of operator input. Returns true to quit.
 async fn handle_input(
     line: &str,
+    agent: &str,
+    dir: &Path,
     session: &mut Box<dyn Agent>,
     pending: &mut Option<Pending>,
     auto: &mut bool,
@@ -583,15 +587,24 @@ async fn handle_input(
         command::Command::Model(want) => {
             let asked = match &want {
                 command::ModelRequest::Report => {
+                    // What the agent volunteered; codex and pi volunteer
+                    // nothing, so ask their CLI instead, the same way serve
+                    // does. The error is the answer: the tmux tier takes no
+                    // model at all, and claude's list comes with the session
+                    // the repl always has.
                     let offered = session.models();
-                    println!(
-                        "[model] {}",
-                        if offered.is_empty() {
-                            "this agent did not say what it offers".to_string()
-                        } else {
-                            format!("offers {}", offered.join(", "))
+                    let offered = if offered.is_empty() {
+                        match crate::agent::list_models(agent, dir).await {
+                            Ok(list) => list,
+                            Err(e) => {
+                                println!("[model] no list to show — {e:#}");
+                                return Ok(false);
+                            }
                         }
-                    );
+                    } else {
+                        offered
+                    };
+                    println!("[model] offers {}", offered.join(", "));
                     return Ok(false);
                 }
                 command::ModelRequest::Reset => None,

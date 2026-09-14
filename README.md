@@ -94,10 +94,13 @@ many of which are prompt expansions, so `/review` just works.
 of these commands that keeps the conversation, because unlike a directory or an
 agent, a model can be changed underneath a running one. On Claude Code the
 switch goes to the live session and comes back checked, so a name it does not
-know is refused in the reply rather than discovered a turn later; `/model` on
-its own lists what that agent said it offers. Codex and Pi take the flag on
-their next turn instead, and neither reports a model back, so what you asked
-for is what gets shown.
+know is refused in the reply rather than discovered a turn later; on Codex and
+Pi the flag goes on their next turn instead, and neither reports a model back,
+so what you asked for is what gets shown. `/model` on its own lists what the
+agent will take: Claude Code's list is the one its session volunteered, so it
+exists only while a session is up and the reply says so when there is none;
+Codex and Pi get theirs from their own CLI (`codex debug models`,
+`pi --list-models`), which is local and costs no API call.
 
 The detached tier (omp, opencode, crush, grok, gemini, copilot) cannot be told:
 it launches through `omarchy-agent`, which takes no model. `/model` says so

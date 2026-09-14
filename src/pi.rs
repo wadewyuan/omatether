@@ -32,10 +32,11 @@
 //! beside it in `errorMessage`. Both are surfaced, or the chat renders an empty
 //! answer and calls it success.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -392,6 +393,51 @@ fn normalize_tool_name(name: &str) -> String {
     }
 }
 
+/// The models `pi --list-models` says it will take, from the CLI itself
+/// rather than a copy kept here — the very command pi's own "Model … not
+/// found" error points at. Local, no API call, works before the first turn.
+/// The mise shim that resolves `pi` prints its activation line to stdout
+/// first, and a transient mise network warning can be a long line, so the
+/// table is the only place exactly six fields meet the header's shape.
+pub async fn list_models(cwd: &Path) -> Result<Vec<String>> {
+    let mut command = Command::new("pi");
+    command
+        .arg("--list-models")
+        .current_dir(cwd)
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(Duration::from_secs(20), command.output()).await {
+        Ok(output) => output.context("running `pi --list-models`")?,
+        Err(_) => bail!("`pi --list-models` did not answer within 20s"),
+    };
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!("`pi --list-models` exited {}: {err}", output.status);
+    }
+
+    let list = parse_model_list(&String::from_utf8_lossy(&output.stdout));
+    if list.is_empty() {
+        bail!("`pi --list-models` named no models");
+    }
+    Ok(list)
+}
+
+/// The table is `provider  model  context  max-out  thinking  images`, and
+/// the name `--model` takes is `provider/id`, so the two columns are joined.
+/// Everything that is not a model row — the header, the mise activation line,
+/// a mise warning — is skipped rather than guessed at.
+pub fn parse_model_list(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields.len() == 6
+                && !fields[0].starts_with("provider")
+                && !fields[0].starts_with("mise"))
+            .then(|| format!("{}/{}", fields[0], fields[1]))
+        })
+        .collect()
+}
+
 /// Pi's tool call arguments arrive as a flat object (`{"command": "ls"}` for
 /// bash); pass them through unchanged.
 fn tool_input(part: &Value) -> Value {
@@ -590,5 +636,27 @@ mod tests {
             normalize(&frame, false).as_slice(),
             [AgentEvent::Unknown { .. }]
         ));
+    }
+
+    // Shaped on a real `pi --list-models` against 0.85.1, including the mise
+    // activation line the shim prints to stdout before the table.
+
+    #[test]
+    fn the_listing_reads_provider_and_model() {
+        let out = "mise ~/.config/mise/config.toml tools: pi@0.85.1\n\
+                   provider     model                      context  max-out  thinking  images\n\
+                   kimi-coding  k3                         1.0M     131.1K   yes       yes   \n\
+                   llama.cpp    qwen-3.8-27b               128K     128K     no        no    \n";
+        assert_eq!(
+            parse_model_list(out),
+            vec!["kimi-coding/k3", "llama.cpp/qwen-3.8-27b"]
+        );
+    }
+
+    #[test]
+    fn a_stream_with_no_rows_is_empty() {
+        let out = "mise ~/.config/mise/config.toml tools: pi@0.85.1\n\
+                   provider     model\n";
+        assert!(parse_model_list(out).is_empty());
     }
 }

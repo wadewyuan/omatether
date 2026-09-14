@@ -573,8 +573,10 @@ impl Core {
 
         note.push_str("\n\n/model <name> switches; /model default hands the choice back.");
 
-        // Only ever a list an agent volunteered — nothing here can ask for one,
-        // and a list hard-coded here would rot against the agent that knows.
+        // A list the agent volunteered first — for claude that is the one that
+        // names what this session actually runs, and it is only there while the
+        // session is up. A list hard-coded here would rot against the agent
+        // that knows.
         let offered = self
             .threads
             .get(key)
@@ -582,9 +584,30 @@ impl Core {
             .unwrap_or_default();
         if !offered.is_empty() {
             note.push_str(&format!("\nIt offers: {}", offered.join(", ")));
+            return self.say(key, &note);
         }
 
-        self.say(key, &note)
+        // Nothing volunteered, so ask the CLI — on a task of its own. Asking
+        // means waiting on a process, and this is the core's loop: waiting
+        // here stops every other thread's events and flushes for as long as it
+        // takes, which on the timeout path is twenty seconds. The finished
+        // note goes out through the same outbox everything else does, so it is
+        // still one message rather than two.
+        let Some(outbox) = self.outbox(key).cloned() else {
+            return Ok(());
+        };
+        let name = state.agent.clone();
+        let cwd = PathBuf::from(&state.cwd);
+        tokio::spawn(async move {
+            match agent::list_models(&name, &cwd).await {
+                Ok(list) => note.push_str(&format!("\nIt offers: {}", list.join(", "))),
+                // `{e:#}` and not `{e}`: the outermost context is the command
+                // that was run, and the reason it failed is behind it.
+                Err(e) => note.push_str(&format!("\n{e:#}")),
+            }
+            outbox.queue(OutJob::Say(note));
+        });
+        Ok(())
     }
 
     async fn on_attach(&mut self, key: &ThreadKey) -> Result<()> {
@@ -2408,6 +2431,26 @@ mod tests {
         assert!(sent[0].contains("Asked for: opus"), "{}", sent[0]);
         // The list is the agent's, not a copy kept here.
         assert!(sent[0].contains("default, opus, haiku"), "{}", sent[0]);
+    }
+
+    #[tokio::test]
+    async fn a_listless_agent_is_asked_and_a_listless_answer_said() {
+        // No session, so nothing has volunteered a list; the answer is the
+        // one the CLI gives when asked, or the reason it does not. Claude
+        // has no such command, and its reason says how to get one rather
+        // than leaving the question hanging.
+        let dir = std::env::temp_dir().join(format!("sb-model9-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.on_model(&key, ModelRequest::Report).await.unwrap();
+        settle().await;
+
+        let sent = channel.sent.lock().unwrap().clone();
+        let last = sent.last().unwrap();
+        assert!(last.contains("live session"), "how to get the list: {last}");
+        assert!(!last.contains("It offers"), "nothing was offered: {last}");
     }
 
     #[tokio::test]

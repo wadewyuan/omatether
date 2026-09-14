@@ -17,10 +17,11 @@
 //! `reasoning`, `command_execution`, `file_change`, `mcp_tool_call`,
 //! `web_search`, `todo_list` and `error`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -234,6 +235,63 @@ async fn read_events(
 
     *child.lock().await = None;
     busy.store(false, Ordering::SeqCst);
+}
+
+/// The models `codex debug models` says it will take, from the CLI itself
+/// rather than a copy kept here. Local and unauthenticated — verified against
+/// 0.153.4 with no `codex login`, so a thread that has never had a turn can
+/// still be told what is available. The mise shim that resolves `codex`
+/// prints its activation line to stdout first, so the catalog is the first
+/// line that opens with a brace, the same rule the pi adapter applies.
+pub async fn list_models(cwd: &Path) -> Result<Vec<String>> {
+    let mut command = Command::new("codex");
+    command
+        .arg("debug")
+        .arg("models")
+        .current_dir(cwd)
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(Duration::from_secs(20), command.output()).await {
+        Ok(output) => output.context("running `codex debug models`")?,
+        Err(_) => bail!("`codex debug models` did not answer within 20s"),
+    };
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!("`codex debug models` exited {}: {err}", output.status);
+    }
+
+    parse_model_catalog(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The slugs the catalog lists. `visibility: "hide"` are the ones codex keeps
+/// out of its own model picker, and a slug nobody would pick from chat is the
+/// kind of thing that belongs there. If the field ever goes away, the whole
+/// catalog is the honest fallback rather than nothing.
+pub fn parse_model_catalog(out: &str) -> Result<Vec<String>> {
+    let line = out
+        .lines()
+        .find(|line| line.trim_start().starts_with('{'))
+        .context("`codex debug models` printed no JSON")?;
+    let frame: Value =
+        serde_json::from_str(line.trim()).context("parsing the codex model catalog")?;
+    let models = frame
+        .get("models")
+        .and_then(Value::as_array)
+        .context("the codex model catalog named no models")?;
+
+    let mut listed: Vec<String> = Vec::new();
+    let mut all: Vec<String> = Vec::new();
+    for model in models {
+        let slug = match model.get("slug").and_then(Value::as_str) {
+            Some(slug) if !slug.is_empty() => slug.to_string(),
+            _ => continue,
+        };
+        all.push(slug.clone());
+        if model.get("visibility").and_then(Value::as_str) == Some("list") {
+            listed.push(slug);
+        }
+    }
+    Ok(if listed.is_empty() { all } else { listed })
 }
 
 /// Turn one Codex frame into zero or more normalized events.
@@ -458,5 +516,30 @@ mod tests {
             normalize(&frame, false).as_slice(),
             [AgentEvent::Unknown { .. }]
         ));
+    }
+
+    // The catalog below is shaped on a real `codex debug models` against
+    // 0.153.4, including the mise activation line the shim prints to stdout.
+
+    #[test]
+    fn the_catalog_names_the_slugs_codex_lists() {
+        let out = "mise ~/.config/mise/config.toml tools: codex@0.153.4\n\
+                   {\"models\":[\
+                   {\"slug\":\"gpt-6-astra\",\"display_name\":\"GPT-6-Astra\",\"visibility\":\"list\"},\
+                   {\"slug\":\"gpt-5.4\",\"display_name\":\"GPT-5.4\",\"visibility\":\"hide\"}\
+                   ]}\n";
+        assert_eq!(parse_model_catalog(out).unwrap(), vec!["gpt-6-astra"]);
+    }
+
+    #[test]
+    fn a_catalog_with_no_visibility_is_whole() {
+        let out = "{\"models\":[{\"slug\":\"a\"},{\"slug\":\"b\"}]}";
+        assert_eq!(parse_model_catalog(out).unwrap(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_stream_with_no_catalog_says_so() {
+        let e = parse_model_catalog("mise … tools: codex@0.153.4\n").unwrap_err();
+        assert!(e.to_string().contains("no JSON"), "{e}");
     }
 }
