@@ -301,6 +301,13 @@ plugin — depending on a path inside the Hermes install tree is the opposite of
 this project's point. The SDK usage was learned from it. `npm install` there is
 required; `node_modules` is gitignored.
 
+Where the binary looks for that directory is resolved **at runtime**, not
+baked in at compile time (it once was `env!("CARGO_MANIFEST_DIR")`, which
+dies the moment a packaged binary meets a machine with no source tree):
+`OMATETHER_PHOTON_SIDECAR_DIR`, then the packaged
+`/usr/lib/omatether/photon-sidecar`, then `~/.local/share/omatether/`, then
+the vendored copy. A source checkout and a package both need nothing set.
+
 `PHOTON_SIDECAR_WATCH_STDIN=1` makes the sidecar exit on stdin EOF, which binds
 its life to ours for free when spawned with a piped stdin.
 

@@ -58,13 +58,22 @@ OMATETHER_PHOTON_PROJECT_SECRET=...
 OMATETHER_PHOTON_ALLOWED_USERS=<your phone, E.164>
 ```
 
-Install the service:
+Install the service. The unit in `contrib/` is written for a packaged
+install (the binary at `/usr/bin/omatether`); from a source checkout, point
+`ExecStart` at your `target/release/omatether` instead:
 
    ```bash
    cargo build --release
    cp contrib/omatether.service ~/.config/systemd/user/
+   # from source: edit ExecStart to <checkout>/target/release/omatether
    systemctl --user enable --now omatether
    ```
+
+The Photon sidecar is found at runtime: `OMATETHER_PHOTON_SIDECAR_DIR` if
+set, then the packaged `/usr/lib/omatether/photon-sidecar`, then
+`~/.local/share/omatether/photon-sidecar`, then the vendored copy beside the
+source. A source checkout needs nothing set; a package install needs nothing
+set either — only a nonstandard layout does.
 
 The service needs no inbound port. Telegram long-polling reaches out rather
 than being called, and the Photon sidecar binds to loopback only — so the whole

@@ -16,10 +16,13 @@ Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/share/omarchy/bin
 #   OMATETHER_TELEGRAM_TOKEN, OMATETHER_TELEGRAM_ALLOWED_USERS
 #   OMATETHER_PHOTON_PROJECT_ID, OMATETHER_PHOTON_PROJECT_SECRET,
 #   OMATETHER_PHOTON_ALLOWED_USERS
-# chmod 600 - these are a shell on this machine.
+# `omatether setup` writes this file; chmod 600 — it is a shell on this
+# machine.
 EnvironmentFile=%h/.config/omatether/env
 
-ExecStart=%h/src/omatether/target/release/omatether serve --dir %h/src
+# Installed by the omatether package. Threads default to $HOME and /new
+# steps into ~/Work, so --dir only seeds threads that never chose a place.
+ExecStart=/usr/bin/omatether serve --dir %h
 
 Restart=on-failure
 RestartSec=5

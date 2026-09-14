@@ -52,8 +52,8 @@ enum Mode {
         #[arg(long)]
         state: Option<PathBuf>,
 
-        /// The Photon sidecar directory. Defaults to the copy vendored beside
-        /// this binary's source.
+        /// The Photon sidecar directory. Default: the packaged copy, else the
+        /// one vendored beside this binary's source. See default_sidecar_dir.
         #[arg(long)]
         photon_sidecar: Option<PathBuf>,
 
@@ -287,17 +287,46 @@ fn merge(
 }
 
 fn default_sidecar_dir() -> PathBuf {
-    // Beside the source tree this binary was built from, so a `cargo run`
-    // during development and an installed binary both find it.
+    // Resolved at runtime, not baked in: a packaged binary has no source tree
+    // beside it. First existing directory wins, in the order a machine is
+    // most likely set up — an explicit override, the distro package location,
+    // a per-user install, then the vendored copy a `cargo run` develops
+    // against. The last of those is not existence-checked: it is the
+    // historical default, and Photon::start's own "not found" error names
+    // the path it looked at.
+    if let Some(dir) = std::env::var_os("OMATETHER_PHOTON_SIDECAR_DIR") {
+        return PathBuf::from(dir);
+    }
+    for candidate in [
+        PathBuf::from("/usr/lib/omatether/photon-sidecar"),
+        dirs_data_home().join("omatether/photon-sidecar"),
+    ] {
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/photon-sidecar")
 }
 
-fn default_state_path() -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
+/// $XDG_STATE_HOME or ~/.local/state, without pulling in a dirs crate for one
+/// path.
+fn dirs_state_home() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("omatether/state.db")
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// $XDG_DATA_HOME or ~/.local/share, same deal.
+fn dirs_data_home() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_state_path() -> PathBuf {
+    dirs_state_home().join("omatether/state.db")
 }
 
 // ---- repl --------------------------------------------------------------
