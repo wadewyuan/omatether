@@ -1,0 +1,51 @@
+# Maintainer: wadewyuan
+#
+# The AUR `omatether` package: built from source. After installing, run
+# `omatether setup` — it writes the credentials file, installs the user
+# service, and starts it.
+#
+# Before publishing: upstream ships no LICENSE file yet; pick one and fix
+# the license= line to match.
+pkgname=omatether
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Your coding agent, over chat — Telegram and iMessage bridged to the agent on this machine"
+arch=('x86_64')
+url="https://github.com/wadewyuan/omatether"
+license=('custom')
+install=omatether.install
+# makepkg's lto option compiles the bundled sqlite3.c into GCC fat-LTO
+# objects that rust-lld silently drops at the final link — the binary then
+# fails with undefined sqlite3_* symbols. Rust PKGBUILDs turn it off.
+options=('!lto')
+# systemd: the bridge runs as a user service. tmux: the detached agent tier.
+depends=('systemd' 'tmux')
+makedepends=('cargo' 'nodejs' 'npm')
+optdepends=(
+  'nodejs: iMessage channel via Photon (Telegram-only installs do not need it)'
+  'claude-code: Claude agent backend'
+  'crush-bin: crush agent backend'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Filled in once v$pkgver is tagged: updpkgsums, or by hand from
+# sha256sum of the downloaded tarball.
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  cargo build --release --locked
+
+  # One bundled file plus resolve-check stubs, not 128 MB of node_modules.
+  cd vendor/photon-sidecar
+  npm ci
+  npm run bundle
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/omatether "$pkgdir/usr/bin/omatether"
+  install -Dm644 contrib/omatether.service "$pkgdir/usr/lib/systemd/user/omatether.service"
+
+  install -dm755 "$pkgdir/usr/lib/omatether"
+  cp -a vendor/photon-sidecar/dist "$pkgdir/usr/lib/omatether/photon-sidecar"
+}

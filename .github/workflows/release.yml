@@ -1,0 +1,54 @@
+name: release
+
+# Tags shaped v1.2.3 build the tarball AUR's omatether-bin and bare-metal
+# installs consume: the binary, the bundled Photon sidecar, and the packaged
+# systemd user unit, for x86_64 Linux (Omarchy's arch).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the binary
+        run: cargo build --release --locked
+
+      # ci rather than install: the lockfile is the whole point of a release.
+      # The bundle is one file plus stub packages — see bundle.mjs for why.
+      - name: Bundle the Photon sidecar
+        run: |
+          cd vendor/photon-sidecar
+          npm ci
+          npm run bundle
+
+      - name: Assemble the tarball
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          STAGE="omatether-$V-x86_64-unknown-linux-gnu"
+          mkdir -p "$STAGE/photon-sidecar"
+          cp target/release/omatether "$STAGE/"
+          cp contrib/omatether.service "$STAGE/"
+          cp -r vendor/photon-sidecar/dist/. "$STAGE/photon-sidecar/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            omatether-*-x86_64-unknown-linux-gnu.tar.gz
+            omatether-*-x86_64-unknown-linux-gnu.tar.gz.sha256

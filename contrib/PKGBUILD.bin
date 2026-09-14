@@ -1,0 +1,32 @@
+# Maintainer: wadewyuan
+#
+# The AUR `omatether-bin` package: the prebuilt release tarball from GitHub,
+# for machines without a Rust toolchain. The tarball is built by
+# .github/workflows/release.yml on every v* tag.
+pkgname=omatether-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Your coding agent, over chat — Telegram and iMessage bridged to the agent on this machine"
+arch=('x86_64')
+url="https://github.com/wadewyuan/omatether"
+license=('custom')
+provides=('omatether')
+conflicts=('omatether')
+depends=('systemd' 'tmux')
+optdepends=(
+  'nodejs: iMessage channel via Photon (Telegram-only installs do not need it)'
+  'claude-code: Claude agent backend'
+  'crush-bin: crush agent backend'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/omatether-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+# Filled in from the release's .sha256 once v$pkgver is published.
+sha256sums=('SKIP')
+
+package() {
+  cd "omatether-$pkgver-x86_64-unknown-linux-gnu"
+  install -Dm755 omatether "$pkgdir/usr/bin/omatether"
+  install -Dm644 omatether.service "$pkgdir/usr/lib/systemd/user/omatether.service"
+
+  install -dm755 "$pkgdir/usr/lib/omatether"
+  cp -a photon-sidecar "$pkgdir/usr/lib/omatether/photon-sidecar"
+}

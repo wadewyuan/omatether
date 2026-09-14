@@ -474,6 +474,32 @@ worst kind of bug to find.
   consecutive tool calls renders as one line naming the count and the newest
   call, rather than a line each.
 
+## Packaging
+
+`contrib/PKGBUILD` (source build) and `contrib/PKGBUILD.bin` (release
+tarball) are the AUR references; `.github/workflows/release.yml` builds the
+tarball `PKGBUILD.bin` consumes on every `v*` tag. Two lessons, both paid
+for with a failed build:
+
+- **makepkg's `lto` option breaks the link.** It compiles the bundled
+  sqlite3.c into GCC fat-LTO objects that rust-lld silently drops, and the
+  binary fails with undefined `sqlite3_*` symbols. The PKGBUILD carries
+  `options=('!lto')`; if the package ever fails to link with missing sqlite
+  symbols, that line is the thing that got lost.
+- **The Photon sidecar ships as an esbuild bundle**, built by
+  `vendor/photon-sidecar/bundle.mjs` (`npm run bundle`), ~8 MB instead of
+  128 MB of node_modules. It needs two shims — a `createRequire` banner for
+  CJS deps that `require()` node builtins, and stub packages for the three
+  gRPC peers `@photon-ai/advanced-imessage` pre-flights with
+  `import.meta.resolve` before an import esbuild already inlined. The bundle
+  was verified against the live service: real credentials, 401 without the
+  token, stream held open with it. Re-run that smoke (real creds, scratch
+  port) whenever the SDK version moves.
+
+makepkg **caches downloaded sources by filename** — a same-named tarball
+from an earlier test build is reused silently. When a local test seems to
+ignore your changes, delete the cached tarball first.
+
 ## Diagnostics
 
 Subprocess output logs under `omatether::{photon,claude,codex,pi}` so the

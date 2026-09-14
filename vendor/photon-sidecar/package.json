@@ -3,8 +3,16 @@
   "private": true,
   "type": "module",
   "main": "index.mjs",
-  "engines": { "node": ">=18.17" },
+  "scripts": {
+    "bundle": "node bundle.mjs"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
   "dependencies": {
     "spectrum-ts": "12.7.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
   }
 }

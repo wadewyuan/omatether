@@ -20,6 +20,19 @@ omatether serve --dir ~/src     # the bridge
 omatether repl  --dir .         # one session, driven from this terminal
 ```
 
+### Install
+
+On Omarchy (or any Arch), once the package is published:
+
+```bash
+yay -S omatether        # built from source
+yay -S omatether-bin    # prebuilt release tarball
+```
+
+Either one then needs only `omatether setup`. From a clone instead:
+`cargo build --release` and the same `omatether setup` — the service unit it
+installs points at the binary you ran it from.
+
 ### Setup
 
 At least one channel must be configured; both is fine. The easy way is the
