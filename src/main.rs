@@ -222,6 +222,12 @@ async fn start_telegram() -> Result<Option<Arc<Telegram>>> {
         .whoami()
         .await
         .context("could not reach Telegram — check the token")?;
+    // Register the slash-command menu on every start so it cannot drift from
+    // the commands this binary parses.
+    telegram
+        .set_commands()
+        .await
+        .context("could not register the slash-command menu with Telegram")?;
 
     tracing::info!("telegram @{username}, allowed: {}", allowed.join(", "));
     Ok(Some(telegram))

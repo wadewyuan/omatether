@@ -9,6 +9,7 @@
 //! URL, no webhook and no inbound port — it stays reachable only over the
 //! tailnet.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -42,6 +43,11 @@ pub struct Telegram {
     /// User ids permitted to talk to this bot. A bot token in a chat is a shell
     /// on this machine, so anyone else is dropped before the core sees them.
     allowed_users: Vec<String>,
+    /// Our own @username, learned from `getMe` in [`Self::whoami`]. Telegram
+    /// addresses a tapped menu command to its bot in a group as
+    /// `/new@omatether_bot`; matching it here is what keeps those taps from
+    /// falling through to the agent as prompts.
+    username: OnceLock<String>,
 }
 
 impl Telegram {
@@ -61,6 +67,7 @@ impl Telegram {
             http,
             base: format!("https://api.telegram.org/bot{token}"),
             allowed_users,
+            username: OnceLock::new(),
         })
     }
 
@@ -142,11 +149,72 @@ impl Telegram {
     /// Confirm the token works, and report who we are.
     pub async fn whoami(&self) -> Result<String> {
         let me = self.call("getMe", json!({})).await?;
-        Ok(me
+        let username = me
             .get("username")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
-            .to_string())
+            .to_string();
+        // Whoever asks first — setup and the service both call this before
+        // polling starts — records it for `own_command`.
+        let _ = self.username.set(username.clone());
+        Ok(username)
+    }
+
+    /// Register the slash-command menu Telegram shows when someone types `/`.
+    ///
+    /// Sent on every start rather than configured once in BotFather so the
+    /// menu cannot drift from the commands this binary actually parses:
+    /// adding a command to `command::parse` and forgetting BotFather would
+    /// otherwise leave the old menu claiming otherwise. Telegram rejects
+    /// command names over 32 characters or with anything but lowercase
+    /// letters, digits and underscores, so none carry the leading slash and
+    /// none carry arguments.
+    pub async fn set_commands(&self) -> Result<()> {
+        const COMMANDS: [(&str, &str); 11] = [
+            ("new", "start a fresh session in this thread"),
+            ("stop", "interrupt the running turn"),
+            ("cd", "set the working directory"),
+            ("agent", "switch agent (claude, codex, pi, ...)"),
+            ("model", "which model the agent runs"),
+            ("attach", "how to take over at a real terminal"),
+            ("status", "agent, model, directory, session"),
+            ("allow", "approve a pending tool call"),
+            ("deny", "refuse a pending tool call"),
+            ("auto", "approve tool calls without asking (on by default)"),
+            ("help", "list commands"),
+        ];
+        let commands: Vec<Value> = COMMANDS
+            .iter()
+            .map(|(command, description)| json!({"command": command, "description": description}))
+            .collect();
+        self.call("setMyCommands", json!({"commands": commands}))
+            .await?;
+        Ok(())
+    }
+
+    /// Strip our own @username from a tapped menu command, leaving everything
+    /// else alone.
+    ///
+    /// In a group Telegram sends the tap as `/new@omatether_bot` — without
+    /// this, `command::parse` sees a head it does not know and the command
+    /// reaches the agent as a prompt that silently does nothing. A suffix
+    /// naming a *different* bot is left in place on purpose: that command was
+    /// meant for someone else in the group, not for us.
+    fn own_command<'a>(&self, text: &'a str) -> &'a str {
+        let Some(rest) = text.strip_prefix('/') else {
+            return text;
+        };
+        let Some(end) = rest.find([' ', '\t', '\n', '@']) else {
+            return text;
+        };
+        if rest.as_bytes()[end] != b'@' {
+            return text;
+        }
+        let name = rest[end + 1..].split_whitespace().next().unwrap_or_default();
+        match self.username.get() {
+            Some(me) if me == name => &text[..1 + end],
+            _ => text,
+        }
     }
 
     fn target(&self, thread: &ThreadKey) -> Value {
@@ -286,6 +354,10 @@ impl Telegram {
             .trim();
 
         let thread = thread_key(message)?;
+
+        // Menu taps in a group arrive addressed to the bot
+        // (`/new@omatether_bot`); make those read as what was tapped.
+        let text = self.own_command(text);
 
         if text.is_empty() {
             // Silence here is the bug this exists to prevent: a voice note or
@@ -476,6 +548,46 @@ mod tests {
     #[test]
     fn empty_allowlist_is_refused() {
         assert!(Telegram::new("t", vec![]).is_err());
+    }
+
+    #[test]
+    fn our_own_suffix_is_stripped_from_menu_taps() {
+        let tg = telegram();
+        tg.username.set("omatether_bot".into()).unwrap();
+
+        assert_eq!(tg.own_command("/new@omatether_bot"), "/new");
+        // Arguments survive: the command word is the only part addressed.
+        assert_eq!(tg.own_command("/deny@omatether_bot too risky"), "/deny");
+        // Plain commands and commands with arguments are untouched.
+        assert_eq!(tg.own_command("/status"), "/status");
+        assert_eq!(tg.own_command("/cd ~/src"), "/cd ~/src");
+        // A suffix naming a different bot in the group is not ours to eat.
+        assert_eq!(
+            tg.own_command("/new@someone_elses_bot"),
+            "/new@someone_elses_bot"
+        );
+        // An @ later in the message is prose, not an address.
+        assert_eq!(tg.own_command("email a@b.com"), "email a@b.com");
+        // Before whoami has run there is nothing to match against.
+        let unknown = telegram();
+        assert_eq!(unknown.own_command("/new@omatether_bot"), "/new@omatether_bot");
+    }
+
+    #[test]
+    fn a_menu_tap_in_a_group_reaches_the_command_parser() {
+        let tg = telegram();
+        tg.username.set("omatether_bot".into()).unwrap();
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "from": { "id": 42 }, "chat": { "id": 5 },
+                "text": "/status@omatether_bot"
+            }
+        });
+        match tg.parse_update(&update).unwrap().kind {
+            InboundKind::Text(t) => assert_eq!(t, "/status"),
+            other => panic!("expected text, got {other:?}"),
+        }
     }
 
     #[test]
