@@ -130,6 +130,8 @@ pub struct Config {
     /// this is where a *remembered* model goes, and [`Agent::set_model`] —
     /// which the CLI does check — is where a newly typed one goes.
     pub model: Option<String>,
+    /// `--append-system-prompt`: see [`crate::agent::SpawnConfig::brief`].
+    pub brief: Option<String>,
     /// `manual` makes the agent ask before every tool, which is what exercises
     /// the permission round-trip. `auto` approves most things itself.
     pub permission_mode: String,
@@ -143,6 +145,7 @@ impl Default for Config {
             cwd: PathBuf::from("."),
             session_id: None,
             model: None,
+            brief: None,
             permission_mode: "manual".to_string(),
             raw: false,
         }
@@ -188,6 +191,11 @@ impl ClaudeSession {
         }
         if let Some(model) = &config.model {
             command.args(["--model", model]);
+        }
+        // On every spawn, resumed or not: a system prompt is not part of the
+        // transcript, so a resumed session does not carry it forward.
+        if let Some(brief) = &config.brief {
+            command.args(["--append-system-prompt", brief]);
         }
         command
             .args(["--permission-mode", &config.permission_mode])

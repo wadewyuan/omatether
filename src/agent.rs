@@ -142,6 +142,15 @@ pub struct SpawnConfig {
     pub model: Option<String>,
     /// Label for a detached tmux session, so it can be found again.
     pub label: String,
+    /// Said to the agent on top of its own system prompt: where its replies
+    /// are read, and what reaches the reader. `None` for the repl, which is a
+    /// terminal and needs no telling.
+    ///
+    /// Each adapter puts it where its CLI keeps instructions rather than in
+    /// the prompt, so it is not part of the transcript and cannot be
+    /// compacted away. The detached tier ignores it: that agent's replies are
+    /// read at the terminal `/attach` names, not in the chat.
+    pub brief: Option<String>,
 }
 
 /// Whether this agent can be told which model to run at all.
@@ -204,6 +213,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
                     .session_id
                     .and_then(|id| uuid::Uuid::parse_str(&id).ok()),
                 model: config.model,
+                brief: config.brief,
                 permission_mode: "default".to_string(),
                 raw: false,
             })
@@ -216,6 +226,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
                 cwd: config.cwd,
                 thread_id: config.session_id,
                 model: config.model,
+                brief: config.brief,
             });
             Ok((Box::new(session), events))
         }
@@ -225,6 +236,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
                 cwd: config.cwd,
                 session_id: config.session_id,
                 model: config.model,
+                brief: config.brief,
             });
             Ok((Box::new(session), events))
         }

@@ -364,6 +364,7 @@ async fn repl(
         session_id,
         model,
         label: "repl".to_string(),
+        brief: None,
     })
     .await?;
 
@@ -666,7 +667,10 @@ async fn handle_input(
         command::Command::New
         | command::Command::Cd(_)
         | command::Command::Agent(_)
-        | command::Command::Attach => {
+        | command::Command::Attach
+        // The repl prints every tool call as it happens; there is nothing
+        // left out to look back at.
+        | command::Command::Log => {
             println!("[not available in repl — use serve]")
         }
 

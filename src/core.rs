@@ -18,7 +18,7 @@ use crate::channel::{Channel, Inbound, InboundKind, ThreadKey};
 use crate::command::{self, Command, ModelRequest};
 use crate::event::{AgentEvent, Decision};
 use crate::outbox::{OutJob, Outbox};
-use crate::render::TurnRenderer;
+use crate::render::{self, TurnRenderer};
 use crate::store::Store;
 
 /// How often a streaming turn is pushed to the chat. Comfortably inside
@@ -42,14 +42,15 @@ const TYPING_INTERVAL: Duration = Duration::from_secs(4);
 /// keeps the prompts meaningful.
 const GATED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
 
-/// Above this many characters, a reply on a channel that cannot edit is spilled
-/// to a file and the chat gets a pointer instead.
+/// The most one message holds when text is delivered whole — a turn on a
+/// channel that cannot edit, or `/log` — before the rest goes in the next.
 ///
-/// iMessage delivers a turn whole, at the end, and clips a long message — which
-/// loses the tail silently. A file plus the command to read it loses nothing,
-/// and the tailnet already makes it reachable. A channel that can edit pages
-/// instead: see [`PAGE_BUDGET`].
-const SPILL_THRESHOLD: usize = 2500;
+/// Under Photon's clip at 3000, which measures the markdown rather than what
+/// iMessage shows, so this is a safe bound on both. It used to be a threshold
+/// past which the turn went to a file and the chat got an ssh pointer: an
+/// answer at a desk and a non-answer from a phone. Now a long answer is more
+/// messages, not a shorter one.
+const WHOLE_PAGE_BUDGET: usize = 2800;
 
 /// The most a turn puts in one message on a channel that can edit, before it
 /// carries on in the next.
@@ -104,7 +105,8 @@ struct PendingPermission {
 
 pub struct Core {
     store: Store,
-    /// Where replies too long for chat are written.
+    /// Where a permission question's tool input goes when it is too long to
+    /// show inline.
     spill_dir: PathBuf,
     /// What a thread talks to before anyone says otherwise.
     default_agent: String,
@@ -129,6 +131,10 @@ pub struct Core {
     /// session it belonged to is gone, and `/new` and `/cd` drop sessions
     /// mid-turn.
     typing: HashMap<ThreadKey, std::time::Instant>,
+    /// Each thread's last finished turn in full, every tool call included, for
+    /// `/log`. Memory only: it is a look back at what just happened, not a
+    /// record, and it outlives the session for the same reason `outboxes` do.
+    transcripts: HashMap<ThreadKey, String>,
     agent_tx: mpsc::Sender<(ThreadKey, AgentEvent)>,
     agent_rx: mpsc::Receiver<(ThreadKey, AgentEvent)>,
 }
@@ -152,6 +158,7 @@ impl Core {
             fresh_cwd: work_dir(),
             threads: HashMap::new(),
             typing: HashMap::new(),
+            transcripts: HashMap::new(),
             agent_tx,
             agent_rx,
         }
@@ -227,6 +234,7 @@ impl Core {
                 Command::Agent(name) => self.on_agent(&message.thread, &name).await,
                 Command::Model(want) => self.on_model(&message.thread, want).await,
                 Command::Attach => self.on_attach(&message.thread).await,
+                Command::Log => self.on_log(&message.thread),
                 Command::Auto(want) => self.on_auto(&message.thread, want).await,
                 Command::Allow => self.decide(&message.thread, Decision::allow(), None).await,
                 Command::Deny(why) => {
@@ -258,6 +266,23 @@ impl Core {
         // Straight away rather than on the next tick: the gap between sending
         // a prompt and seeing anything at all is exactly what this is for.
         self.refresh_typing(key);
+        Ok(())
+    }
+
+    /// The last finished turn in full: every tool call on a line of its own,
+    /// and the narration between them that the chat was spared.
+    ///
+    /// What replaced the ssh pointer. The detail is there for whoever wants
+    /// it, in the chat they are already in, and only when they ask.
+    fn on_log(&mut self, key: &ThreadKey) -> Result<()> {
+        let Some(log) = self.transcripts.get(key).cloned() else {
+            return self.say(key, "No finished turn to show yet.");
+        };
+        for page in render::split(&log, WHOLE_PAGE_BUDGET) {
+            if !self.queue(key, OutJob::Say(page)) {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -803,6 +828,10 @@ impl Core {
         if finished {
             self.flush(key);
             if let Some(thread) = self.threads.get_mut(key) {
+                if thread.renderer.has_content() {
+                    self.transcripts
+                        .insert(key.clone(), thread.renderer.compose_log());
+                }
                 thread.renderer.reset();
                 thread.turn_running = false;
             }
@@ -1088,30 +1117,42 @@ impl Core {
                     return;
                 }
                 match thread.renderer.pending() {
-                    Some(text) => (text, thread.renderer.compose_prose()),
+                    Some(text) => (text, thread.renderer.compose_answer()),
                     None => return,
                 }
             }
             None => return,
         };
-        let (text, prose) = text;
+        let (text, answer) = text;
 
         if can_edit {
             self.flush_pages(key, text);
             return;
         }
 
-        // Spilling rewrites the message into a pointer, but what the renderer
-        // has to remember is the text it composed: comparing next time against
-        // the pointer would make every tick look like a change and re-send the
-        // whole turn.
-        let payload = self.spill_if_long(key, text.clone(), prose);
+        // Delivered whole, so only the answer: the tool calls and the
+        // narration around them were the agent's working, and on a phone they
+        // are what stands between the reader and what it concluded. `/log` has
+        // them. A turn that said nothing at all still says what it did.
+        let answer = if answer.is_empty() {
+            text.clone()
+        } else {
+            answer
+        };
 
-        // Only once it has been accepted for delivery is it no longer owed.
-        if self.queue(key, OutJob::Turn(payload)) {
-            if let Some(thread) = self.threads.get_mut(key) {
-                thread.renderer.mark_sent(text);
+        // What the renderer remembers is the turn it composed, not the pages
+        // cut from its answer: comparing against those would make every tick
+        // look like a change and re-send the whole thing.
+        //
+        // Each page is a message of its own — `Seal` rather than `Turn`, which
+        // on a channel that cannot edit would try to grow the first one.
+        for page in render::split(&answer, WHOLE_PAGE_BUDGET) {
+            if !self.queue(key, OutJob::Seal(page)) {
+                return;
             }
+        }
+        if let Some(thread) = self.threads.get_mut(key) {
+            thread.renderer.mark_sent(text);
         }
     }
 
@@ -1152,47 +1193,6 @@ impl Core {
                 thread.renderer.mark_sent(text);
             }
         }
-    }
-
-    /// Write an over-long reply to a file and hand back something that fits.
-    ///
-    /// Three attempts, in order of how much of the answer survives:
-    ///
-    /// 1. the whole turn, when it fits;
-    /// 2. the turn without its tool log, when *that* fits — the log is the bulk
-    ///    of a working turn and the least of it, so this is nearly always the
-    ///    one that runs, and the answer arrives whole;
-    /// 3. the **end** of the prose, plus a pointer. Cutting from the front is
-    ///    deliberate: a long answer builds to its conclusion, and a reader who
-    ///    can see the file has lost only the run-up.
-    ///
-    /// Falls back to the untouched text if the file cannot be written — a
-    /// clipped reply is worse than a whole one, but both beat no reply.
-    fn spill_if_long(&self, key: &ThreadKey, text: String, prose: String) -> String {
-        if text.chars().count() <= SPILL_THRESHOLD {
-            return text;
-        }
-
-        // The file always holds the whole turn, tool log included: it is the
-        // record, and the thing a pointer would be lying about if it did not.
-        let path = match self.spill(key, &text) {
-            Some(path) => path,
-            None => return text,
-        };
-        let pointer = format!("  ssh {} -t 'cat {}'", hostname(), path.display());
-
-        if !prose.is_empty() && prose.chars().count() <= SPILL_THRESHOLD {
-            return format!("{prose}\n\nFull turn:\n\n{pointer}");
-        }
-
-        // Nothing to prefer between them, so cut whichever is the real answer.
-        let long = if prose.is_empty() { &text } else { &prose };
-        let cut = long.chars().count() - SPILL_THRESHOLD;
-        let tail: String = long.chars().skip(cut).collect();
-        format!(
-            "[first {cut} characters omitted — {} in all]\n\n{tail}\n\nFull turn:\n\n{pointer}",
-            long.chars().count(),
-        )
     }
 
     /// Write text to a file in the spill directory and report where it went.
@@ -1255,6 +1255,7 @@ impl Core {
         }
 
         let state = self.state(key)?;
+        let brief = self.channel(key).map(|channel| brief(channel.can_edit()));
 
         let (session, events) = agent::spawn(agent::SpawnConfig {
             agent: state.agent.clone(),
@@ -1265,6 +1266,7 @@ impl Core {
             // pinning itself to whatever it happened to default to once.
             model: state.requested_model.clone(),
             label: key.to_string(),
+            brief,
         })
         .await
         .with_context(|| format!("starting {} for {key}", state.agent))?;
@@ -1283,6 +1285,31 @@ impl Core {
         );
         Ok(())
     }
+}
+
+/// What an agent is told about where its replies are read.
+///
+/// Nothing else can stop a reply that is right for a terminal and wrong for a
+/// phone — a pasted log, a wide table — because the rendering is not where it
+/// goes wrong: the agent wrote it. And on a channel that delivers only the
+/// answer, the agent has to know that it is only the answer that arrives, or
+/// it leaves the substance in narration nobody will see.
+fn brief(can_edit: bool) -> String {
+    let mut brief = String::from(
+        "You are being driven from a chat app on the user's phone, not a terminal. \
+         Lead with the answer and keep replies short. Do not paste logs, command \
+         output or long code unless asked; say in a sentence what they showed. \
+         Prefer short paragraphs and lists to tables and wide code blocks.",
+    );
+    if !can_edit {
+        brief.push_str(
+            " Only your final message of each turn, the text after your last tool \
+             call, reaches the user; anything written before or between tool calls \
+             is never shown. Make that final message stand on its own: what you \
+             did, what you found, and anything you need them to decide.",
+        );
+    }
+    brief
 }
 
 /// How this thread's tool calls are approved, in a phrase.
@@ -1374,84 +1401,140 @@ fn expand_home(path: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    #[test]
-    fn short_replies_are_left_alone_and_long_ones_are_spilled() {
-        let dir = std::env::temp_dir().join(format!("sb-spill-{}", std::process::id()));
-        let core = Core::new(
-            Store::in_memory().unwrap(),
-            Vec::new(),
-            PathBuf::from("/tmp"),
-            "claude".into(),
-            dir.clone(),
+    /// Run a finished turn through the core the way an agent's events would.
+    async fn finish_turn(core: &mut Core, key: &ThreadKey, events: Vec<AgentEvent>) {
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
         );
-        let key = ThreadKey {
-            channel: "telegram",
-            chat_id: "5".into(),
-            topic_id: None,
-        };
+        for event in events {
+            core.on_agent_event(key, event).await.unwrap();
+        }
+        core.on_agent_event(
+            key,
+            AgentEvent::TurnEnd {
+                ok: true,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+        settle().await;
+    }
 
-        assert_eq!(
-            core.spill_if_long(&key, "short".into(), "short".into()),
-            "short"
-        );
+    fn bash(command: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: command.into(),
+            name: "Bash".into(),
+            input: serde_json::json!({ "command": command }),
+        }
+    }
 
-        // A turn with no prose to prefer — all of it is the tool log.
-        let long = "x".repeat(SPILL_THRESHOLD + 500);
-        let pointed = core.spill_if_long(&key, long.clone(), String::new());
-        assert!(pointed.chars().count() < long.chars().count());
-        assert!(pointed.contains("ssh "), "must say how to read the rest");
-        assert!(pointed.contains(&format!("{}", SPILL_THRESHOLD + 500)));
+    #[tokio::test]
+    async fn a_phone_that_cannot_edit_gets_the_answer_and_not_the_working() {
+        // The screenshots this came from: a 2,504-character answer lost its
+        // first four characters to a cut, arrived glued to the narration
+        // around nine tool calls nobody could see, and ended in an ssh
+        // pointer. What should arrive is the answer, whole, however many
+        // messages that takes — and nothing else.
+        let dir = std::env::temp_dir().join(format!("sb-answer-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
 
-        // The whole thing is on disk, not just the part that fit.
-        let written: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
-        assert_eq!(written.len(), 1);
-        assert_eq!(
-            std::fs::read_to_string(written[0].path()).unwrap().len(),
-            long.len()
-        );
+        let answer: Vec<String> = (0..30)
+            .map(|i| format!("Finding {i}: {}", "the node registered fine. ".repeat(6)))
+            .collect();
+        finish_turn(
+            &mut core,
+            &key,
+            vec![
+                AgentEvent::TextDelta {
+                    text: "Restarting, then waiting rather than polling:".into(),
+                },
+                bash("systemctl --user restart comfyui"),
+                AgentEvent::TextDelta {
+                    text: "Server's up. Checking the nodes:".into(),
+                },
+                bash("curl localhost:8188/object_info"),
+                bash("grep SAM2 log"),
+                AgentEvent::TextDelta {
+                    text: answer.join("\n\n"),
+                },
+            ],
+        )
+        .await;
+
+        let sent = channel.messages();
+        assert!(sent.len() > 1, "a long answer is more messages: {sent:?}");
+        let all = sent.join("\n");
+        for finding in &answer {
+            assert!(all.contains(finding.trim_end()), "lost: {finding}");
+        }
+        for message in &sent {
+            assert!(message.chars().count() <= WHOLE_PAGE_BUDGET);
+        }
+        assert!(!all.contains('▸'), "no tool calls: {all}");
+        assert!(!all.contains("polling"), "no narration: {all}");
+        assert!(!all.contains("ssh "), "no pointer: {all}");
+        assert!(!all.contains("omitted"), "nothing cut: {all}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn log_shows_the_last_turn_with_every_tool_call() {
+        let dir = std::env::temp_dir().join(format!("sb-log-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.on_log(&key).unwrap();
+        settle().await;
+        assert_eq!(channel.messages(), vec!["No finished turn to show yet."]);
+        channel.messages.lock().unwrap().clear();
+
+        finish_turn(
+            &mut core,
+            &key,
+            vec![
+                AgentEvent::TextDelta {
+                    text: "checking:".into(),
+                },
+                bash("ls"),
+                bash("pwd"),
+                AgentEvent::TextDelta {
+                    text: "all good".into(),
+                },
+            ],
+        )
+        .await;
+        assert_eq!(channel.messages(), vec!["all good"]);
+        channel.messages.lock().unwrap().clear();
+
+        core.on_log(&key).unwrap();
+        settle().await;
+        let log = channel.messages().join("\n");
+        assert!(log.contains("checking:"), "{log}");
+        assert!(log.contains("▸ Bash  `ls`"), "{log}");
+        assert!(log.contains("▸ Bash  `pwd`"), "{log}");
+        assert!(log.contains("all good"), "{log}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn a_long_turn_keeps_its_answer_and_spills_the_tool_log() {
-        // The bug this exists for: a 6,500-character turn was cut at 2,500 from
-        // the front, and the front of a working turn is its tool log. What
-        // arrived was Bash lines ending mid-command, and every word of the
-        // answer was in the part that went to the file. From a phone that is
-        // indistinguishable from no reply at all.
-        let dir = std::env::temp_dir().join(format!("sb-spill3-{}", std::process::id()));
-        let core = core_with_spill_dir(&dir);
-        let key = fake_key();
-
-        let log = "▸ Bash  `cargo test`\n".repeat(200);
-        let answer = "Here is what I changed and why.";
-        let whole = format!("{log}{answer}");
-        let prose = answer.to_string();
-
-        let sent = core.spill_if_long(&key, whole, prose);
-        assert!(sent.contains(answer), "the answer survives whole: {sent}");
-        assert!(!sent.contains('▸'), "the log does not: {sent}");
-        assert!(sent.contains("ssh "), "and it is still readable in full");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn an_answer_too_long_even_alone_is_cut_from_the_front() {
-        // A long answer builds to its conclusion, so the end is the half worth
-        // keeping — the opposite of what cutting by position gives you.
-        let dir = std::env::temp_dir().join(format!("sb-spill4-{}", std::process::id()));
-        let core = core_with_spill_dir(&dir);
-        let key = fake_key();
-
-        let prose = format!("{}THE CONCLUSION", "preamble. ".repeat(400));
-        let sent = core.spill_if_long(&key, prose.clone(), prose);
-
-        assert!(sent.contains("THE CONCLUSION"), "kept the end");
-        assert!(
-            sent.contains("characters omitted"),
-            "and says it cut: {sent}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+    fn the_brief_says_only_the_last_message_arrives_where_that_is_true() {
+        // On a channel that edits, the narration streams in as it is written
+        // and is not lost, so telling the agent otherwise would be a lie that
+        // changes how it writes.
+        assert!(brief(false).contains("final message"));
+        assert!(!brief(true).contains("final message"));
+        assert!(brief(true).contains("phone"));
     }
 
     /// A `Core` with a scratch spill directory, for the tests that write one.
@@ -1726,12 +1809,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_unchanged_turn_is_not_re_sent_on_every_tick() {
-        // Spilling rewrites a long reply into a pointer before it goes out. If
-        // what the renderer remembers is that pointer rather than the text it
-        // composed, every tick compares unequal, and the thread gets the whole
-        // turn again every 1.5 seconds — on someone's phone. Verified to fail
-        // when that mistake is reintroduced. Only a channel that cannot edit
-        // spills now, so that is the one this runs against.
+        // A channel that cannot edit gets the turn's answer, cut into pages,
+        // not the turn itself. If what the renderer remembers is those pages
+        // rather than the text it composed, every tick compares unequal, and
+        // the thread gets the whole turn again every 1.5 seconds — on
+        // someone's phone. The same trap the ssh pointer set when it was the
+        // thing sent; that version was verified to fail when reintroduced.
         let dir = std::env::temp_dir().join(format!("sb-tick-{}", std::process::id()));
         let channel = CountingChannel::write_only();
         let key = ThreadKey {
@@ -1750,7 +1833,7 @@ mod tests {
 
         let mut renderer = TurnRenderer::new();
         renderer.apply(&AgentEvent::Text {
-            text: "x".repeat(SPILL_THRESHOLD + 500),
+            text: "x".repeat(WHOLE_PAGE_BUDGET + 500),
         });
         renderer.apply(&AgentEvent::TurnEnd {
             ok: true,
@@ -1783,8 +1866,8 @@ mod tests {
 
         assert_eq!(
             channel.sent.lock().unwrap().len(),
-            1,
-            "an unchanged turn must cost exactly one message"
+            2,
+            "an unchanged turn must cost exactly its own pages"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

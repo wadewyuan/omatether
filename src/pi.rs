@@ -58,6 +58,8 @@ pub struct Config {
     /// `--model`, or `None` to let Pi pick. Pi's own vocabulary: a pattern, a
     /// `provider/id`, or either with a `:<thinking>` suffix.
     pub model: Option<String>,
+    /// `--append-system-prompt`: see [`crate::agent::SpawnConfig::brief`].
+    pub brief: Option<String>,
 }
 
 pub struct PiSession {
@@ -68,6 +70,7 @@ pub struct PiSession {
     /// Passed to every turn's process; see the Codex adapter's note on why it
     /// is a plain field.
     model: Option<String>,
+    brief: Option<String>,
     events: mpsc::Sender<AgentEvent>,
     busy: Arc<AtomicBool>,
     /// The running turn's process, so `cancel` has something to kill.
@@ -82,6 +85,7 @@ impl PiSession {
                 cwd: config.cwd,
                 session_id: Arc::new(Mutex::new(config.session_id)),
                 model: config.model,
+                brief: config.brief,
                 events: tx,
                 busy: Arc::new(AtomicBool::new(false)),
                 child: Arc::new(Mutex::new(None)),
@@ -126,6 +130,10 @@ impl Agent for PiSession {
         }
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
+        }
+        // Every turn is its own process, so every turn is told.
+        if let Some(brief) = &self.brief {
+            command.arg("--append-system-prompt").arg(brief);
         }
         command
             // The prompt goes after `--` so a leading `-` in the text is not

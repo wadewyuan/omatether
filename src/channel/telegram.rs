@@ -170,7 +170,7 @@ impl Telegram {
     /// letters, digits and underscores, so none carry the leading slash and
     /// none carry arguments.
     pub async fn set_commands(&self) -> Result<()> {
-        const COMMANDS: [(&str, &str); 11] = [
+        const COMMANDS: [(&str, &str); 12] = [
             ("new", "start a fresh session in this thread"),
             ("stop", "interrupt the running turn"),
             ("cd", "set the working directory"),
@@ -178,6 +178,7 @@ impl Telegram {
             ("model", "which model the agent runs"),
             ("attach", "how to take over at a real terminal"),
             ("status", "agent, model, directory, session"),
+            ("log", "the last turn in full, every tool call included"),
             ("allow", "approve a pending tool call"),
             ("deny", "refuse a pending tool call"),
             ("auto", "approve tool calls without asking (on by default)"),

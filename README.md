@@ -113,6 +113,7 @@ thing stays behind the tailnet with nothing exposed.
 | `/model [name]` | Which model the agent runs. `/model default` hands the choice back |
 | `/attach` | The ssh line to take over at a real terminal |
 | `/status` | Agent, model, directory, session, whether a turn is running |
+| `/log` | The last turn in full — every tool call, and what the agent said between them |
 | `/allow`, `/deny <why>` | Answer a permission request without tapping |
 | `/auto [on\|off]` | Approve tool calls without asking. **On by default** |
 | `/help` | The above |
@@ -147,10 +148,19 @@ thread starts in auto mode, and the reply reads as an account of what the agent
 did rather than a queue of questions.
 
 A reply too long for one Telegram message carries on in the next, so a long
-run keeps reporting progress and nothing is cut. On iMessage, where a turn
-arrives whole at the end, a reply too long for one message keeps the agent's
-own words and spills the tool log to a file, with the ssh line to read it in
-full.
+run keeps reporting progress and nothing is cut.
+
+iMessage cannot edit a message, so a turn arrives whole at the end — and only
+its **answer**: what the agent wrote after its last tool call. The tool calls,
+and the narration around them ("checking the log:"), were the agent's working;
+`/log` shows them on request.
+
+Every chat thread also tells the agent where it is being read, on top of its
+own system prompt: a phone, so lead with the answer and do not paste logs; and
+on iMessage, that only the final message arrives, so make it stand on its own.
+Claude and pi get that as `--append-system-prompt`, codex as
+`-c developer_instructions=…`. The detached tier does not — its replies are
+read at the terminal `/attach` names.
 
 `/auto off` turns the gate on for that thread. Then a consequential tool call
 blocks the turn until answered — with **Allow** / **Deny** buttons on Telegram,
@@ -236,20 +246,13 @@ at a paragraph break where they can, and a code block split across two is
 closed on the first and reopened, with its language, on the second. Nothing
 goes to a file.
 
-On iMessage, which cannot edit a message and so gets each turn whole, above
-~2500 characters a reply is written to
-`$XDG_STATE_HOME/omatether/out/` and the chat gets the head plus the command
-to read the rest:
+On iMessage, which gets each turn whole, a long answer is sent as several
+messages, cut the same way — never shortened, and never a file to read over
+ssh from a phone. `/log` pages the same way.
 
-```
-… 12431 characters in all. Read the rest with:
-
-  ssh <host> -t 'cat ~/.local/state/omatether/out/telegram-5-1788.txt'
-```
-
-iMessage clips long messages anyway, which loses the tail silently. A file
-plus a way to read it loses nothing, and the tailnet already makes it
-reachable.
+The one thing that still goes to `$XDG_STATE_HOME/omatether/out/` is a
+permission question whose tool input is too long to show inline: a question
+is never shown cut off.
 
 ### The repl
 
@@ -407,7 +410,7 @@ Deliberately the simplest option in each case; revisit when something hurts.
 
 Deliberately not built: **attachments** (sending and receiving files) and
 **Photon tapbacks**. Both need live channel credentials to exercise at all, and
-neither addresses a problem the long-reply spill does not already solve.
+neither addresses a problem that paging and `/log` do not already solve.
 
 ## What is verified, and what is not
 

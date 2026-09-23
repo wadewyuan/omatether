@@ -489,18 +489,38 @@ worst kind of bug to find.
 - **Never show a question you had to cut off.** A permission prompt is the one
   human control here, so the full tool input goes out whole or goes to a file
   with a pointer — never clipped by the channel with "… truncated".
-- **A length cut must never land on the answer.** `spill_if_long` used to keep
-  the first 2500 characters of a long turn, and the first 2500 characters of a
-  working turn are its tool log: a 6,500-character reply arrived as `▸ Bash`
-  lines ending mid-command, with every word of the answer in the spill file.
-  It reads as *no reply*, not a truncated one, and on Photon — where the whole
-  turn lands at once at the end, unedited — it is the normal case for any real
-  piece of work, not an edge one. So the order is: whole turn, else the turn
-  without its tool log (`TurnRenderer::compose_prose`), else the *end* of the
-  prose. Related, and the reason the first two nearly always suffice: a run of
-  consecutive tool calls renders as one line naming the count and the newest
-  call, rather than a line each. This is now the path for channels that cannot
-  edit only; one that can pages the turn instead (see Telegram).
+- **A turn delivered whole is its answer, paged — never cut, never a file.**
+  On a channel that cannot edit, what goes out is
+  `TurnRenderer::compose_answer`: the text after the last tool call, split by
+  `render::split` into as many messages as it takes. Two versions before this
+  one failed on a phone. Keeping the first 2500 characters delivered the tool
+  log and lost the answer. Then "drop the tool log, else keep the *end*" cut a
+  2,504-character answer by four characters, glued together the narration
+  from around nine tool calls nobody could see ("…rather than poll:Server's
+  up."), and ended in an ssh pointer — which is not an answer on a phone.
+  Nothing marks agent text as the final answer while it streams, and nothing
+  needs to: it is only asked for once the turn has ended, when "after the last
+  tool call" is just a position. A turn that ended *on* a tool call (stopped,
+  or failed) gets every passage, each its own paragraph. The agent is told
+  the rule too (`core::brief`, below), so it writes a final message that
+  stands on its own. `/log` shows the whole turn with every call on its own
+  line (`compose_log`) for whoever wants the working. It is kept in memory
+  only, per thread. Spilling to a file is now for permission questions alone.
+- **Every chat thread tells its agent where it is read.** `core::brief`
+  becomes `--append-system-prompt` (claude, pi) or
+  `-c developer_instructions="…"` (codex), on every spawn. It is a system
+  prompt rather than text in the first message, so it is not part of the
+  transcript and cannot be compacted away. It depends on `can_edit`, not on
+  which channel it is: only a channel that cannot edit gets the "only your
+  final message arrives" clause, because elsewhere the narration streams in
+  and saying otherwise would change how the agent writes, for no reason. The
+  repl passes `None` and the tmux tier ignores it (it is read at a
+  terminal). Verified: claude (sonnet) obeys it with a clean env, haiku
+  obeyed a weaker wording less reliably; codex 0.154 accepts the key under
+  `--strict-config`, which rejects an unknown one; pi 0.85 accepts the flag,
+  but whether it obeys is **unverified**, because its provider refused with
+  a 403 on this machine. The value is quoted as a TOML string on purpose:
+  `-c` falls back to the raw string only when TOML parsing *fails*.
 
 ## Packaging
 

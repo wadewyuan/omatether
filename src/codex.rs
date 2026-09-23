@@ -42,6 +42,8 @@ pub struct Config {
     pub thread_id: Option<String>,
     /// `-m`, or `None` to let Codex pick.
     pub model: Option<String>,
+    /// `developer_instructions`: see [`crate::agent::SpawnConfig::brief`].
+    pub brief: Option<String>,
 }
 
 pub struct CodexSession {
@@ -52,6 +54,7 @@ pub struct CodexSession {
     /// nothing but `set_model` writes it, and the process it applies to has not
     /// started yet.
     model: Option<String>,
+    brief: Option<String>,
     events: mpsc::Sender<AgentEvent>,
     busy: Arc<AtomicBool>,
     /// The running turn's process, so `cancel` has something to kill.
@@ -66,6 +69,7 @@ impl CodexSession {
                 cwd: config.cwd,
                 thread_id: Arc::new(Mutex::new(config.thread_id)),
                 model: config.model,
+                brief: config.brief,
                 events: tx,
                 busy: Arc::new(AtomicBool::new(false)),
                 child: Arc::new(Mutex::new(None)),
@@ -111,6 +115,10 @@ impl Agent for CodexSession {
         }
         if let Some(model) = &self.model {
             command.args(["-m", model]);
+        }
+        // Every turn is its own process, so every turn is told.
+        if let Some(brief) = &self.brief {
+            command.args(["-c", &developer_instructions(brief)]);
         }
         command
             .arg("--json")
@@ -261,6 +269,18 @@ pub async fn list_models(cwd: &Path) -> Result<Vec<String>> {
     }
 
     parse_model_catalog(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The `-c` override that tells codex something on top of its own prompt.
+///
+/// `developer_instructions` is a top-level config key (read out of the 0.154
+/// binary; `--help` does not list config keys). `-c` parses its value as TOML
+/// and falls back to the raw string when that fails — so an unquoted sentence
+/// works until one happens to parse as something else. Quoted, it is always a
+/// string. A JSON string literal is a valid TOML basic string: same escapes.
+fn developer_instructions(brief: &str) -> String {
+    let quoted = serde_json::to_string(brief).expect("a string always serializes");
+    format!("developer_instructions={quoted}")
 }
 
 /// The slugs the catalog lists. `visibility: "hide"` are the ones codex keeps
@@ -419,6 +439,14 @@ async fn log_stderr(stderr: tokio::process::ChildStderr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instructions_are_passed_as_a_quoted_toml_string() {
+        assert_eq!(
+            developer_instructions(r#"say "hi"\nthen stop"#),
+            r#"developer_instructions="say \"hi\"\\nthen stop""#
+        );
+    }
     use serde_json::json;
 
     // Frames below are verbatim from a real `codex exec --json` run

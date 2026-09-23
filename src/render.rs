@@ -23,10 +23,11 @@ enum Segment {
     /// it buried it past the length limit. So a run collapses to one line: how
     /// many, and what the most recent one was, which is the useful half while
     /// the turn is still streaming and a fair summary once it is not.
+    ///
+    /// Every call is kept, in order, for `/log`; the chat line shows only the
+    /// count and the newest.
     Tool {
-        name: String,
-        summary: String,
-        count: usize,
+        calls: Vec<(String, String)>,
     },
 }
 
@@ -100,23 +101,11 @@ impl TurnRenderer {
 
             AgentEvent::ToolCall { name, input, .. } => {
                 self.thinking = false;
+                let call = (name.clone(), summarize(input));
                 match self.segments.last_mut() {
-                    // Still in the same run: keep the count and the newest
-                    // call, and drop the one it replaces.
-                    Some(Segment::Tool {
-                        name: last,
-                        summary,
-                        count,
-                    }) => {
-                        *last = name.clone();
-                        *summary = summarize(input);
-                        *count += 1;
-                    }
-                    _ => self.segments.push(Segment::Tool {
-                        name: name.clone(),
-                        summary: summarize(input),
-                        count: 1,
-                    }),
+                    // Still in the same run.
+                    Some(Segment::Tool { calls }) => calls.push(call),
+                    _ => self.segments.push(Segment::Tool { calls: vec![call] }),
                 }
             }
 
@@ -177,25 +166,19 @@ impl TurnRenderer {
         for (i, segment) in self.segments.iter().enumerate() {
             match segment {
                 Segment::Text(text) => out.push_str(text),
-                Segment::Tool {
-                    name,
-                    summary,
-                    count,
-                } => {
+                Segment::Tool { calls } => {
+                    let (name, summary) = calls.last().expect("a run has a call");
+                    let count = calls.len();
                     // The name of the newest call when it is the only one, and
                     // the size of the run when it is not: "▸ Bash `ls`" reads
                     // as what just happened, "▸ 9 tools · Bash `ls`" as what
                     // has been happening.
-                    let head = if *count == 1 {
+                    let head = if count == 1 {
                         format!("▸ {name}")
                     } else {
                         format!("▸ {count} tools · {name}")
                     };
-                    let line = if summary.is_empty() {
-                        head
-                    } else {
-                        format!("{head}  {}", code_span(summary))
-                    };
+                    let line = tool_line(&head, summary);
                     push_line(&mut out, &line);
                     // The start of the line itself, past any newline pushed to
                     // separate it: a cut right in front of it is a safe one.
@@ -228,37 +211,61 @@ impl TurnRenderer {
         (body.to_string(), stable)
     }
 
-    /// The turn with the tool log left out — what the agent actually said.
+    /// What the agent concluded: the text after its last tool call.
     ///
-    /// For the one case where the whole turn will not fit in a chat message.
-    /// Cutting by position keeps the beginning, and the beginning of a working
-    /// turn is its tool log; the answer is at the end, so a length-cut message
-    /// delivers the transcript and drops the conclusion. That is not a
-    /// truncated reply, it is a missing one. Dropping the log instead cuts the
-    /// part that was never the point.
-    pub fn compose_prose(&self) -> String {
-        let mut out = String::new();
-        let mut tools = 0;
-
+    /// For a channel that delivers a turn whole, at the end. Everything an
+    /// agent writes *before* a tool call is narration about that call — "let
+    /// me check the log:" — and with the calls themselves left out it reads as
+    /// fragments glued together. What it writes after the last one is the
+    /// answer. No live signal marks that text as final, and none is needed:
+    /// this is only asked once the turn has ended, when "after the last tool
+    /// call" is simply a position.
+    ///
+    /// A turn that ended on a tool call — interrupted, or failed before it
+    /// could reply — has no such text, and gets every passage it did write,
+    /// each its own paragraph, rather than nothing.
+    pub fn compose_answer(&self) -> String {
+        let mut passages = Vec::new();
+        let mut current = String::new();
         for segment in &self.segments {
             match segment {
-                Segment::Text(text) => out.push_str(text),
-                Segment::Tool { count, .. } => tools += count,
+                Segment::Text(text) => current.push_str(text),
+                Segment::Tool { .. } => {
+                    passages.push(std::mem::take(&mut current));
+                }
             }
         }
 
-        let out = out.trim();
-        if out.is_empty() {
-            return String::new();
+        let last = current.trim();
+        if !last.is_empty() {
+            return last.to_string();
         }
+        passages
+            .iter()
+            .map(|passage| passage.trim())
+            .filter(|passage| !passage.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 
-        // Say that something was left out. A reply that silently omits every
-        // command it ran reads as if it ran none.
-        match tools {
-            0 => out.to_string(),
-            1 => format!("{out}\n\n[1 tool call not shown]"),
-            n => format!("{out}\n\n[{n} tool calls not shown]"),
+    /// The whole turn with every tool call on a line of its own — what `/log`
+    /// shows, where the chat line for a run shows only the newest call.
+    pub fn compose_log(&self) -> String {
+        let mut out = String::new();
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => out.push_str(text),
+                Segment::Tool { calls } => {
+                    for (name, summary) in calls {
+                        push_line(&mut out, &tool_line(&format!("▸ {name}"), summary));
+                    }
+                    // A tool line followed by prose is a paragraph break,
+                    // not the prose glued onto the call.
+                    out.push('\n');
+                }
+            }
         }
+        out.trim().to_string()
     }
 
     /// The text to send now, or `None` when nothing changed since last time.
@@ -326,6 +333,31 @@ fn code_span(text: &str) -> String {
         ""
     };
     format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+/// One tool call's line: the head, then its arguments as a code span.
+fn tool_line(head: &str, summary: &str) -> String {
+    if summary.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}  {}", code_span(summary))
+    }
+}
+
+/// Finished text as chat messages of at most `budget` characters each.
+///
+/// The same cuts a streaming turn's pages get — between paragraphs by
+/// preference, and a code block cut across two messages closed and reopened —
+/// for text that is delivered whole: a turn on a channel that cannot edit, or
+/// `/log`. Nothing is dropped; a long answer is more messages, not a shorter
+/// one.
+pub fn split(text: &str, budget: usize) -> Vec<String> {
+    let pages = paginate(text, text.len(), &PageStart::default(), budget);
+    let mut out: Vec<String> = pages.sealed.into_iter().map(|(page, _)| page).collect();
+    if !pages.current.trim().is_empty() {
+        out.push(pages.current);
+    }
+    out
 }
 
 /// Cut `text` into pages of at most `budget` characters, the first beginning
@@ -725,27 +757,111 @@ mod tests {
     }
 
     #[test]
-    fn prose_only_drops_the_log_but_admits_it() {
-        // Used when the whole turn will not fit. A reply that silently omits
-        // every command it ran reads as if it ran none.
+    fn the_answer_is_what_came_after_the_last_tool_call() {
+        // The shape of the turn in the screenshots that prompted this: every
+        // line of narration was addressed to a tool call nobody could see,
+        // and joined together it read as "…rather than poll:Server's up."
         let mut r = TurnRenderer::new();
-        r.apply(&delta("here is what I found"));
-        r.apply(&tool("Bash", "ls"));
-        r.apply(&tool("Bash", "pwd"));
+        r.apply(&delta("Restarting it — waiting for boot rather than poll:"));
+        r.apply(&tool("Bash", "systemctl restart comfyui"));
+        r.apply(&delta("Server's up. Confirming the nodes registered:"));
+        r.apply(&tool("Bash", "curl /object_info"));
+        r.apply(&tool("Bash", "grep SAM2"));
+        r.apply(&delta(
+            "\n\nComfyUI is running clean.\n\nThe fix is confirmed.",
+        ));
+        r.apply(&AgentEvent::TurnEnd {
+            ok: true,
+            detail: None,
+        });
 
-        let prose = r.compose_prose();
-        assert!(prose.starts_with("here is what I found"));
-        assert!(!prose.contains('▸'), "the log is gone: {prose}");
-        assert!(prose.contains("2 tool calls not shown"), "{prose}");
+        assert_eq!(
+            r.compose_answer(),
+            "ComfyUI is running clean.\n\nThe fix is confirmed."
+        );
     }
 
     #[test]
-    fn a_turn_that_is_only_tool_calls_has_no_prose_to_prefer() {
-        // The caller uses this to decide; an empty string says "nothing here
-        // is better than what you have".
+    fn a_turn_with_no_tools_is_all_answer() {
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("just a reply"));
+        assert_eq!(r.compose_answer(), "just a reply");
+    }
+
+    #[test]
+    fn a_turn_that_ended_on_a_tool_call_keeps_what_it_did_say() {
+        // Interrupted, say. The narration is all there is, and each passage
+        // stays a paragraph of its own rather than running into the next.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("looking at the log:"));
+        r.apply(&tool("Bash", "tail log"));
+        r.apply(&delta("found it, fixing:"));
+        r.apply(&tool("Edit", "a.rs"));
+
+        assert_eq!(
+            r.compose_answer(),
+            "looking at the log:\n\nfound it, fixing:"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_is_only_tool_calls_has_no_answer() {
+        // The caller falls back to the compact turn; empty says "nothing here
+        // is better than that".
         let mut r = TurnRenderer::new();
         r.apply(&tool("Bash", "ls"));
-        assert_eq!(r.compose_prose(), "");
+        assert_eq!(r.compose_answer(), "");
+    }
+
+    #[test]
+    fn a_failure_after_the_last_tool_call_is_part_of_the_answer() {
+        let mut r = TurnRenderer::new();
+        r.apply(&tool("Bash", "ls"));
+        r.apply(&AgentEvent::TurnEnd {
+            ok: false,
+            detail: Some("401".into()),
+        });
+        assert_eq!(r.compose_answer(), "[turn failed: 401]");
+    }
+
+    #[test]
+    fn the_log_names_every_call_that_the_chat_line_counted() {
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("checking:"));
+        r.apply(&tool("Bash", "ls"));
+        r.apply(&tool("Bash", "pwd"));
+        r.apply(&delta("done"));
+
+        assert!(r.compose().contains("▸ 2 tools · Bash"));
+        let log = r.compose_log();
+        assert!(log.contains("▸ Bash  `ls`"), "{log}");
+        assert!(log.contains("▸ Bash  `pwd`"), "{log}");
+        assert!(log.starts_with("checking:"), "{log}");
+        assert!(
+            log.ends_with("\n\ndone"),
+            "prose after a call is its own paragraph: {log:?}"
+        );
+    }
+
+    #[test]
+    fn split_text_loses_nothing_and_fits() {
+        let paragraphs: Vec<String> = (0..40)
+            .map(|i| format!("paragraph {i} {}", "word ".repeat(12)))
+            .collect();
+        let text = paragraphs.join("\n\n");
+        let pages = split(&text, 300);
+
+        assert!(pages.len() > 1);
+        for page in &pages {
+            assert!(page.chars().count() <= 300, "over budget: {page:?}");
+        }
+        for paragraph in &paragraphs {
+            assert!(
+                pages.iter().any(|page| page.contains(paragraph.trim_end())),
+                "lost: {paragraph}"
+            );
+        }
+        assert_eq!(split("short", 300), vec!["short".to_string()]);
     }
 
     fn fences(page: &str) -> usize {

@@ -23,6 +23,8 @@ pub enum Command {
     Attach,
     /// Report agent, directory, session and whether a turn is running.
     Status,
+    /// Show the last finished turn in full, tool calls and all.
+    Log,
     /// Answer a pending permission request without tapping a button.
     Allow,
     Deny(String),
@@ -80,6 +82,7 @@ pub fn parse(text: &str) -> Command {
             _ => ModelRequest::Set(rest.to_string()),
         }),
         "/attach" => Command::Attach,
+        "/log" => Command::Log,
         "/auto" | "/yolo" => Command::Auto(match rest.to_ascii_lowercase().as_str() {
             "" => None,
             "on" | "yes" | "true" => Some(true),
@@ -101,6 +104,7 @@ omatether — your coding agent, over chat
 /model [name]  which model the agent runs (/model default to undo)
 /attach        how to take over at a real terminal
 /status        agent, model, directory, session, whether a turn is running
+/log           the last turn in full, every tool call included
 /allow         approve a pending tool call
 /deny <why>    refuse it, and tell the agent why
 /auto [on|off] approve tool calls without asking (on by default)
@@ -142,6 +146,7 @@ mod tests {
     fn agent_and_attach_are_omatether_commands() {
         assert_eq!(parse("/agent codex"), Command::Agent("codex".into()));
         assert_eq!(parse("/attach"), Command::Attach);
+        assert_eq!(parse("/log"), Command::Log);
         assert_eq!(parse("/agent"), Command::Agent(String::new()));
     }
 
