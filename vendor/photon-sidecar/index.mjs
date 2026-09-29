@@ -5,9 +5,13 @@
 // needs over loopback HTTP:
 //
 //   GET  /inbound  -> NDJSON stream, one normalized inbound message per line
-//                     (`text` may be empty — an attachment with no words)
+//                     (`text` may be empty — a sticker, or an image whose words
+//                     are all in `files`)
 //   POST /send     -> { spaceId, text, format? } -> { ok, messageId }
 //   POST /typing   -> { spaceId, state? }          -> { ok }
+//   POST /fetch    -> { messageId }                -> { ok, files: [...] }
+//                     downloads that message's attachments to the inbox; asked
+//                     for only once the sender has passed the allowlist
 //
 // Both require `X-Omatether-Token`. It binds to 127.0.0.1 only; nothing here
 // is safe to expose.
@@ -21,11 +25,21 @@
 // closes, so spawning it with a piped stdin binds it to the parent's life.
 
 import http from "node:http";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const projectId = requireEnv("PHOTON_PROJECT_ID");
 const projectSecret = requireEnv("PHOTON_PROJECT_SECRET");
 const token = requireEnv("PHOTON_SIDECAR_TOKEN");
 const port = Number(process.env.PHOTON_SIDECAR_PORT || 8789);
+// Where an attachment's bytes are written for the agent to read. The Rust side
+// always sets it; unset means attachments are reported as unavailable rather
+// than silently dropped, because a dropped one is the bug this whole path
+// exists to fix.
+const inboxDir = process.env.PHOTON_SIDECAR_INBOX_DIR || null;
+// Mirrors `inbox::MAX_BYTES` in Rust. The limit a person meets should not
+// depend on which chat app they happened to use.
+const MAX_BYTES = 20 * 1024 * 1024;
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -75,24 +89,110 @@ function broadcast(event) {
   }
 }
 
+/** Content is a list of parts on some platforms and a bare string on others. */
+function parts(content) {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  if (Array.isArray(content)) return content.map((p) => (typeof p === "string" ? { type: "text", text: p } : p ?? {}));
+  return content ? [content] : [];
+}
+
+/** Mirrors `inbox::sanitize` in Rust: last component, and nothing a path or a shell can read as syntax. */
+function safeName(name) {
+  const base = String(name ?? "")
+    .split(/[/\\]/)
+    .pop()
+    .replace(/^\.+|\.+$/g, "")
+    .replace(/[^A-Za-z0-9._-]/g, "_")
+    .slice(0, 80);
+  return base || "file";
+}
+
+/**
+ * Attachments of recently announced messages, waiting to be asked for.
+ *
+ * The bytes are *not* read when a message arrives — they are read when
+ * omatether asks for them by message id, which is after it has checked the
+ * sender against the allowlist. That ordering is the same rule `parse_event`
+ * follows on the Rust side: a stranger who texts the line gets silence, and
+ * nothing they sent is fetched, written to this machine's disk, or looked at.
+ *
+ * Bounded because a message nobody asks about is a leak. omatether asks within
+ * milliseconds, so this only ever holds a handful.
+ */
+const pending = new Map();
+const PENDING_MAX = 64;
+
+function remember(messageId, spaceId, attachments) {
+  if (!messageId || attachments.length === 0) return;
+  pending.set(messageId, { spaceId, attachments });
+  while (pending.size > PENDING_MAX) {
+    pending.delete(pending.keys().next().value);
+  }
+}
+
+/**
+ * Write one attachment's bytes under the inbox and report where they went.
+ *
+ * `read()` is the SDK's own accessor — an inbound attachment part is
+ * `{type:"attachment", id, name, mimeType, size, read(), stream()}` — so the
+ * bytes come down here, in the process that holds the credentials, exactly as
+ * Telegram's come down inside its adapter.
+ */
+async function saveAttachment(spaceId, part) {
+  const name = safeName(part?.name);
+  const size = Number(part?.size ?? 0);
+
+  if (!inboxDir) throw new Error("this bridge is not configured to receive files");
+  if (size > MAX_BYTES) throw new Error(`it is ${(size / 1048576).toFixed(1)} MB, over the ${MAX_BYTES / 1048576} MB limit`);
+  if (typeof part?.read !== "function") throw new Error("the platform sent no way to read it");
+
+  const bytes = await part.read();
+  if (bytes.length > MAX_BYTES) throw new Error(`it is ${(bytes.length / 1048576).toFixed(1)} MB, over the limit`);
+
+  const dir = path.join(inboxDir, `photon-${safeName(spaceId)}`);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+
+  // A nanosecond counter as well as the second, so two images sent together
+  // stay two files rather than one overwriting the other.
+  const file = path.join(
+    dir,
+    `${Math.floor(Date.now() / 1000)}-${process.hrtime.bigint()}-${name}`
+  );
+  // 0600 for the same reason the Rust side uses it: a screenshot of a dashboard
+  // is not something the rest of the machine's users need to be able to read.
+  await fs.writeFile(file, bytes, { mode: 0o600 });
+
+  return {
+    name: part?.name ?? name,
+    mime: part?.mimeType ?? "application/octet-stream",
+    size: bytes.length,
+    path: file,
+  };
+}
+
+/** What omatether is told about a message. Metadata only — see `pending`. */
 function normalize(space, message) {
-  const content = message?.content;
-  // Content is a list of parts on some platforms and a bare string on others.
-  const text =
-    typeof content === "string"
-      ? content
-      : Array.isArray(content)
-        ? content
-            .map((part) => (typeof part === "string" ? part : (part?.text ?? "")))
-            .join("")
-        : (content?.text ?? "");
+  const spaceId = space?.id ?? message?.space?.id ?? null;
+  const content = parts(message?.content);
+
+  const text = content
+    .map((part) => (part?.type === "attachment" ? "" : (part?.text ?? "")))
+    .join("");
+
+  const attachments = content.filter((part) => part?.type === "attachment");
+  remember(message?.id, spaceId, attachments);
 
   return {
     messageId: message?.id ?? null,
-    spaceId: space?.id ?? message?.space?.id ?? null,
+    spaceId,
     spaceType: space?.type ?? "dm",
     senderId: message?.sender?.id ?? space?.phone ?? null,
     text: (text || "").trim(),
+    files: attachments.map((part) => ({
+      name: part?.name ?? "attachment",
+      mime: part?.mimeType ?? "application/octet-stream",
+      size: Number(part?.size ?? 0),
+    })),
   };
 }
 
@@ -251,6 +351,40 @@ const server = http.createServer(async (req, res) => {
       if (state === "stop") await space.stopTyping();
       else await space.startTyping();
       return reply(res, 200, { ok: true });
+    }
+
+    // Deliberately a second round trip rather than work done when the message
+    // arrived: omatether calls this after its allowlist has passed, so a
+    // stranger's file is never read, never written here, and never looked at.
+    if (req.method === "POST" && req.url === "/fetch") {
+      const { messageId } = await readJson(req);
+      if (!messageId) return reply(res, 400, { ok: false, error: "messageId required" });
+
+      const held = pending.get(messageId);
+      // Gone means the announcement was replayed after a reconnect and the
+      // bytes were already collected — an empty list, not an error.
+      if (!held) return reply(res, 200, { ok: true, files: [] });
+      pending.delete(messageId);
+
+      const files = [];
+      for (const part of held.attachments) {
+        try {
+          files.push(await saveAttachment(held.spaceId, part));
+        } catch (e) {
+          // Reported rather than swallowed: the person attached it, and a reply
+          // that never mentions their file reads as an answer to a different
+          // message.
+          const why = String(e?.message ?? e);
+          console.error(`photon-sidecar: could not save ${part?.name ?? "an attachment"} — ${why}`);
+          files.push({
+            name: part?.name ?? "attachment",
+            mime: part?.mimeType ?? "application/octet-stream",
+            size: Number(part?.size ?? 0),
+            error: why,
+          });
+        }
+      }
+      return reply(res, 200, { ok: true, files });
     }
 
     if (req.method === "GET" && req.url === "/health") {

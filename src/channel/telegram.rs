@@ -9,6 +9,7 @@
 //! URL, no webhook and no inbound port — it stays reachable only over the
 //! tailnet.
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::{markup, Channel, Inbound, InboundKind, MessageId, ThreadKey};
+use super::{inbox, markup, Attachment, Channel, Inbound, InboundKind, MessageId, ThreadKey};
 
 pub const CHANNEL: &str = "telegram";
 
@@ -40,6 +41,13 @@ const CB_DENY: &str = "deny";
 pub struct Telegram {
     http: reqwest::Client,
     base: String,
+    /// Where a downloaded file is served from. A different host path to the
+    /// method endpoint — `/file/bot<token>/` rather than `/bot<token>/` — and
+    /// it carries the token too, so it is built once here rather than spelled
+    /// out at the call site.
+    file_base: String,
+    /// Where received files land. See [`super::inbox`].
+    inbox_dir: PathBuf,
     /// User ids permitted to talk to this bot. A bot token in a chat is a shell
     /// on this machine, so anyone else is dropped before the core sees them.
     allowed_users: Vec<String>,
@@ -51,7 +59,7 @@ pub struct Telegram {
 }
 
 impl Telegram {
-    pub fn new(token: &str, allowed_users: Vec<String>) -> Result<Self> {
+    pub fn new(token: &str, allowed_users: Vec<String>, inbox_dir: PathBuf) -> Result<Self> {
         if allowed_users.is_empty() {
             bail!(
                 "refusing to start with an empty allowlist — set OMATETHER_TELEGRAM_ALLOWED_USERS"
@@ -66,6 +74,8 @@ impl Telegram {
         Ok(Self {
             http,
             base: format!("https://api.telegram.org/bot{token}"),
+            file_base: format!("https://api.telegram.org/file/bot{token}"),
+            inbox_dir,
             allowed_users,
             username: OnceLock::new(),
         })
@@ -211,7 +221,10 @@ impl Telegram {
         if rest.as_bytes()[end] != b'@' {
             return text;
         }
-        let name = rest[end + 1..].split_whitespace().next().unwrap_or_default();
+        let name = rest[end + 1..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
         match self.username.get() {
             Some(me) if me == name => &text[..1 + end],
             _ => text,
@@ -287,13 +300,27 @@ impl Telegram {
                         offset = offset.max(id + 1);
                     }
 
-                    match self.parse_update(&update) {
-                        Some(inbound) => {
-                            if tx.send(inbound).await.is_err() {
-                                return;
-                            }
+                    let Some((mut inbound, wanted)) = self.parse_update(&update) else {
+                        continue;
+                    };
+
+                    // The download happens here, on the poll loop, rather than
+                    // on a task of its own. A batch of updates is one person's
+                    // messages in the order they sent them, and keeping that
+                    // order is worth more than overlapping their own transfers.
+                    // What it costs is this bot's polling for the length of the
+                    // transfer, bounded by `inbox::MAX_BYTES` and a per-request
+                    // timeout — and that is all it costs, because the core and
+                    // every other channel are on other tasks.
+                    if !wanted.is_empty() {
+                        let fetched = self.fetch_all(&inbound.thread, wanted).await;
+                        if let InboundKind::Text { files, .. } = &mut inbound.kind {
+                            *files = fetched;
                         }
-                        None => continue,
+                    }
+
+                    if tx.send(inbound).await.is_err() {
+                        return;
                     }
                 }
             }
@@ -303,8 +330,13 @@ impl Telegram {
     }
 
     /// Turn one update into an [`Inbound`], dropping anything unauthorized or
-    /// uninteresting.
-    fn parse_update(&self, update: &Value) -> Option<Inbound> {
+    /// uninteresting, and report the files it refers to.
+    ///
+    /// The files come back as ids to fetch rather than fetched, so this stays a
+    /// pure function of the update: the tests drive the real parser over real
+    /// captured updates without a network in reach, which is what kept the
+    /// caption and thread-id rules honest. The caller does the fetching.
+    fn parse_update(&self, update: &Value) -> Option<(Inbound, Vec<Want>)> {
         if let Some(callback) = update.get("callback_query") {
             let user_id = user_id(callback.get("from"))?;
             if !self.is_allowed(&user_id) {
@@ -324,15 +356,18 @@ impl Telegram {
                 _ => return None,
             };
 
-            return Some(Inbound {
-                thread: thread_key(callback.get("message")?)?,
-                user_id,
-                kind: InboundKind::Decision {
-                    allow,
-                    ack: callback.get("id").and_then(Value::as_str)?.to_string(),
-                    question: question.to_string(),
+            return Some((
+                Inbound {
+                    thread: thread_key(callback.get("message")?)?,
+                    user_id,
+                    kind: InboundKind::Decision {
+                        allow,
+                        ack: callback.get("id").and_then(Value::as_str)?.to_string(),
+                        question: question.to_string(),
+                    },
                 },
-            });
+                Vec::new(),
+            ));
         }
 
         let message = update.get("message")?;
@@ -359,29 +394,128 @@ impl Telegram {
         // Menu taps in a group arrive addressed to the bot
         // (`/new@omatether_bot`); make those read as what was tapped.
         let text = self.own_command(text);
+        let wanted = wants(message);
 
-        if text.is_empty() {
-            // Silence here is the bug this exists to prevent: a voice note or
-            // a bare photo used to vanish with nothing in the chat and nothing
+        if text.is_empty() && wanted.is_empty() {
+            // Silence here is the bug this exists to prevent: a message we
+            // cannot act on used to vanish with nothing in the chat and nothing
             // in the log, which is indistinguishable from the bridge being
-            // down.
-            tracing::info!(thread = %thread, "message with no text to act on");
-            return Some(Inbound {
+            // down. What is left in here is now narrow — a sticker, a location,
+            // a poll — because anything with a file in it has a file to pass on.
+            tracing::info!(thread = %thread, "message with nothing to act on");
+            return Some((
+                Inbound {
+                    thread,
+                    user_id,
+                    kind: InboundKind::Unsupported(
+                        "There is nothing in that I can pass on. Send words, a \
+                         photo or a file — a caption comes through too."
+                            .to_string(),
+                    ),
+                },
+                Vec::new(),
+            ));
+        }
+
+        Some((
+            Inbound {
                 thread,
                 user_id,
-                kind: InboundKind::Unsupported(
-                    "I can only read text. Send words — or a photo with a \
-                     caption — and I will pass it to the agent."
-                        .to_string(),
-                ),
+                // Filled in by the caller once the bytes are down.
+                kind: InboundKind::Text {
+                    text: text.to_string(),
+                    files: Vec::new(),
+                },
+            },
+            wanted,
+        ))
+    }
+
+    /// Fetch every file in one message, in order, and report each outcome.
+    ///
+    /// One that fails is still reported — as an [`Attachment`] whose `saved` is
+    /// the reason — because the person watching their phone attached it, and a
+    /// reply that never mentions it reads as an answer to a different message.
+    async fn fetch_all(&self, thread: &ThreadKey, wanted: Vec<Want>) -> Vec<Attachment> {
+        let mut files = Vec::with_capacity(wanted.len());
+
+        for want in wanted {
+            let saved = match self.fetch(thread, &want).await {
+                Ok(path) => {
+                    tracing::info!(thread = %thread, "received {} -> {}", want.name, path.display());
+                    Ok(path)
+                }
+                Err(e) => {
+                    // `{e:#}` for the same reason getUpdates uses it: the outer
+                    // context names the call, and the cause is further down.
+                    tracing::warn!(thread = %thread, "could not fetch {}: {e:#}", want.name);
+                    Err(format!("{e:#}"))
+                }
+            };
+            files.push(Attachment {
+                name: want.name,
+                mime: want.mime,
+                size: want.size,
+                saved,
             });
         }
 
-        Some(Inbound {
-            thread,
-            user_id,
-            kind: InboundKind::Text(text.to_string()),
-        })
+        // On the way past, while we are already doing filesystem work for this
+        // thread. An inbox nobody prunes is a disk that fills months later.
+        inbox::prune(&self.inbox_dir);
+        files
+    }
+
+    /// `getFile` for the path, then a plain GET for the bytes.
+    ///
+    /// The Bot API will not serve a file over 20 MB at all — `getFile` answers
+    /// "file is too big" — so the size Telegram already told us in the update is
+    /// checked first, to turn that into a sentence naming the actual size
+    /// instead of an API error.
+    async fn fetch(&self, thread: &ThreadKey, want: &Want) -> Result<PathBuf> {
+        if want.size > inbox::MAX_BYTES {
+            bail!(
+                "it is {} — Telegram will not send a bot anything over {}",
+                inbox::human(want.size),
+                inbox::human(inbox::MAX_BYTES)
+            );
+        }
+
+        let file = self
+            .call("getFile", json!({ "file_id": want.file_id }))
+            .await?;
+        let remote = file
+            .get("file_path")
+            .and_then(Value::as_str)
+            .context("getFile returned no file_path")?;
+
+        let bytes = self
+            .http
+            .get(format!("{}/{}", self.file_base, remote))
+            // Overrides the client's poll-shaped default: a download is a
+            // transfer, not a long poll, and a stalled one must not wedge
+            // inbound for this bot.
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
+            .context("downloading the file from telegram")?
+            .error_for_status()
+            .context("downloading the file from telegram")?
+            .bytes()
+            .await
+            .context("reading the download")?;
+
+        // The update's `file_size` is the only pre-check there is, and it is
+        // optional; re-check what actually arrived before it goes to disk.
+        if bytes.len() as u64 > inbox::MAX_BYTES {
+            bail!(
+                "it is {}, which is over the limit",
+                inbox::human(bytes.len() as u64)
+            );
+        }
+
+        inbox::save(&self.inbox_dir, thread, &want.name, &bytes)
+            .with_context(|| format!("saving {} to the inbox", want.name))
     }
 
     fn is_allowed(&self, user_id: &str) -> bool {
@@ -494,6 +628,89 @@ fn is_parse_failure(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("can't parse entities")
 }
 
+/// A file Telegram is holding for us, before anything has been fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Want {
+    file_id: String,
+    /// What it will be called on disk. Telegram names a document and nothing
+    /// else, so the rest get a name describing what they are — which is what
+    /// the agent sees in the prompt, and `photo.jpg` reads better there than a
+    /// file_unique_id would.
+    name: String,
+    mime: String,
+    size: u64,
+}
+
+/// Every file in one message.
+///
+/// A `Vec` even though Telegram sends one media per message — an album arrives
+/// as several updates, not one — because the seam carries a list and a channel
+/// that batches would otherwise have nowhere to put the second file.
+///
+/// Stickers, locations, polls and contacts are deliberately absent: a `.webp`
+/// of a cartoon on disk is not something an agent can do anything useful with,
+/// and pretending otherwise would spend a turn to be told so.
+fn wants(message: &Value) -> Vec<Want> {
+    // Largest first is not guaranteed by the docs — "available sizes" — so the
+    // biggest is chosen rather than the last. A phone sends a thumbnail and a
+    // full-resolution copy in the same array, and the thumbnail is the one an
+    // agent cannot read the text in.
+    if let Some(sizes) = message.get("photo").and_then(Value::as_array) {
+        let largest = sizes.iter().max_by_key(|size| {
+            size.get("file_size")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| {
+                    let dimension = |name| size.get(name).and_then(Value::as_u64).unwrap_or(0);
+                    dimension("width") * dimension("height")
+                })
+        });
+        if let Some(want) = largest.and_then(|size| want(size, "photo.jpg", "image/jpeg")) {
+            return vec![want];
+        }
+    }
+
+    const MEDIA: [(&str, &str, &str); 6] = [
+        ("document", "file", "application/octet-stream"),
+        ("video", "video.mp4", "video/mp4"),
+        ("animation", "animation.mp4", "video/mp4"),
+        ("audio", "audio", "audio/mpeg"),
+        // A voice note comes through as a file rather than as "I can't read
+        // that". Most agents will say they cannot listen to it, which is a
+        // true answer the person can act on; one with a transcriber on PATH
+        // can do better, and neither outcome is this adapter's call to make.
+        ("voice", "voice.ogg", "audio/ogg"),
+        ("video_note", "video-note.mp4", "video/mp4"),
+    ];
+
+    for (field, name, mime) in MEDIA {
+        if let Some(want) = message.get(field).and_then(|m| want(m, name, mime)) {
+            return vec![want];
+        }
+    }
+
+    Vec::new()
+}
+
+/// One media object — they all carry `file_id`, and most carry the rest.
+fn want(media: &Value, default_name: &str, default_mime: &str) -> Option<Want> {
+    let file_id = media.get("file_id").and_then(Value::as_str)?.to_string();
+    Some(Want {
+        file_id,
+        name: media
+            .get("file_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(default_name)
+            .to_string(),
+        mime: media
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .unwrap_or(default_mime)
+            .to_string(),
+        size: media.get("file_size").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
 fn user_id(from: Option<&Value>) -> Option<String> {
     from?
         .get("id")
@@ -543,12 +760,25 @@ mod tests {
     use super::*;
 
     fn telegram() -> Telegram {
-        Telegram::new("test-token", vec!["42".into()]).unwrap()
+        // No test in here fetches anything, so the inbox is never written to;
+        // `parse_update` is pure by design, and keeping it that way is what
+        // lets these run with no network and no scratch directory.
+        Telegram::new(
+            "test-token",
+            vec!["42".into()],
+            PathBuf::from("/nonexistent"),
+        )
+        .unwrap()
+    }
+
+    /// The parse, with the files it asked for.
+    fn parse(tg: &Telegram, update: &Value) -> Option<(Inbound, Vec<Want>)> {
+        tg.parse_update(update)
     }
 
     #[test]
     fn empty_allowlist_is_refused() {
-        assert!(Telegram::new("t", vec![]).is_err());
+        assert!(Telegram::new("t", vec![], PathBuf::from("/nonexistent")).is_err());
     }
 
     #[test]
@@ -571,7 +801,10 @@ mod tests {
         assert_eq!(tg.own_command("email a@b.com"), "email a@b.com");
         // Before whoami has run there is nothing to match against.
         let unknown = telegram();
-        assert_eq!(unknown.own_command("/new@omatether_bot"), "/new@omatether_bot");
+        assert_eq!(
+            unknown.own_command("/new@omatether_bot"),
+            "/new@omatether_bot"
+        );
     }
 
     #[test]
@@ -585,8 +818,8 @@ mod tests {
                 "text": "/status@omatether_bot"
             }
         });
-        match tg.parse_update(&update).unwrap().kind {
-            InboundKind::Text(t) => assert_eq!(t, "/status"),
+        match parse(&tg, &update).unwrap().0.kind {
+            InboundKind::Text { text, .. } => assert_eq!(text, "/status"),
             other => panic!("expected text, got {other:?}"),
         }
     }
@@ -597,7 +830,7 @@ mod tests {
             "update_id": 1,
             "message": { "from": { "id": 999 }, "chat": { "id": 5 }, "text": "hi" }
         });
-        assert!(telegram().parse_update(&update).is_none());
+        assert!(parse(&telegram(), &update).is_none());
     }
 
     #[test]
@@ -606,16 +839,17 @@ mod tests {
             "update_id": 1,
             "message": { "from": { "id": 42 }, "chat": { "id": 5 }, "text": "  hello  " }
         });
-        let inbound = telegram().parse_update(&update).unwrap();
+        let (inbound, wanted) = parse(&telegram(), &update).unwrap();
         assert_eq!(inbound.thread.to_string(), "telegram:5");
+        assert!(wanted.is_empty(), "no files to fetch for a plain message");
         match inbound.kind {
-            InboundKind::Text(t) => assert_eq!(t, "hello"),
+            InboundKind::Text { text, .. } => assert_eq!(text, "hello"),
             other => panic!("expected text, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_photo_caption_is_the_prompt() {
+    fn a_photo_caption_is_the_prompt_and_the_photo_comes_with_it() {
         // Sending a screenshot with a question is a natural thing to do from a
         // phone, and the words are in `caption`, not `text`.
         let update = json!({
@@ -625,40 +859,122 @@ mod tests {
                 "photo": [{ "file_id": "x" }], "caption": "what is wrong here?"
             }
         });
-        match telegram().parse_update(&update).unwrap().kind {
-            InboundKind::Text(t) => assert_eq!(t, "what is wrong here?"),
+        let (inbound, wanted) = parse(&telegram(), &update).unwrap();
+        match inbound.kind {
+            InboundKind::Text { text, .. } => assert_eq!(text, "what is wrong here?"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        assert_eq!(wanted.len(), 1);
+        assert_eq!(wanted[0].file_id, "x");
+    }
+
+    #[test]
+    fn the_biggest_copy_of_a_photo_is_the_one_fetched() {
+        // A phone sends the same picture several times over. The thumbnail is
+        // the one whose text an agent cannot read, and the array is documented
+        // as "available sizes" rather than sorted, so size decides.
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "from": { "id": 42 }, "chat": { "id": 5 },
+                "photo": [
+                    { "file_id": "thumb", "file_size": 1200, "width": 90, "height": 60 },
+                    { "file_id": "full", "file_size": 480_000, "width": 1280, "height": 960 },
+                    { "file_id": "middle", "file_size": 42_000, "width": 320, "height": 240 }
+                ]
+            }
+        });
+        let (_, wanted) = parse(&telegram(), &update).unwrap();
+        assert_eq!(wanted[0].file_id, "full");
+        assert_eq!(wanted[0].name, "photo.jpg");
+        assert_eq!(wanted[0].size, 480_000);
+    }
+
+    #[test]
+    fn a_bare_photo_is_a_prompt_on_its_own() {
+        // It used to be "I can only read text". There is now a file to hand
+        // over, so the turn runs with the picture and no words.
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "from": { "id": 42 }, "chat": { "id": 5 },
+                "photo": [{ "file_id": "x", "file_size": 900 }]
+            }
+        });
+        let (inbound, wanted) = parse(&telegram(), &update).unwrap();
+        assert_eq!(wanted.len(), 1);
+        match inbound.kind {
+            InboundKind::Text { text, .. } => assert!(text.is_empty()),
             other => panic!("expected text, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_message_we_cannot_read_still_gets_an_answer() {
-        // A voice note used to be dropped in silence, which from the phone
-        // looks exactly like the bridge being down.
+    fn a_document_keeps_the_name_and_type_telegram_gave_it() {
         let update = json!({
             "update_id": 1,
             "message": {
                 "from": { "id": 42 }, "chat": { "id": 5 },
-                "voice": { "file_id": "x", "duration": 3 }
+                "document": {
+                    "file_id": "d1", "file_name": "trace.log",
+                    "mime_type": "text/plain", "file_size": 2048
+                },
+                "caption": "why does this end here?"
             }
         });
-        let inbound = telegram().parse_update(&update).unwrap();
+        let (_, wanted) = parse(&telegram(), &update).unwrap();
+        assert_eq!(wanted[0].name, "trace.log");
+        assert_eq!(wanted[0].mime, "text/plain");
+        assert_eq!(wanted[0].size, 2048);
+    }
+
+    #[test]
+    fn a_voice_note_is_handed_over_rather_than_refused() {
+        // Most agents will answer that they cannot listen to it — which is a
+        // true answer the person can act on, and not this adapter's call to
+        // pre-empt.
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "from": { "id": 42 }, "chat": { "id": 5 },
+                "voice": { "file_id": "v1", "duration": 3, "mime_type": "audio/ogg" }
+            }
+        });
+        let (inbound, wanted) = parse(&telegram(), &update).unwrap();
+        assert_eq!(wanted[0].name, "voice.ogg");
+        assert!(matches!(inbound.kind, InboundKind::Text { .. }));
+    }
+
+    #[test]
+    fn a_message_we_cannot_read_still_gets_an_answer() {
+        // A sticker carries no words and nothing worth putting on disk. It used
+        // to be dropped in silence, which from the phone looks exactly like the
+        // bridge being down.
+        let update = json!({
+            "update_id": 1,
+            "message": {
+                "from": { "id": 42 }, "chat": { "id": 5 },
+                "sticker": { "file_id": "s1", "emoji": "🎉" }
+            }
+        });
+        let (inbound, wanted) = parse(&telegram(), &update).unwrap();
         assert_eq!(inbound.thread.to_string(), "telegram:5");
+        assert!(wanted.is_empty());
         match inbound.kind {
-            InboundKind::Unsupported(note) => assert!(note.contains("text")),
+            InboundKind::Unsupported(note) => assert!(note.contains("Send words")),
             other => panic!("expected unsupported, got {other:?}"),
         }
     }
 
     #[test]
     fn strangers_get_no_answer_at_all() {
-        // Not even the "I can only read text" note: replying would confirm the
-        // bot exists to whoever found it.
+        // Not even the "nothing in that I can pass on" note: replying would
+        // confirm the bot exists to whoever found it.
         let update = json!({
             "update_id": 1,
             "message": { "from": { "id": 999 }, "chat": { "id": 5 }, "voice": {} }
         });
-        assert!(telegram().parse_update(&update).is_none());
+        assert!(parse(&telegram(), &update).is_none());
     }
 
     #[test]
@@ -692,7 +1008,7 @@ mod tests {
             }
         });
         assert_eq!(
-            telegram().parse_update(&reply).unwrap().thread.to_string(),
+            parse(&telegram(), &reply).unwrap().0.thread.to_string(),
             "telegram:5"
         );
 
@@ -704,7 +1020,7 @@ mod tests {
             }
         });
         assert_eq!(
-            telegram().parse_update(&topic).unwrap().thread.to_string(),
+            parse(&telegram(), &topic).unwrap().0.thread.to_string(),
             "telegram:5:77"
         );
     }
@@ -718,7 +1034,7 @@ mod tests {
                 "message": { "chat": { "id": 5 } }
             }
         });
-        match telegram().parse_update(&update).unwrap().kind {
+        match parse(&telegram(), &update).unwrap().0.kind {
             InboundKind::Decision {
                 allow,
                 ack,
@@ -744,7 +1060,7 @@ mod tests {
                 "message": { "chat": { "id": 5 } }
             }
         });
-        assert!(telegram().parse_update(&update).is_none());
+        assert!(parse(&telegram(), &update).is_none());
     }
 
     #[test]
@@ -769,7 +1085,7 @@ mod tests {
                 "message": { "chat": { "id": 5 } }
             }
         });
-        match telegram().parse_update(&update).unwrap().kind {
+        match parse(&telegram(), &update).unwrap().0.kind {
             InboundKind::Decision {
                 allow, question, ..
             } => {

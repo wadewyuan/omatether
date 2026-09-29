@@ -34,3 +34,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# The paused clock, for the tests that check a timing window without waiting
+# one out. A dev-dependency rather than a feature on the entry above, so the
+# service that has to keep real time is never built with it.
+tokio = { version = "1", features = ["test-util"] }

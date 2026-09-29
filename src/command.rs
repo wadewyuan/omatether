@@ -112,6 +112,10 @@ omatether — your coding agent, over chat
 Anything else is sent to the agent as typed, including its own \
 slash commands.
 
+Send a photo, a screenshot or a file and it is saved where the agent \
+can open it; anything you type with it comes through as the prompt. \
+Received files are deleted after a week.
+
 Threads start in auto mode: tool calls run without asking, and you \
 see each one in the reply as it happens. /auto off puts the gate \
 back for this thread — Allow/Deny before every Bash, Write and Edit.

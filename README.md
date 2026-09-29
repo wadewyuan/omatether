@@ -121,6 +121,40 @@ thing stays behind the tailnet with nothing exposed.
 Anything else goes to the agent as typed — including its own slash commands,
 many of which are prompt expansions, so `/review` just works.
 
+### Photos and files
+
+Send a screenshot, a photo or a file and it is downloaded to
+`$XDG_STATE_HOME/omatether/in/` and handed to the agent as a path to open, with
+whatever you typed alongside it as the prompt:
+
+```
+what is wrong here?
+[attachment: shot.png — /home/you/.local/state/omatether/in/telegram-5/…-shot.png (image/png, 200 kB)]
+```
+
+A path rather than an upload, because every agent here is a CLI with
+filesystem tools: Claude Code opens an image with `Read`, Codex and Pi read
+files, and the detached tier gets the same string as its prompt. Nothing about
+it is per-agent, and an agent that cannot read that kind of file says so in the
+reply.
+
+A photo with no caption is a prompt on its own now. Voice notes are handed over
+too — most agents will answer that they cannot listen to one, which is at least
+a true answer. The limit is 20 MB, which is Telegram's own ceiling for what it
+will send a bot, applied to both channels; anything larger is named in the
+reply with the reason rather than quietly dropped. Files are written 0600 in a
+0700 directory and deleted after a week.
+
+The download happens *after* the allowlist check on both channels — a stranger's
+attachment is never fetched, never written to this machine and never opened.
+
+One send is not always one message: iMessage delivers a photo and its caption as
+two, microseconds apart, and a Telegram album is one message per photo. So a
+prompt waits about 600ms for the rest of itself and goes to the agent as one
+turn. The indicator comes up the moment the first part lands, so the wait is
+invisible. `/stop`, `/allow` and `/deny` never wait — they answer the turn that
+is already running.
+
 ### Models
 
 `/model opus` switches the model without starting a new session — the only one
@@ -366,6 +400,7 @@ bridge needs. See `src/agent.rs`.
 | `src/codex.rs` | `codex exec --json`: per-turn process, `resume` for continuity. |
 | `src/tmux.rs` | The detached tier, for agents with no structured output. |
 | `src/channel/mod.rs` | Seam A: send, edit, ask, acknowledge. |
+| `src/channel/inbox.rs` | Where a file someone sent lands on disk. |
 | `src/channel/telegram.rs` | Bot API client and the long-poll loop. |
 | `src/core.rs` | The router: threads ↔ sessions, dispatch, flushing. |
 | `src/render.rs` | Debounced edit-in-place message building. |

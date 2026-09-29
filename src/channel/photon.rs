@@ -24,7 +24,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-use super::{Channel, Inbound, InboundKind, MessageId, ThreadKey};
+use super::{inbox, Attachment, Channel, Inbound, InboundKind, MessageId, ThreadKey};
 
 pub const CHANNEL: &str = "photon";
 
@@ -40,6 +40,9 @@ pub struct Photon {
     /// with PHOTON_SIDECAR_WATCH_STDIN=1.
     _child: Child,
     allowed_users: Vec<String>,
+    /// Where the sidecar writes received files. Held so a path it reports can
+    /// be checked against it — see [`Self::fetch_files`].
+    inbox_dir: PathBuf,
 }
 
 pub struct Config {
@@ -52,6 +55,8 @@ pub struct Config {
     pub port: u16,
     /// Phone numbers (E.164) permitted to talk to this bridge.
     pub allowed_users: Vec<String>,
+    /// Where received files are written. See [`super::inbox`].
+    pub inbox_dir: PathBuf,
 }
 
 impl Photon {
@@ -86,6 +91,7 @@ impl Photon {
             .env("PHOTON_PROJECT_SECRET", &config.project_secret)
             .env("PHOTON_SIDECAR_PORT", port.to_string())
             .env("PHOTON_SIDECAR_TOKEN", &token)
+            .env("PHOTON_SIDECAR_INBOX_DIR", &config.inbox_dir)
             // Bind the sidecar's life to ours. Without this a crashed
             // omatether leaves a process holding the iMessage line.
             .env("PHOTON_SIDECAR_WATCH_STDIN", "1")
@@ -117,6 +123,7 @@ impl Photon {
             token,
             _child: child,
             allowed_users: config.allowed_users,
+            inbox_dir: config.inbox_dir,
         })
     }
 
@@ -171,13 +178,130 @@ impl Photon {
                 }
             };
 
-            if let Some(inbound) = parse_event(&self.allowed_users, &event, seen) {
-                if tx.send(inbound).await.is_err() {
-                    return Ok(());
+            let Some((mut inbound, wanted)) = parse_event(&self.allowed_users, &event, seen) else {
+                continue;
+            };
+
+            // Only now — past the allowlist — are the bytes asked for. The
+            // sidecar announces a file without reading it, so a stranger's
+            // attachment is never fetched, never written to this machine and
+            // never opened. Same ordering rule as `parse_event`'s, one step
+            // further out.
+            if let Some(wanted) = wanted {
+                let fetched = self.fetch_files(&inbound.thread, &wanted).await;
+                if let InboundKind::Text { files, .. } = &mut inbound.kind {
+                    *files = fetched;
                 }
+            }
+
+            if tx.send(inbound).await.is_err() {
+                return Ok(());
             }
         }
         Ok(())
+    }
+
+    /// Ask the sidecar to bring down one message's attachments.
+    ///
+    /// A failure to fetch is not a failure to deliver: the announced names come
+    /// back as attachments carrying the reason, so the reply says "I could not
+    /// open the photo you sent, because …" rather than answering as though
+    /// nothing had been attached.
+    async fn fetch_files(&self, thread: &ThreadKey, wanted: &Wanted) -> Vec<Attachment> {
+        let failed = |why: String| -> Vec<Attachment> {
+            wanted
+                .announced
+                .iter()
+                .map(|file| Attachment {
+                    saved: Err(why.clone()),
+                    ..file.clone()
+                })
+                .collect()
+        };
+
+        let files = match self.post_fetch(&wanted.message_id).await {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(thread = %thread, "photon /fetch failed: {e:#}");
+                return failed(format!("{e:#}"));
+            }
+        };
+
+        if files.is_empty() {
+            // The sidecar no longer had it: a replayed announcement after a
+            // reconnect, where the bytes were collected the first time round.
+            return failed("it was no longer available to download".to_string());
+        }
+
+        let attachments: Vec<Attachment> = files
+            .iter()
+            .map(|file| {
+                let name = str_field(file, "name", "attachment");
+                let saved = match file.get("error").and_then(Value::as_str) {
+                    Some(why) => Err(why.to_string()),
+                    None => match file.get("path").and_then(Value::as_str) {
+                        // Our own process wrote it, so this is not a trust
+                        // boundary so much as a statement of one: nothing
+                        // outside the inbox becomes a path in a prompt.
+                        Some(path) if PathBuf::from(path).starts_with(&self.inbox_dir) => {
+                            tracing::info!(thread = %thread, "received {name} -> {path}");
+                            Ok(PathBuf::from(path))
+                        }
+                        Some(path) => {
+                            tracing::warn!("photon reported a file outside the inbox: {path}");
+                            Err("it was saved somewhere unexpected".to_string())
+                        }
+                        None => Err("it was not saved".to_string()),
+                    },
+                };
+                Attachment {
+                    name,
+                    mime: str_field(file, "mime", "application/octet-stream"),
+                    size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
+                    saved,
+                }
+            })
+            .collect();
+
+        inbox::prune(&self.inbox_dir);
+        attachments
+    }
+
+    async fn post_fetch(&self, message_id: &str) -> Result<Vec<Value>> {
+        let response: Value = self
+            .http
+            .post(format!("{}/fetch", self.base))
+            .header("x-omatether-token", &self.token)
+            // Generous: this covers the whole download, which for a video off a
+            // phone is not instant. Bounded, because the inbound stream is on
+            // this task and a wedged transfer must not hold it forever.
+            .timeout(Duration::from_secs(180))
+            .json(&json!({ "messageId": message_id }))
+            .send()
+            .await
+            .context("photon /fetch")?
+            .json()
+            .await
+            .context("decoding photon /fetch")?;
+
+        // The Spectrum lesson, applied to our own sidecar: an envelope that
+        // says `ok:false` arrives with a 200, and reading the status alone
+        // reports success for a failure.
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!(
+                "{}",
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+
+        Ok(response
+            .get("files")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Post one message, choosing whether the sidecar renders it as markdown.
@@ -402,7 +526,7 @@ fn parse_event(
     allowed_users: &[String],
     event: &Value,
     seen: &mut std::collections::VecDeque<String>,
-) -> Option<Inbound> {
+) -> Option<(Inbound, Option<Wanted>)> {
     let space_id = event.get("spaceId").and_then(Value::as_str)?;
 
     let sender = event
@@ -418,11 +542,16 @@ fn parse_event(
 
     // Dedupe across reconnects. A short window is enough — a replay is
     // immediate, not hours later.
-    if let Some(id) = event.get("messageId").and_then(Value::as_str) {
-        if seen.contains(&id.to_string()) {
+    let message_id = event
+        .get("messageId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !message_id.is_empty() {
+        if seen.contains(&message_id) {
             return None;
         }
-        seen.push_back(id.to_string());
+        seen.push_back(message_id.clone());
         if seen.len() > 256 {
             seen.pop_front();
         }
@@ -440,25 +569,89 @@ fn parse_event(
         .unwrap_or_default()
         .trim();
 
-    if text.is_empty() {
-        tracing::info!(thread = %thread, "message with no text to act on");
-        return Some(Inbound {
-            thread,
-            user_id: sender,
-            kind: InboundKind::Unsupported(
-                "I can only read text. A voice note or an image on its own has \
-                 nothing in it for me to pass on — send words with it and I \
-                 will."
-                    .to_string(),
-            ),
-        });
+    // Metadata only: the sidecar announces a file without having read it, and
+    // the bytes are asked for by `Photon::fetch_files` once we are past the
+    // allowlist above.
+    let announced: Vec<Attachment> = event
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| Attachment {
+                    name: str_field(file, "name", "attachment"),
+                    mime: str_field(file, "mime", "application/octet-stream"),
+                    size: file.get("size").and_then(Value::as_u64).unwrap_or(0),
+                    saved: Err("it was not fetched".to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if text.is_empty() && announced.is_empty() {
+        tracing::info!(thread = %thread, "message with nothing to act on");
+        return Some((
+            Inbound {
+                thread,
+                user_id: sender,
+                kind: InboundKind::Unsupported(
+                    "There is nothing in that I can pass on. Send words, a \
+                     photo or a file — words sent with it come through too."
+                        .to_string(),
+                ),
+            },
+            None,
+        ));
     }
 
-    Some(Inbound {
-        thread,
-        user_id: sender,
-        kind: InboundKind::Text(text.to_string()),
-    })
+    // A message id is what `/fetch` is keyed on, so a file announced without
+    // one cannot be collected. Reported as such rather than dropped.
+    let wanted = match (announced.is_empty(), message_id.is_empty()) {
+        (true, _) => None,
+        (false, false) => Some(Wanted {
+            message_id,
+            announced,
+        }),
+        (false, true) => {
+            tracing::warn!(thread = %thread, "photon announced a file with no message id");
+            None
+        }
+    };
+
+    Some((
+        Inbound {
+            thread,
+            user_id: sender,
+            kind: InboundKind::Text {
+                text: text.to_string(),
+                // Filled in by the caller, which is the only place that can
+                // ask for them.
+                files: wanted
+                    .as_ref()
+                    .map(|w| w.announced.clone())
+                    .unwrap_or_default(),
+            },
+        },
+        wanted,
+    ))
+}
+
+/// One message's attachments, announced but not yet downloaded.
+#[derive(Debug, Clone)]
+struct Wanted {
+    message_id: String,
+    /// What the sidecar said is there, kept so a failed download can still be
+    /// described by name.
+    announced: Vec<Attachment>,
+}
+
+fn str_field(value: &Value, field: &str, fallback: &str) -> String {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// A sender is a phone number; compare on digits so +1 555 000 and +1555000 are
@@ -496,6 +689,11 @@ mod tests {
     }
 
     fn parse(event: Value) -> Option<Inbound> {
+        parse_event(&allowed(), &event, &mut VecDeque::new()).map(|(inbound, _)| inbound)
+    }
+
+    /// The parse and what it would go on to fetch.
+    fn parse_with_files(event: Value) -> Option<(Inbound, Option<Wanted>)> {
         parse_event(&allowed(), &event, &mut VecDeque::new())
     }
 
@@ -520,14 +718,14 @@ mod tests {
 
         assert_eq!(inbound.thread.to_string(), "photon:space-1");
         match inbound.kind {
-            InboundKind::Text(text) => assert_eq!(text, "run the tests"),
+            InboundKind::Text { text, .. } => assert_eq!(text, "run the tests"),
             other => panic!("expected text, got {other:?}"),
         }
     }
 
     #[test]
     fn a_message_we_cannot_read_still_gets_an_answer() {
-        // A voice note or a bare image reaches us with an empty `text`. It used
+        // A sticker or a tapback reaches us with no text and no file. It used
         // to be dropped — by the sidecar, and then again here — which from the
         // phone is indistinguishable from the bridge being down.
         let inbound = parse(json!({
@@ -539,9 +737,51 @@ mod tests {
         .expect("an allowed sender always gets an answer");
 
         match inbound.kind {
-            InboundKind::Unsupported(note) => assert!(note.contains("text")),
+            InboundKind::Unsupported(note) => assert!(note.contains("Send words")),
             other => panic!("expected unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_image_with_no_words_is_a_prompt_now() {
+        // This is the case that used to be "I can only read text".
+        let (inbound, wanted) = parse_with_files(json!({
+            "spaceId": "space-1",
+            "messageId": "m1",
+            "senderId": "+15551234567",
+            "text": "",
+            "files": [{ "name": "IMG_0042.HEIC", "mime": "image/heic", "size": 2_400_000 }]
+        }))
+        .expect("an image on its own is something to act on");
+
+        let wanted = wanted.expect("its bytes are worth asking for");
+        assert_eq!(wanted.message_id, "m1", "what /fetch is keyed on");
+        assert_eq!(wanted.announced[0].name, "IMG_0042.HEIC");
+        match inbound.kind {
+            InboundKind::Text { text, files } => {
+                assert!(text.is_empty());
+                assert_eq!(files.len(), 1);
+                // Announced, not fetched: nothing has been downloaded at this
+                // point, and the core must not be told otherwise.
+                assert!(files[0].saved.is_err());
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_strangers_attachment_is_never_even_asked_for() {
+        // The allowlist runs before anything is fetched, so an unknown number
+        // cannot make this machine download what they sent — the reason the
+        // sidecar announces a file rather than reading it.
+        assert!(parse_with_files(json!({
+            "spaceId": "space-1",
+            "messageId": "m1",
+            "senderId": "+19998887777",
+            "text": "look at this",
+            "files": [{ "name": "payload.bin", "mime": "application/octet-stream", "size": 10 }]
+        }))
+        .is_none());
     }
 
     #[test]
@@ -609,6 +849,7 @@ mod tests {
             project_secret: "s".into(),
             port: 8789,
             allowed_users: vec![],
+            inbox_dir: PathBuf::from("/nonexistent"),
         };
         assert!(config.allowed_users.is_empty());
     }

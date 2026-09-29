@@ -149,17 +149,26 @@ async fn serve(
     let state_path = state.unwrap_or_else(default_state_path);
     let store = Store::open(&state_path)?;
 
+    let state_dir = state_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    // Two directions, two directories: `out` is what we had to write down for
+    // the person to read, `in` is what they sent us.
+    let spill_dir = state_dir.join("out");
+    let inbox_dir = state_dir.join("in");
+
     // Every channel's inbound stream funnels into one receiver, so the core
     // selects over a single source no matter how many channels are configured.
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Inbound>(64);
     let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
 
-    if let Some(telegram) = start_telegram().await? {
+    if let Some(telegram) = start_telegram(inbox_dir.clone()).await? {
         merge(telegram.clone().start_polling(), inbound_tx.clone());
         channels.push(telegram);
     }
 
-    if let Some(photon) = start_photon(photon_sidecar).await? {
+    if let Some(photon) = start_photon(photon_sidecar, inbox_dir.clone()).await? {
         merge(photon.clone().start_streaming(), inbound_tx.clone());
         channels.push(photon);
     }
@@ -181,11 +190,6 @@ async fn serve(
     tracing::info!("default agent {default_agent}");
     tracing::info!("state {}", state_path.display());
 
-    let spill_dir = state_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("out");
-
     Core::new(store, channels, dir, default_agent, spill_dir)
         .run(inbound_rx)
         .await
@@ -205,7 +209,7 @@ fn omarchy_default_agent() -> String {
 }
 
 /// Telegram is configured when a token is present; absent is not an error.
-async fn start_telegram() -> Result<Option<Arc<Telegram>>> {
+async fn start_telegram(inbox_dir: PathBuf) -> Result<Option<Arc<Telegram>>> {
     let token = match std::env::var("OMATETHER_TELEGRAM_TOKEN") {
         Ok(token) => token,
         Err(_) => return Ok(None),
@@ -217,7 +221,7 @@ async fn start_telegram() -> Result<Option<Arc<Telegram>>> {
          comma separated.",
     )?;
 
-    let telegram = Arc::new(Telegram::new(&token, allowed.clone())?);
+    let telegram = Arc::new(Telegram::new(&token, allowed.clone(), inbox_dir)?);
     let username = telegram
         .whoami()
         .await
@@ -234,7 +238,7 @@ async fn start_telegram() -> Result<Option<Arc<Telegram>>> {
 }
 
 /// Photon is configured when a project id is present.
-async fn start_photon(sidecar: Option<PathBuf>) -> Result<Option<Arc<Photon>>> {
+async fn start_photon(sidecar: Option<PathBuf>, inbox_dir: PathBuf) -> Result<Option<Arc<Photon>>> {
     let project_id = match std::env::var("OMATETHER_PHOTON_PROJECT_ID") {
         Ok(id) => id,
         Err(_) => return Ok(None),
@@ -263,6 +267,7 @@ async fn start_photon(sidecar: Option<PathBuf>) -> Result<Option<Arc<Photon>>> {
             project_secret,
             port,
             allowed_users: allowed.clone(),
+            inbox_dir,
         })
         .await?,
     );

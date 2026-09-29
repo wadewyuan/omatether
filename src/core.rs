@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use crate::agent::{self, Agent};
-use crate::channel::{Channel, Inbound, InboundKind, ThreadKey};
+use crate::channel::{inbox, Attachment, Channel, Inbound, InboundKind, ThreadKey};
 use crate::command::{self, Command, ModelRequest};
 use crate::event::{AgentEvent, Decision};
 use crate::outbox::{OutJob, Outbox};
@@ -33,6 +33,26 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 /// inside the per-chat budget even alongside the flushes, and typing is the
 /// one job the outbox drops rather than retries.
 const TYPING_INTERVAL: Duration = Duration::from_secs(4);
+
+/// How long a message waits for the rest of itself before becoming a turn.
+///
+/// **One send is not one message.** iMessage delivers a photo with a caption as
+/// two: the attachment arrived here 35 microseconds ahead of the words, took
+/// the turn, and the words came back "Busy — a turn is already running". The
+/// agent got a picture with no question attached. Telegram albums split the
+/// same way, one update per photo.
+///
+/// So a prompt is held briefly and anything else from that thread joins it.
+/// The window is sized against what actually happens — a platform splitting one
+/// send delivers the halves microseconds apart, not seconds — and it is invisible
+/// next to a turn that takes seconds, because the working indicator goes up the
+/// moment the first half lands rather than when the window closes.
+const COALESCE: Duration = Duration::from_millis(600);
+
+/// The longest a thread will hold anything, however fast the messages keep
+/// coming. Without it, a run of messages arriving inside the window each
+/// extends it and the turn never starts.
+const COALESCE_MAX: Duration = Duration::from_secs(3);
 
 /// Tools that require a human decision. Everything else is approved by
 /// omatether without bothering anyone.
@@ -91,6 +111,23 @@ struct Thread {
     turn_running: bool,
 }
 
+/// One thread's messages, collected but not yet sent as a turn.
+///
+/// Exists because one send is not one message — see [`COALESCE`]. Held beside
+/// `threads` rather than inside a [`Thread`], for the same reason `outboxes` and
+/// `typing` are: a message can be waiting for a thread that has no session yet,
+/// and starting one to have somewhere to put it would spawn an agent for a
+/// message that might turn out to be nothing but a failed download.
+struct Held {
+    /// The words of each message, in the order they arrived.
+    parts: Vec<String>,
+    files: Vec<Attachment>,
+    /// Released once nothing new has arrived for [`COALESCE`]…
+    due: tokio::time::Instant,
+    /// …or once this passes, whichever comes first.
+    limit: tokio::time::Instant,
+}
+
 struct PendingPermission {
     request_id: String,
     tool: String,
@@ -131,6 +168,8 @@ pub struct Core {
     /// session it belonged to is gone, and `/new` and `/cd` drop sessions
     /// mid-turn.
     typing: HashMap<ThreadKey, std::time::Instant>,
+    /// Messages collected but not yet sent as a turn. See [`COALESCE`].
+    held: HashMap<ThreadKey, Held>,
     /// Each thread's last finished turn in full, every tool call included, for
     /// `/log`. Memory only: it is a look back at what just happened, not a
     /// record, and it outlives the session for the same reason `outboxes` do.
@@ -158,6 +197,7 @@ impl Core {
             fresh_cwd: work_dir(),
             threads: HashMap::new(),
             typing: HashMap::new(),
+            held: HashMap::new(),
             transcripts: HashMap::new(),
             agent_tx,
             agent_rx,
@@ -169,6 +209,12 @@ impl Core {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            // Recomputed each time round: a message arriving during the window
+            // moves the deadline out, and the next pass through here is what
+            // notices. `sleep_until` on a far-off instant when nothing is held,
+            // rather than an Option, so the branch is always well-formed.
+            let release_at = self.next_release();
+
             tokio::select! {
                 Some(message) = inbound.recv() => {
                     if let Err(e) = self.on_inbound(message).await {
@@ -179,6 +225,12 @@ impl Core {
                 Some((key, event)) = self.agent_rx.recv() => {
                     if let Err(e) = self.on_agent_event(&key, event).await {
                         tracing::error!("handling agent event: {e:#}");
+                    }
+                }
+
+                _ = tokio::time::sleep_until(release_at) => {
+                    if let Err(e) = self.release_due().await {
+                        tracing::error!("releasing a held message: {e:#}");
                     }
                 }
 
@@ -225,24 +277,125 @@ impl Core {
             }
             InboundKind::Unsupported(note) => self.say(&message.thread, &note),
 
-            InboundKind::Text(text) => match command::parse(&text) {
-                Command::Help => self.say(&message.thread, command::HELP),
-                Command::New => self.on_new(&message.thread).await,
-                Command::Stop => self.on_stop(&message.thread).await,
-                Command::Status => self.on_status(&message.thread).await,
-                Command::Cd(path) => self.on_cd(&message.thread, &path).await,
-                Command::Agent(name) => self.on_agent(&message.thread, &name).await,
-                Command::Model(want) => self.on_model(&message.thread, want).await,
-                Command::Attach => self.on_attach(&message.thread).await,
-                Command::Log => self.on_log(&message.thread),
-                Command::Auto(want) => self.on_auto(&message.thread, want).await,
-                Command::Allow => self.decide(&message.thread, Decision::allow(), None).await,
-                Command::Deny(why) => {
-                    self.decide(&message.thread, Decision::deny(why), None)
-                        .await
+            InboundKind::Text { text, files } => {
+                let command = command::parse(&text);
+
+                // A file sent with a *command* is not a prompt — a photo
+                // captioned `/status` is still `/status` — so files reach the
+                // agent on the `Prompt` arm alone. Logged rather than silent,
+                // because a file that went nowhere without a word said is the
+                // failure this whole path exists to stop.
+                if !files.is_empty() && !matches!(command, Command::Prompt(_)) {
+                    tracing::info!(
+                        thread = %message.thread,
+                        "{} file(s) sent with a command, not passed on",
+                        files.len()
+                    );
                 }
-                Command::Prompt(text) => self.on_prompt(&message.thread, &text).await,
-            },
+
+                if let Command::Prompt(text) = command {
+                    self.hold(&message.thread, text, files);
+                    return Ok(());
+                }
+
+                // A command about what is happening *now* must not wait behind
+                // a message that is still collecting itself, and must not
+                // release it either: `/stop` ends the running turn, and
+                // `/allow` answers the question on screen. Everything else runs
+                // in the order it was sent, which means after whatever was
+                // already waiting.
+                if !answers_the_moment(&command) {
+                    self.release(&message.thread).await?;
+                }
+
+                self.on_command(&message.thread, command).await
+            }
+        }
+    }
+
+    /// Add a message to what this thread is collecting, and move the deadline.
+    ///
+    /// The indicator goes up here rather than when the turn starts, so the
+    /// window costs nothing anyone can see.
+    fn hold(&mut self, key: &ThreadKey, text: String, files: Vec<Attachment>) {
+        let now = tokio::time::Instant::now();
+        let held = self.held.entry(key.clone()).or_insert_with(|| Held {
+            parts: Vec::new(),
+            files: Vec::new(),
+            due: now,
+            limit: now + COALESCE_MAX,
+        });
+
+        if !text.trim().is_empty() {
+            held.parts.push(text);
+        }
+        held.files.extend(files);
+        held.due = (now + COALESCE).min(held.limit);
+
+        self.refresh_typing(key);
+    }
+
+    /// When the earliest waiting message is due, or far enough away to mean
+    /// "never" while nothing is waiting.
+    fn next_release(&self) -> tokio::time::Instant {
+        self.held
+            .values()
+            .map(|held| held.due)
+            .min()
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))
+    }
+
+    async fn release_due(&mut self) -> Result<()> {
+        let now = tokio::time::Instant::now();
+        let ready: Vec<ThreadKey> = self
+            .held
+            .iter()
+            .filter(|(_, held)| held.due <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in ready {
+            self.release(&key).await?;
+        }
+        Ok(())
+    }
+
+    /// Send what this thread was collecting as one prompt. A no-op when there
+    /// is nothing waiting, which is what makes it safe to call before a
+    /// command.
+    async fn release(&mut self, key: &ThreadKey) -> Result<()> {
+        let Some(held) = self.held.remove(key) else {
+            return Ok(());
+        };
+
+        // Newline rather than a space: the parts were separate messages, and
+        // two sentences run together read as one badly-punctuated sentence.
+        let text = held.parts.join("\n");
+        match compose(&text, &held.files) {
+            Some(prompt) => self.on_prompt(key, &prompt).await,
+            // Nothing to send: no words, and not one file arrived. Say why
+            // instead of starting a turn about nothing.
+            None => self.say(key, &nothing_arrived(&held.files)),
+        }
+    }
+
+    async fn on_command(&mut self, key: &ThreadKey, command: Command) -> Result<()> {
+        match command {
+            Command::Help => self.say(key, command::HELP),
+            Command::New => self.on_new(key).await,
+            Command::Stop => self.on_stop(key).await,
+            Command::Status => self.on_status(key).await,
+            Command::Cd(path) => self.on_cd(key, &path).await,
+            Command::Agent(name) => self.on_agent(key, &name).await,
+            Command::Model(want) => self.on_model(key, want).await,
+            Command::Attach => self.on_attach(key).await,
+            Command::Log => self.on_log(key),
+            Command::Auto(want) => self.on_auto(key, want).await,
+            Command::Allow => self.decide(key, Decision::allow(), None).await,
+            Command::Deny(why) => self.decide(key, Decision::deny(why), None).await,
+            // Held and released as a turn by `hold`/`release`; a prompt does
+            // not reach here from a chat.
+            Command::Prompt(text) => self.on_prompt(key, &text).await,
         }
     }
 
@@ -324,6 +477,12 @@ impl Core {
     }
 
     async fn on_stop(&mut self, key: &ThreadKey) -> Result<()> {
+        // A message still inside its coalescing window has not become a turn
+        // yet, and "stop" plainly means don't. Dropped here, rather than left
+        // to start a turn half a second after being called off — the person
+        // can see what they just sent, and the interrupt has to cover it.
+        let dropped = self.held.remove(key).is_some();
+
         match self.threads.get_mut(key) {
             Some(thread) => {
                 thread.session.cancel().await?;
@@ -332,6 +491,7 @@ impl Core {
                 thread.pending = None;
                 self.say(key, "Stopped.")
             }
+            None if dropped => self.say(key, "Dropped that — nothing had started yet."),
             None => self.say(key, "Nothing running."),
         }
     }
@@ -1010,6 +1170,13 @@ impl Core {
     /// channel that cannot edit: those hold the whole turn back until it is
     /// finished, so the indicator is all there is for as long as it runs.
     fn is_working(&self, key: &ThreadKey) -> bool {
+        // A message still collecting itself is work about to happen. Without
+        // this the coalescing window is dead air on the phone — which is
+        // exactly what it was meant not to cost.
+        if self.held.contains_key(key) {
+            return true;
+        }
+
         let Some(thread) = self.threads.get(key) else {
             return false;
         };
@@ -1294,12 +1461,81 @@ impl Core {
 /// goes wrong: the agent wrote it. And on a channel that delivers only the
 /// answer, the agent has to know that it is only the answer that arrives, or
 /// it leaves the substance in narration nobody will see.
+/// Whether this command is about what is happening right now.
+///
+/// These three answer the live turn — the interrupt, and the two halves of a
+/// permission decision — so they run the moment they arrive, ahead of anything
+/// still being collected. The rest are ordinary instructions and take their
+/// turn in the order they were sent.
+fn answers_the_moment(command: &Command) -> bool {
+    matches!(command, Command::Stop | Command::Allow | Command::Deny(_))
+}
+
+/// The prompt one message becomes: what they typed, then where their files are.
+///
+/// A path rather than the bytes, because every agent here is a CLI with
+/// filesystem tools and a path is the one thing all of them understand — claude
+/// opens an image with `Read`, codex and pi read files, and the detached tier
+/// gets this string as argv. It is also why nothing about this is per-agent.
+///
+/// Files that failed to arrive are named too, with the reason. The person
+/// attached them; an answer that never mentions them reads as a reply to a
+/// different message, which is the exact shape of the bug this replaced.
+///
+/// `None` means there is nothing to send at all — no words, and nothing that
+/// made it to disk.
+fn compose(text: &str, files: &[Attachment]) -> Option<String> {
+    if files.is_empty() {
+        return (!text.trim().is_empty()).then(|| text.to_string());
+    }
+    if text.trim().is_empty() && files.iter().all(|f| f.saved.is_err()) {
+        return None;
+    }
+
+    let mut prompt = text.trim().to_string();
+    for file in files {
+        if !prompt.is_empty() {
+            prompt.push('\n');
+        }
+        prompt.push_str(&match &file.saved {
+            Ok(path) => format!(
+                "[attachment: {} — {} ({}, {})]",
+                file.name,
+                path.display(),
+                file.mime,
+                inbox::human(file.size)
+            ),
+            Err(why) => format!("[attachment {} could not be received: {why}]", file.name),
+        });
+    }
+    Some(prompt)
+}
+
+/// What to say when someone sent only files and not one of them arrived.
+fn nothing_arrived(files: &[Attachment]) -> String {
+    let reasons: Vec<String> = files
+        .iter()
+        .filter_map(|file| match &file.saved {
+            Err(why) => Some(format!("{}: {why}", file.name)),
+            Ok(_) => None,
+        })
+        .collect();
+
+    match reasons.len() {
+        0 => "There was nothing in that message for me to pass on.".to_string(),
+        _ => format!("I could not get {}.", reasons.join("; ")),
+    }
+}
+
 fn brief(can_edit: bool) -> String {
     let mut brief = String::from(
         "You are being driven from a chat app on the user's phone, not a terminal. \
          Lead with the answer and keep replies short. Do not paste logs, command \
          output or long code unless asked; say in a sentence what they showed. \
-         Prefer short paragraphs and lists to tables and wide code blocks.",
+         Prefer short paragraphs and lists to tables and wide code blocks. \
+         A file they send in the chat is saved to disk and appears in their \
+         message as an `[attachment: name — /path (type, size)]` line: open \
+         that path to see it, and say so if you cannot read that kind of file.",
     );
     if !can_edit {
         brief.push_str(
@@ -1726,6 +1962,9 @@ mod tests {
         /// What it offers, and what it was last told, for asserting on both.
         offers: Vec<String>,
         told: Arc<std::sync::Mutex<Option<Option<String>>>>,
+        /// Every prompt it was given, which is the only place the composed
+        /// text of a turn can be read back.
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl StubAgent {
@@ -1736,6 +1975,7 @@ mod tests {
                 refuses: None,
                 offers: Vec::new(),
                 told: Arc::new(std::sync::Mutex::new(None)),
+                prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -1786,7 +2026,8 @@ mod tests {
         fn is_busy(&self) -> bool {
             self.busy
         }
-        async fn prompt(&mut self, _text: &str) -> Result<()> {
+        async fn prompt(&mut self, text: &str) -> Result<()> {
+            self.prompts.lock().unwrap().push(text.to_string());
             Ok(())
         }
         async fn set_model(&mut self, model: Option<&str>) -> Result<Option<String>> {
@@ -2708,6 +2949,272 @@ mod tests {
 
         core.on_agent(&key, "codex").await.unwrap();
         assert_eq!(core.state(&key).unwrap().requested_model, None);
+    }
+
+    fn saved(name: &str, mime: &str, size: u64, path: &str) -> Attachment {
+        Attachment {
+            name: name.into(),
+            mime: mime.into(),
+            size,
+            saved: Ok(PathBuf::from(path)),
+        }
+    }
+
+    fn lost(name: &str, why: &str) -> Attachment {
+        Attachment {
+            name: name.into(),
+            mime: "image/jpeg".into(),
+            size: 0,
+            saved: Err(why.into()),
+        }
+    }
+
+    /// A message as a channel hands it over.
+    fn said(key: &ThreadKey, text: &str, files: Vec<Attachment>) -> Inbound {
+        Inbound {
+            thread: key.clone(),
+            user_id: "42".into(),
+            kind: InboundKind::Text {
+                text: text.to_string(),
+                files,
+            },
+        }
+    }
+
+    /// Give the thread a session that records what it is asked, so the text a
+    /// turn actually started with can be read back.
+    fn stub_session(core: &mut Core, key: &ThreadKey) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let agent = StubAgent::idle();
+        let prompts = agent.prompts.clone();
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(agent),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: false,
+            },
+        );
+        prompts
+    }
+
+    #[tokio::test]
+    async fn one_send_split_into_two_messages_is_one_turn() {
+        // What iMessage actually did with a photo and a caption: two messages,
+        // the attachment 35 microseconds ahead of the words. The image took the
+        // turn, the words came back "Busy — a turn is already running", and the
+        // agent answered a picture with no question attached.
+        let dir = std::env::temp_dir().join(format!("sb-coalesce-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        let prompts = stub_session(&mut core, &key);
+
+        core.on_inbound(said(
+            &key,
+            "",
+            vec![saved(
+                "IMG_1705.heic",
+                "image/heic",
+                1_800_000,
+                "/in/IMG_1705.heic",
+            )],
+        ))
+        .await
+        .unwrap();
+        core.on_inbound(said(&key, "what is on this board?", vec![]))
+            .await
+            .unwrap();
+
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "nothing starts while the message is still arriving"
+        );
+
+        core.release(&key).await.unwrap();
+        settle().await;
+
+        let started = prompts.lock().unwrap().clone();
+        assert_eq!(started.len(), 1, "one turn, not two: {started:?}");
+        assert!(started[0].contains("what is on this board?"));
+        assert!(started[0].contains("/in/IMG_1705.heic"));
+        assert!(
+            !channel.messages().iter().any(|m| m.contains("Busy")),
+            "nobody is told they are busy with their own message: {:?}",
+            channel.messages()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_window_closes_on_its_own_and_not_before() {
+        // The path the service actually runs: nothing calls `release`, the
+        // deadline does. On a paused clock, so the test costs no wall time.
+        let dir = std::env::temp_dir().join(format!("sb-window-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel, &dir);
+        let prompts = stub_session(&mut core, &key);
+
+        core.on_inbound(said(&key, "what changed today?", vec![]))
+            .await
+            .unwrap();
+
+        core.release_due().await.unwrap();
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "a message still inside its window has not become a turn"
+        );
+        assert!(core.next_release() <= tokio::time::Instant::now() + COALESCE);
+
+        tokio::time::sleep(COALESCE + Duration::from_millis(50)).await;
+        core.release_due().await.unwrap();
+
+        assert_eq!(prompts.lock().unwrap().len(), 1, "and then it does");
+        assert!(core.held.is_empty(), "released once, not on every pass");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_run_of_messages_cannot_hold_a_thread_open_forever() {
+        let dir = std::env::temp_dir().join(format!("sb-cap-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel, &dir);
+
+        core.hold(&key, "one".into(), Vec::new());
+        let first = core.held[&key].due;
+        let limit = core.held[&key].limit;
+
+        core.hold(&key, "two".into(), Vec::new());
+        let second = core.held[&key].due;
+
+        assert!(second >= first, "each message moves the deadline out");
+        assert!(second <= limit, "but never past the cap");
+        assert_eq!(limit, core.held[&key].limit, "which is fixed when it opens");
+        assert_eq!(core.held[&key].parts, vec!["one", "two"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stop_calls_off_a_message_that_has_not_started_yet() {
+        // `/stop` is one of the three that answer the live moment, so it does
+        // not wait behind the window — and what it stops has to include the
+        // message the person can see they just sent.
+        let dir = std::env::temp_dir().join(format!("sb-stop-held-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.on_inbound(said(&key, "rm the build dir", vec![]))
+            .await
+            .unwrap();
+        core.on_inbound(said(&key, "/stop", vec![])).await.unwrap();
+        settle().await;
+
+        assert!(
+            !core.held.contains_key(&key),
+            "called off, not merely delayed"
+        );
+        assert!(
+            channel.messages().iter().any(|m| m.contains("Dropped")),
+            "and said so: {:?}",
+            channel.messages()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_command_runs_after_what_was_sent_before_it() {
+        // Chronological order, which is the only one that is not surprising:
+        // the prompt was sent first, so it goes first.
+        let dir = std::env::temp_dir().join(format!("sb-order-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        let prompts = stub_session(&mut core, &key);
+
+        core.on_inbound(said(&key, "list the files", vec![]))
+            .await
+            .unwrap();
+        core.on_inbound(said(&key, "/status", vec![]))
+            .await
+            .unwrap();
+        settle().await;
+
+        assert_eq!(prompts.lock().unwrap().len(), 1, "the prompt was released");
+        assert!(!core.held.contains_key(&key));
+        assert!(
+            channel.messages().iter().any(|m| m.contains("agent")),
+            "and /status still answered: {:?}",
+            channel.messages()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_reaches_the_agent_as_a_path_to_open() {
+        // The whole design in one assertion: the bytes are on disk and the
+        // prompt says where. Nothing here is per-agent, because a path is what
+        // every one of them can act on.
+        let prompt = compose(
+            "what is wrong here?",
+            &[saved(
+                "shot.png",
+                "image/png",
+                204_800,
+                "/state/in/telegram-5/1-2-shot.png",
+            )],
+        )
+        .expect("words and a file are a prompt");
+
+        assert!(prompt.starts_with("what is wrong here?\n"));
+        assert!(prompt.contains("/state/in/telegram-5/1-2-shot.png"));
+        assert!(prompt.contains("image/png"));
+        assert!(prompt.contains("200 kB"));
+    }
+
+    #[test]
+    fn a_bare_photo_is_a_prompt_with_no_words() {
+        let prompt = compose(
+            "",
+            &[saved("shot.png", "image/png", 1024, "/state/in/x/shot.png")],
+        )
+        .expect("a photo on its own is worth a turn");
+        assert!(prompt.starts_with("[attachment: shot.png"));
+    }
+
+    #[test]
+    fn plain_text_is_left_exactly_as_it_was() {
+        // The common path must not gain a trailing anything.
+        assert_eq!(compose("run the tests", &[]).unwrap(), "run the tests");
+        assert_eq!(compose("   ", &[]), None);
+    }
+
+    #[test]
+    fn a_file_that_did_not_arrive_is_still_named_in_the_prompt() {
+        // The person attached it. An answer that never mentions it reads as a
+        // reply to a different message — the shape of the bug this replaced.
+        let prompt = compose(
+            "what is this?",
+            &[lost("clip.mov", "it is 48.0 MB, over the limit")],
+        )
+        .expect("the words alone are still a prompt");
+        assert!(prompt.contains("clip.mov"));
+        assert!(prompt.contains("48.0 MB"));
+    }
+
+    #[test]
+    fn a_message_that_was_only_a_file_that_failed_is_answered_not_asked() {
+        // No words and nothing on disk: there is no turn to run, so the reason
+        // goes back to the chat rather than to the agent.
+        let files = [lost("clip.mov", "it is 48.0 MB, over the limit")];
+        assert_eq!(compose("", &files), None);
+
+        let note = nothing_arrived(&files);
+        assert!(note.contains("clip.mov"), "{note}");
+        assert!(note.contains("48.0 MB"), "{note}");
     }
 
     #[test]

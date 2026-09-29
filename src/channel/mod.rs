@@ -8,12 +8,14 @@
 //! there has to arrive whole. [`Channel::can_edit`] is how the core learns
 //! which world it is in without knowing which channel it is talking to.
 
+pub mod inbox;
 mod markup;
 pub mod photon;
 pub mod photon_setup;
 pub mod telegram;
 pub mod telegram_setup;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -69,9 +71,35 @@ pub struct Inbound {
     pub kind: InboundKind,
 }
 
+/// A file someone sent, already on disk.
+///
+/// The channel adapter fetches the bytes, because that is where the platform's
+/// credentials are — the same reason the allowlist is enforced there. By the
+/// time the core sees one, the only question left is what to say about it in
+/// the prompt.
+///
+/// `saved` is a `Result` rather than an `Option` because a file that could not
+/// be fetched still has to be *said*: a 30 MB video the Bot API refuses to
+/// serve must reach the person as "too big for Telegram to send me", not as a
+/// message that looks delivered and never mentions their attachment again.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    /// Bytes, or zero where the platform did not say.
+    pub size: u64,
+    pub saved: Result<PathBuf, String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum InboundKind {
-    Text(String),
+    /// Words, files, or both. A photo with a caption is one message with both;
+    /// a bare screenshot is files with no words, which is a perfectly good
+    /// prompt now that the agent can open it.
+    Text {
+        text: String,
+        files: Vec<Attachment>,
+    },
     /// A tap on one of the permission buttons.
     Decision {
         allow: bool,
@@ -86,7 +114,9 @@ pub enum InboundKind {
         question: String,
     },
     /// Something the channel saw, recognized as addressed to us, and cannot
-    /// turn into a prompt — a voice note, a sticker, a photo with no caption.
+    /// turn into a prompt at all — a sticker, a tapback, a message whose only
+    /// content is a kind nothing can be done with. A photo or a document is no
+    /// longer one of these: it arrives as [`InboundKind::Text`] with a file.
     ///
     /// Carried through rather than dropped at the edge, because from the phone
     /// a dropped message and a broken bridge look identical: you sent

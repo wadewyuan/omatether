@@ -242,11 +242,12 @@ refused rather than applied to whatever is pending now.
 **A message is not always `text`.** A photo or a document carries its words in
 `caption`, and a voice note carries none at all. Reading only `text` dropped
 both — silently, with nothing in the log and nothing in the chat, which from a
-phone is indistinguishable from the bridge being down. Captions are now read as
-prompts, and anything with no words at all comes through as
-`InboundKind::Unsupported` so the sender is told rather than ignored. If you add
-a channel, the rule is: an allowed user who sent something always gets an
-answer, even if the answer is "I cannot read that".
+phone is indistinguishable from the bridge being down. Captions are read as
+prompts, the file itself now comes down with them (see "Attachments"), and
+whatever is left with neither words nor a file — a sticker, a location — comes
+through as `InboundKind::Unsupported` so the sender is told rather than ignored.
+If you add a channel, the rule is: an allowed user who sent something always
+gets an answer, even if the answer is "I cannot read that".
 
 **A failing poller used to say nothing useful.** `getUpdates failed: telegram
 getUpdates` was the whole warning — `{e}` prints only anyhow's outermost
@@ -386,6 +387,57 @@ Telegram bug above, in a second place. Both now carry it through as
 allowlist runs *first*, because a stranger gets silence rather than a reply that
 confirms the number is a bridge.
 
+## Attachments
+
+**A file becomes a path in the prompt, not an upload.** `src/channel/inbox.rs`
+writes the bytes under `$XDG_STATE_HOME/omatether/in/<thread>/` and
+`core::compose` appends one `[attachment: name — /path (mime, size)]` line per
+file after the person's words. That is the only reason this works across nine
+agents at once: every one of them is a CLI with filesystem tools, so a path is
+the single representation claude, codex, pi *and* the tmux tier can all act on.
+Base64 up a vision API would have been per-agent work nine times over, and
+would have skipped the detached tier entirely. Seam B never learned about it —
+`Agent::prompt` still takes a `&str`.
+
+**The download happens after the allowlist, on both channels, and that shapes
+both adapters.** `Telegram::parse_update` and `photon::parse_event` stay pure
+functions that *name* the files (`Want` / `Wanted`) and hand them back to their
+poll loop, which fetches only for a sender that passed. Two things fall out.
+The parsers stay testable with no network in reach, which is what keeps the
+caption and forum-topic rules honest. And a stranger cannot make this machine
+download what they sent — which is why the Photon sidecar **announces**
+attachments in `/inbound` and only reads them when Rust asks by message id at
+`POST /fetch`. Saving them as they arrived would have put the bytes on disk
+before the allowlist had run.
+
+Telegram: two calls, `getFile` for the path and a plain GET on
+`api.telegram.org/**file**/bot<token>/<file_path>` — a different URL shape to
+every other method, which is why `file_base` is built once in the constructor.
+The Bot API will not serve anything over **20 MB**, so the update's own
+`file_size` is checked first to turn that into a sentence naming the real size.
+`photo` is an array of the *same* picture at several sizes, documented as
+"available sizes" rather than sorted, so the largest is chosen rather than the
+last — the thumbnail is the copy whose text an agent cannot read.
+
+Photon: an inbound attachment part is
+`{type:"attachment", id, name, mimeType, size, read(), stream()}` — read out of
+the installed `@spectrum-ts/core` 12.7.0 type bundle, not guessed. `read()`
+returns a Buffer. The sidecar's `normalize` used to throw away everything that
+was not text, which is where the second half of the vanishing-voice-note bug
+lived.
+
+A file that fails to arrive is still named in the prompt, with the reason.
+Dropping it silently is the same bug as dropping the message: the person
+attached it, and an answer that never mentions their file reads as a reply to
+someone else's message. When *nothing* arrived and there were no words either,
+the reason goes back to the chat instead of starting a turn about nothing.
+
+**Unverified:** a real photo through either channel end to end. The parsers,
+the compose step, the sanitizer and the file modes are covered by tests; what
+has not been watched is a screenshot landing in `in/` and an agent opening it.
+Telegram needs the live bot (so, the running service), and Photon needs someone
+to text the line.
+
 ## Storage
 
 **Databases exist in the wild. Changing `CREATE TABLE` is not a migration.**
@@ -417,6 +469,25 @@ worst kind of bug to find.
   shell on this machine.
 - **One turn per thread.** A second message while one runs is rejected, not
   queued. From a phone that is more predictable, and far simpler.
+- **One send is not one message, and the core waits ~600ms to find out.**
+  iMessage delivers a photo with a caption as *two* messages: the attachment
+  arrived **35 microseconds** ahead of the words, took the turn, and the words
+  came back "Busy — a turn is already running". The agent answered a picture
+  with no question attached, which looks like the model ignoring you rather
+  than like a bug. Telegram albums split the same way, one update per photo. So
+  a prompt is held in `Core::held` and anything else from that thread joins it
+  (`COALESCE`, capped by `COALESCE_MAX` so a run of messages cannot hold a
+  thread open forever). Three things follow. The window is sized against what
+  actually happens — a platform splitting one send delivers the halves
+  microseconds apart, not seconds — so it is invisible against a turn that
+  takes seconds. **The working indicator goes up when the first half lands**,
+  not when the window closes, which is what keeps it invisible; that is why
+  `is_working` checks `held` first. And `/stop`, `/allow` and `/deny` skip the
+  queue (`answers_the_moment`) because they answer the turn that is already
+  running, while every other command releases what is waiting before it runs,
+  so things happen in the order they were sent. `/stop` also *drops* what is
+  held: a message called off half a second before it would have started must
+  not start anyway.
 - **`/new` starts in `~/Work`, not where the last session was.** It matches
   `omarchy-agent`, which steps out of `$HOME` into `~/Work` before launching
   because agents refuse to remember trust for a home directory. So a session
