@@ -1,487 +1,143 @@
 # omatether
 
-Bridge between messaging channels and the coding agent already installed in
-your repo. Text it from a phone; it runs Claude Code (or Codex, or whichever
-agent `omarchy default agent` points at) in your working tree and streams the
-answer back to the thread it came from.
+Your coding agent, over chat. Text it from your phone on Telegram or iMessage.
+It runs the agent installed on your machine (Claude Code, Codex, or whichever
+one `omarchy default agent` points at) in your working tree, and sends the
+answer back to the chat.
 
-Not to be confused with a general chat assistant: the thing on the far end of
-the pipe is *your* agent, with your `CLAUDE.md`, your MCP servers, and your
-working tree.
+This isn't a general chat assistant. What answers is *your* agent, with your
+`CLAUDE.md`, your MCP servers and your files.
 
-## Status: complete
+## Install
 
-Two channels — Telegram and iMessage (via Photon) — and every agent Omarchy
-supports, over one core. Text either one, the agent runs in your working tree,
-and the reply comes back to the thread it came from.
+On Omarchy, or any Arch:
 
 ```bash
-omatether serve --dir ~/src     # the bridge
-omatether repl  --dir .         # one session, driven from this terminal
-```
-
-### Install
-
-On Omarchy (or any Arch), once the package is published:
-
-```bash
-yay -S omatether        # built from source
-yay -S omatether-bin    # prebuilt release tarball
-```
-
-Either one then needs only `omatether setup`. From a clone instead:
-`cargo build --release` and the same `omatether setup` — the service unit it
-installs points at the binary you ran it from.
-
-### Setup
-
-At least one channel must be configured; both is fine. The easy way is the
-guided setup, which validates every credential as you type it, detects your
-Telegram user id from the first message you send the bot, writes the env
-file, and installs and starts the service:
-
-```bash
+yay -S omatether-bin    # prebuilt
+yay -S omatether        # or build from source
 omatether setup
 ```
 
-It is idempotent — what is already configured is reported and kept, so a
-half-finished run can simply be run again. What it asks for, and why:
+You need at least one agent CLI on the machine (`claude`, `codex`, `pi`, or
+any agent Omarchy can launch), plus `node` if you want iMessage.
 
-**Telegram.** Create a bot with [@BotFather](https://t.me/BotFather). **Mint a
-new one** — `getUpdates` is exclusive, so sharing a token with another bot means
-the two steal each other's messages. Setup checks the token against Telegram
-the moment you paste it, then asks you to send the bot any message and reads
-your numeric user id off it — no trip to @userinfobot.
+## Setup
 
-**iMessage (Photon).** Photon is a managed service — no Mac relay. Create a
-project at [app.photon.codes](https://app.photon.codes/) and note its id and
-secret. Credentials alone are not enough: a fresh project knows nothing about
-you, so your phone has to be registered as a Spectrum user before inbound
-messages route anywhere, and **the number you text to reach the agent is
-assigned per user, per project** — a new project means a new number, not
-whatever an older one used. Setup runs that registration for you and prints
-the line to text; `omatether photon-setup --phone <E.164>` re-checks it later
-if the line has not been assigned yet.
+`omatether setup` walks you through it. It checks each credential the moment
+you paste it, writes `~/.config/omatether/env` (mode 600), then starts the user
+service and confirms it stayed up. Running it again is safe: anything already
+configured is kept.
 
-From a source checkout the Photon sidecar also needs its dependencies once:
+**Telegram.** Create a **new** bot with [@BotFather](https://t.me/BotFather)
+and paste its token. Don't reuse a bot another program uses: only one program
+can read a bot's messages, and two would steal each other's. Setup then asks
+you to message the bot once, and takes your user id from that message.
 
-```bash
-cd vendor/photon-sidecar && npm install
-```
+**iMessage (optional).** Uses [Photon](https://app.photon.codes/), a hosted
+service, so no Mac is needed. Create a project there, and give setup its id,
+its secret and your phone number. Setup registers your number and prints the
+number you text. Each project gets its own line, so a new project means a new
+number to text.
 
-The manual path, if you prefer it: write `~/.config/omatether/env`,
-`chmod 600`:
+Only the Telegram user and phone number you give setup can use the bridge. A
+message from anyone else is ignored and never answered.
 
-```
-OMATETHER_TELEGRAM_TOKEN=123456:AA...
-OMATETHER_TELEGRAM_ALLOWED_USERS=<your telegram user id>
+## Using it
 
-OMATETHER_PHOTON_PROJECT_ID=...
-OMATETHER_PHOTON_PROJECT_SECRET=...
-OMATETHER_PHOTON_ALLOWED_USERS=<your phone, E.164>
-```
-
-and install the service by hand. The unit in `contrib/` is written for a
-packaged install (the binary at `/usr/bin/omatether`); from a source
-checkout, point `ExecStart` at your `target/release/omatether` instead:
-
-   ```bash
-   cargo build --release
-   cp contrib/omatether.service ~/.config/systemd/user/
-   # from source: edit ExecStart to <checkout>/target/release/omatether
-   systemctl --user enable --now omatether
-   ```
-
-The Photon sidecar is found at runtime: `OMATETHER_PHOTON_SIDECAR_DIR` if
-set, then the packaged `/usr/lib/omatether/photon-sidecar`, then
-`~/.local/share/omatether/photon-sidecar`, then the vendored copy beside the
-source. A source checkout needs nothing set; a package install needs nothing
-set either — only a nonstandard layout does.
-
-The service needs no inbound port. Telegram long-polling reaches out rather
-than being called, and the Photon sidecar binds to loopback only — so the whole
-thing stays behind the tailnet with nothing exposed.
-
-### Commands
+Send a message and the agent works on it. On Telegram its reply builds up in
+place as it works. iMessage can't edit a sent message, so there you see typing
+dots, then the answer arrives whole. A long answer continues in the next
+message rather than being cut.
 
 | Command | Effect |
 |---|---|
-| `/new` | Fresh session in this thread, back in `~/Work`, and says which agent and model |
+| `/new` | Fresh session, starting in `~/Work` |
 | `/stop` | Interrupt the running turn |
-| `/cd <path>` | Set the working directory (starts a fresh session) |
-| `/agent <name>` | Switch agent — claude, codex, pi, omp, opencode, crush, grok, gemini, copilot |
-| `/model [name]` | Which model the agent runs. `/model default` hands the choice back |
-| `/attach` | The ssh line to take over at a real terminal |
-| `/status` | Agent, model, directory, session, whether a turn is running |
-| `/log` | The last turn in full — every tool call, and what the agent said between them |
-| `/allow`, `/deny <why>` | Answer a permission request without tapping |
-| `/auto [on\|off]` | Approve tool calls without asking. **On by default** |
-| `/help` | The above |
+| `/cd <path>` | Change the working directory (starts a fresh session) |
+| `/agent <name>` | Switch agent: claude, codex, pi, omp, opencode, crush, grok, gemini, copilot |
+| `/model [name]` | List models, or switch without losing the conversation |
+| `/status` | Agent, model, directory, and whether a turn is running |
+| `/log` | The last turn in full, with every tool call |
+| `/attach` | The ssh command to take over at a real terminal |
+| `/auto [on\|off]` | Whether tool calls run without asking. **On by default** |
+| `/allow`, `/deny <why>` | Answer a permission question |
+| `/help` | This list |
 
-Anything else goes to the agent as typed — including its own slash commands,
-many of which are prompt expansions, so `/review` just works.
+Anything else goes to the agent as typed, including its own slash commands,
+so `/review` works.
 
-### Photos and files
+**Photos and files** are saved to `~/.local/state/omatether/in/` and passed to
+the agent as a file path, with your caption as the prompt. The limit is 20 MB.
+Files are private to you and deleted after a week.
 
-Send a screenshot, a photo or a file and it is downloaded to
-`$XDG_STATE_HOME/omatether/in/` and handed to the agent as a path to open, with
-whatever you typed alongside it as the prompt:
+## Agents, and what they may do without asking
 
-```
-what is wrong here?
-[attachment: shot.png — /home/you/.local/state/omatether/in/telegram-5/…-shot.png (image/png, 200 kB)]
-```
+**Tool calls run without asking by default.** Asking about every command from
+a phone quickly turns into tapping Allow without reading, which only looks
+like review. Use `/auto off` in a thread to be asked before Claude runs
+`Bash`, `Write`, `Edit` or `NotebookEdit`. On Telegram you get Allow / Deny
+buttons; on iMessage you reply `/allow` or `/deny`.
 
-A path rather than an upload, because every agent here is a CLI with
-filesystem tools: Claude Code opens an image with `Read`, Codex and Pi read
-files, and the detached tier gets the same string as its prompt. Nothing about
-it is per-agent, and an agent that cannot read that kind of file says so in the
-reply.
+Only Claude can be asked at all:
 
-A photo with no caption is a prompt on its own now. Voice notes are handed over
-too — most agents will answer that they cannot listen to one, which is at least
-a true answer. The limit is 20 MB, which is Telegram's own ceiling for what it
-will send a bot, applied to both channels; anything larger is named in the
-reply with the reason rather than quietly dropped. Files are written 0600 in a
-0700 directory and deleted after a week.
+| Agent | Streams replies | Can ask before a tool call | Model choice |
+|---|---|---|---|
+| `claude` | yes | **yes** | yes |
+| `codex` | yes | no | yes |
+| `pi` | yes | no | yes |
+| omp, opencode, crush, grok, gemini, copilot | no | no | no |
 
-The download happens *after* the allowlist check on both channels — a stranger's
-attachment is never fetched, never written to this machine and never opened.
+> **Codex, Pi and the last six run their tools as they decide, and omatether
+> cannot stop them.** Switching to one is one `/agent` away for anyone on the
+> allowlist. `/agent` says so when you switch.
 
-One send is not always one message: iMessage delivers a photo and its caption as
-two, microseconds apart, and a Telegram album is one message per photo. So a
-prompt waits about 600ms for the rest of itself and goes to the agent as one
-turn. The indicator comes up the moment the first part lands, so the wait is
-invisible. `/stop`, `/allow` and `/deny` never wait — they answer the turn that
-is already running.
+The last six run in a tmux session through `omarchy-agent`. Their replies
+appear in that terminal rather than in the chat; `/attach` gives you the
+command to open it.
 
-### Models
-
-`/model opus` switches the model without starting a new session — the only one
-of these commands that keeps the conversation, because unlike a directory or an
-agent, a model can be changed underneath a running one. On Claude Code the
-switch goes to the live session and comes back checked, so a name it does not
-know is refused in the reply rather than discovered a turn later; on Codex and
-Pi the flag goes on their next turn instead, and neither reports a model back,
-so what you asked for is what gets shown. `/model` on its own lists what the
-agent will take: Claude Code's list is the one its session volunteered, so it
-exists only while a session is up and the reply says so when there is none;
-Codex and Pi get theirs from their own CLI (`codex debug models`,
-`pi --list-models`), which is local and costs no API call.
-
-The detached tier (omp, opencode, crush, grok, gemini, copilot) cannot be told:
-it launches through `omarchy-agent`, which takes no model. `/model` says so
-rather than remembering something that would never be used.
-
-### How a turn looks
-
-Tool calls appear inline as the agent makes them, a run at a time — one
-`▸ 9 tools · Bash` line rather than nine separate ones, since on a phone the
-log should not outweigh the answer. **By default they run without asking** — a
-thread starts in auto mode, and the reply reads as an account of what the agent
-did rather than a queue of questions.
-
-A reply too long for one Telegram message carries on in the next, so a long
-run keeps reporting progress and nothing is cut.
-
-iMessage cannot edit a message, so a turn arrives whole at the end — and only
-its **answer**: what the agent wrote after its last tool call. The tool calls,
-and the narration around them ("checking the log:"), were the agent's working;
-`/log` shows them on request.
-
-Every chat thread also tells the agent where it is being read, on top of its
-own system prompt: a phone, so lead with the answer and do not paste logs; and
-on iMessage, that only the final message arrives, so make it stand on its own.
-Claude and pi get that as `--append-system-prompt`, codex as
-`-c developer_instructions=…`. The detached tier does not — its replies are
-read at the terminal `/attach` names.
-
-`/auto off` turns the gate on for that thread. Then a consequential tool call
-blocks the turn until answered — with **Allow** / **Deny** buttons on Telegram,
-and as a message asking for `/allow` or `/deny` on iMessage, which has no
-buttons. `/status` always says which of the two a thread is in.
-
-Auto by default is a considered trade, not an oversight. A gate on every `Bash`
-call from a phone is a tap-Allow reflex within a day, and a prompt nobody reads
-is worse than no prompt at all because it looks like review. The gate is still
-there, per thread, for the directory where it earns its interruption — and the
-setting is stored, so a thread stays where you put it across restarts.
-
-Streaming differs by channel, and the core learns which world it is in from
-`Channel::can_edit` rather than from the channel's name:
-
-| | Telegram | iMessage |
-|---|---|---|
-| Editing | yes | **never** |
-| A turn arrives as | one message, growing on a 1.5s debounce | one complete message at the end |
-| Markdown | rendered (converted to Telegram's HTML) | rendered natively by iMessage |
-
-iMessage cannot rewrite a sent message under any circumstances, so streaming
-there would mean a stream of fragments. Holding the turn back and delivering it
-whole is the only readable option.
-
-Agents write markdown, so both channels render it — bold, bullets, headings,
-and code as code. A permission question is the exception on both: it quotes a
-tool's own arguments and goes out unformatted, because a renderer eats the
-characters it treats as markup and `rm -rf /tmp/*_cache*` must not be shown to
-you as `rm -rf /tmp/_cache`. For the same reason emphasis is read more strictly
-than CommonMark would: a path or a glob keeps its punctuation.
-
-With `/auto off`, not every tool asks even then. Gating all of them is unusable
-from a phone — the agent reads a dozen files before doing anything
-consequential, and a prompt per read trains you to tap Allow without looking.
-Only `Bash`, `Write`, `Edit` and `NotebookEdit` ask; the rest are approved by
-omatether itself (`GATED_TOOLS` in `src/core.rs`).
-
-### Agents
-
-All nine of Omarchy's agents work, in three tiers. `/agent` says what changes
-when you switch, because waiting for an approval prompt that will never arrive
-is a bad way to find out.
-
-| Tier | Agents | Streams | Gates tools | How |
-|---|---|---|---|---|
-| Structured | `claude` | yes | **yes** | Bidirectional `stream-json`, one long-lived process |
-| Structured | `codex` | yes | no | `codex exec --json`, one process per turn, `resume` for continuity |
-| Structured | `pi` | yes | no | `pi -p --mode json`, one process per turn, `--session` for continuity |
-| Detached | the other six | no | no | `omarchy-agent --inline` in a tmux session |
-
-Honest limits, all the agent's rather than ours:
-
-* **Codex cannot gate tools.** `codex exec`'s only non-interactive approval mode
-  is `--approve-for-me`, which reviews automatically inside a workspace-write
-  sandbox. There is no callback to route to a human, so no Allow/Deny appears.
-* **Pi cannot gate tools either.** `pi -p` runs its tools as it decides on them;
-  there is no approval callback in non-interactive mode.
-* **The detached tier does not stream.** Those agents have no structured output,
-  so the reply is the tmux session, not a chat message. Omatether says so and
-  gives you the `/attach` line rather than pretending otherwise.
-
-And one that is worth stating plainly rather than reading out of the table:
-
-> **Only `claude` asks you anything.** Codex, Pi and the detached tier run
-> their tools as they decide on them, unsandboxed, and omatether cannot stop a
-> tool call there — it has no channel to be asked through. The same allowlisted
-> person who approves every `Bash` on `claude` is one `/agent pi` away from an
-> agent that approves its own. That is a deliberate trade for reaching the
-> other agents at all, but it is a real one: `/agent` says so on the way in,
-> and `/help` lists the terms of every tier.
-
-Codex assigns its own conversation id on the first turn and reports it back
-through `AgentEvent::Ready`; Pi does the same in its first `session` frame and
-resumes with `--session <id>`; Claude takes one we choose. Any way it arrives,
-the id round-trips through the store, so a restart resumes.
-
-### Long replies
-
-On Telegram a turn pages. Once its message reaches ~3500 characters that
-message is finished, and the turn carries on in a new one below it. Pages end
-at a paragraph break where they can, and a code block split across two is
-closed on the first and reopened, with its language, on the second. Nothing
-goes to a file.
-
-On iMessage, which gets each turn whole, a long answer is sent as several
-messages, cut the same way — never shortened, and never a file to read over
-ssh from a phone. `/log` pages the same way.
-
-The one thing that still goes to `$XDG_STATE_HOME/omatether/out/` is a
-permission question whose tool input is too long to show inline: a question
-is never shown cut off.
-
-### The repl
-
-The milestone-1 instrument, still the fastest way to see the wire protocol:
+## Running it
 
 ```bash
-omatether repl --dir .                            # interactive
-omatether repl --agent codex --dir . "run tests"  # one-shot; runs to completion
+systemctl --user status omatether
+journalctl --user -fu omatether
 ```
 
-It drives any agent through the same seam, which makes it the fastest way to
-see what a backend actually emits.
+It opens no ports. Telegram is polled from this machine, and the iMessage
+helper listens on localhost only.
 
-## How the Claude adapter works
-
-`claude` runs in bidirectional `stream-json` mode — one long-lived process per
-session:
+**Manual setup**, if you'd rather not use `omatether setup`: write
+`~/.config/omatether/env` with mode 600:
 
 ```
-claude --print --verbose \
-       --output-format stream-json \
-       --input-format stream-json \
-       --include-partial-messages \
-       --session-id <uuid>
+OMATETHER_TELEGRAM_TOKEN=123456:AA...
+OMATETHER_TELEGRAM_ALLOWED_USERS=<your numeric telegram id>
+
+OMATETHER_PHOTON_PROJECT_ID=...
+OMATETHER_PHOTON_PROJECT_SECRET=...
+OMATETHER_PHOTON_ALLOWED_USERS=<your phone, e.g. +15551234567>
 ```
 
-`--input-format stream-json` is what makes this a session rather than a series
-of one-shots: prompts are written to stdin as they arrive.
+then `systemctl --user enable --now omatether`. A source build runs
+`omatether setup` the same way. It writes a unit for the binary you ran it
+from, and the iMessage helper needs `npm install` in `vendor/photon-sidecar`
+once (setup offers to run it).
 
-### Gating tools: what actually works
+## Uninstall
 
-This took some finding, so it is written down.
-
-**`--permission-mode manual` does not survive `--print`.** Pass it and the CLI
-reports `"permissionMode":"default"` in its `system/init` frame and approves
-tools itself — silently, with no warning. If permission requests stop arriving,
-check that frame first. Setting `CLAUDE_CODE_ENTRYPOINT=sdk-cli` does not
-change it either.
-
-**Permissions need no MCP server, and `--permission-prompt-tool` is not used
-anywhere in this codebase.** The gate that does fire is a **`PreToolUse` hook
-registered in the `initialize` handshake**, which is what the CLI's own
-diagnostics recommend ("To gate every tool call, use a PreToolUse hook"). Each
-tool call then arrives as a `hook_callback` control request and blocks until
-answered:
-
-```jsonc
-// initialize — shape per the CLI's own validation error
-{"type":"control_request","request_id":"omatether-1","request":{
-  "subtype":"initialize",
-  "hooks":{"PreToolUse":[{"matcher":"*","hookCallbackIds":["omatether-pretooluse"]}]}}}
-
-// …then, per tool call
-{"type":"control_request","request_id":"…","request":{
-  "subtype":"hook_callback","callback_id":"omatether-pretooluse",
-  "input":{"tool_name":"Bash","tool_input":{"command":"echo hi"}}}}
-
-// answered with
-{"type":"control_response","response":{"subtype":"success","request_id":"…","response":{
-  "hookSpecificOutput":{"hookEventName":"PreToolUse",
-    "permissionDecision":"deny","permissionDecisionReason":"…"}}}}
+```bash
+systemctl --user disable --now omatether
+rm -f ~/.config/systemd/user/omatether.service   # only exists for source builds
+rm -rf ~/.config/omatether ~/.local/state/omatether
+yay -R omatether-bin                             # or omatether
 ```
 
-A denial's reason reaches the model, which explains it back rather than
-retrying blindly — verified end to end.
+Also revoke the bot with @BotFather if you won't use it again.
 
-The older `can_use_tool` control request is also accepted (payload:
-`{behavior: 'allow', updatedInput?: object}` / `{behavior: 'deny', message}`,
-per the CLI's validation message), but it is not what arrives in practice. The
-adapter remembers which dialect each question was asked in and answers in kind;
-that bookkeeping stays inside the adapter so seam B remains vendor-neutral.
+## More
 
-### Environment scrubbing
+[docs/internals.md](docs/internals.md) covers how it's built: architecture,
+how Claude Code's tools are gated, decisions taken, and what is verified.
+[CLAUDE.md](CLAUDE.md) has the per-agent and per-channel details learned the
+hard way.
 
-The agent is spawned with `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
-`CLAUDE_CODE_CHILD_SESSION` and friends removed. Otherwise, when omatether is
-itself launched from inside a Claude Code session, the child inherits them,
-decides it is a nested session, and resolves its configuration from the parent.
-A service's agent environment should be deterministic regardless of what
-started it.
-
-## Architecture
-
-Three layers, two out-of-process seams, both speaking JSON:
-
-```
-channel adapters  →  core  →  agent adapters
-   (telegram)         │         (claude, codex, acp)
-   (photon/node)      │
-                   seam A     seam B
-```
-
-Photon's SDK is TypeScript-only, so its adapter must be a separate process
-regardless of what the core is written in. Rather than treat that as a wart,
-both seams are out-of-process by design — each adapter can live in whatever
-language its SDK does, and the core never learns which channel or agent it is
-talking to.
-
-Seam B is shaped after **ACP** (Agent Client Protocol), whose four verbs —
-prompt, streamed update, permission request, cancel — are exactly what a chat
-bridge needs. See `src/agent.rs`.
-
-### Layout
-
-| Path | Role |
-|---|---|
-| `src/event.rs` | The normalized event model. Seam B's vocabulary. |
-| `src/agent.rs` | The trait every agent adapter implements. |
-| `src/claude/wire.rs` | Claude's `stream-json` frames → normalized events. |
-| `src/claude/mod.rs` | Process lifetime, stdin writes, stdout reader task. |
-| `src/codex.rs` | `codex exec --json`: per-turn process, `resume` for continuity. |
-| `src/tmux.rs` | The detached tier, for agents with no structured output. |
-| `src/channel/mod.rs` | Seam A: send, edit, ask, acknowledge. |
-| `src/channel/inbox.rs` | Where a file someone sent lands on disk. |
-| `src/channel/telegram.rs` | Bot API client and the long-poll loop. |
-| `src/core.rs` | The router: threads ↔ sessions, dispatch, flushing. |
-| `src/render.rs` | Debounced edit-in-place message building. |
-| `src/command.rs` | Slash commands, and what passes through. |
-| `src/store.rs` | SQLite thread state. |
-| `src/main.rs` | `serve` and `repl`. |
-
-### The loosely-typed boundary
-
-Agent wire formats are unversioned and will move underneath us. Frames are
-parsed as `serde_json::Value` at the adapter edge and normalized inward, and
-anything unrecognized becomes `AgentEvent::Unknown` rather than a parse error.
-A change upstream should cost one adapter, not the whole binary.
-
-This is the single most important implementation decision in the project. The
-risk here is integration churn, not concurrency correctness.
-
-## Decisions taken
-
-Deliberately the simplest option in each case; revisit when something hurts.
-
-| Question | Answer | Why |
-|---|---|---|
-| Session scope | One per chat thread | Matches chat intuition; per-repo lets two threads collide in one working tree. |
-| Concurrent turns | Rejected while one runs | More predictable from a phone than queuing, and much simpler than interleaving. |
-| Restart with a turn in flight | Kill the child, resume the conversation | `kill_on_drop` plus `--session-id`. The turn is lost; the conversation is not. |
-| Long output | Truncate | Revisit with a paste file served over the tailnet — chat is a bad place for a 500-line diff. |
-| Whether tools ask at all | No, by default (`/auto off` per thread) | A gate on every `Bash` from a phone becomes a tap-Allow reflex; a prompt nobody reads only looks like review. |
-| Which tools ask, with the gate on | Only `Bash`/`Write`/`Edit`/`NotebookEdit` | A prompt per file read trains you to tap Allow without reading it. |
-| `/cd` on a live thread | Starts a fresh session | `cwd` is fixed when the agent process starts; the old session stays resumable by id. |
-| Telegram reply threads | Not separate threads | Only forum topics are; otherwise one conversation scatters into a session per reply chain. |
-| Switching agents | Starts a fresh conversation | Transcripts do not move between agents; pretending otherwise would lose context silently. |
-| Typing indicators | On every channel, until the turn's own message appears | The gap before the first word is the one with no other sign of life; after it, a growing message says the same thing for free. Refreshed every 4s, because Telegram's expires in about 5. |
-
-## Roadmap
-
-1. ~~Claude driver, no channels~~
-2. ~~Telegram end to end~~
-3. ~~Photon channel~~
-4. ~~Second agent, plus the detached tier~~
-5. ~~Polish~~ — typing indicators, long-reply spill, `/attach`, forum topics
-
-Deliberately not built: **attachments** (sending and receiving files) and
-**Photon tapbacks**. Both need live channel credentials to exercise at all, and
-neither addresses a problem that paging and `/log` do not already solve.
-
-## What is verified, and what is not
-
-Both channels are live and working end to end. Everything below was checked
-against the real tool or service rather than inferred.
-
-Verified:
-
-- **Telegram**, in daily use.
-- **Photon/iMessage**, end to end: a real message inbound, through the agent,
-  and the reply back out.
-- **The Claude adapter**, including the permission gate blocking a tool call
-  and a denial's reason reaching the model, which the model then explains
-  rather than retrying blindly.
-- **The detached tier**: a real tmux session, the exact
-  `omarchy-agent --inline --prompt …` invocation, and a second prompt reaching
-  a running session through `send-keys`.
-- **The Codex adapter's lifecycle**: a real `thread.started` id captured, real
-  JSONL parsed, errors surfaced, turn failure reported.
-- **The store migration**, on the live database, preserving existing threads.
-
-Not verified:
-
-- **A successful Codex turn.** `codex login` has never been run on this
-  machine, so every request 401s. Everything up to the model call is exercised.
-  `codex login`, then `omatether repl --agent codex --dir . "say hi"`.
-- **Photon attachments and tapbacks**, which are not implemented at all.
-
-## Notes kept from the build
-
-- Vendor the Photon sidecar rather than pointing at the copy inside the Hermes
-  install tree — an update there would break us, and depending on that path is
-  not Hermes-free.
-- `PHOTON_SIDECAR_WATCH_STDIN=1` makes the sidecar exit on stdin EOF, which
-  gives parent-death binding for free when spawned with a piped stdin.
-- Telegram allows roughly one message per second to a chat, and
-  `editMessageText` draws on the same budget.
-- `getUpdates` is exclusive: two pollers on one bot token steal each other's
-  messages. Outbound `sendMessage` on a shared token is fine.
+MIT licensed.
