@@ -1,0 +1,36 @@
+name: ci
+
+# Tests on every push and pull request, so a tag is never the first time a
+# change is built anywhere but this machine.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test
+        run: cargo test --locked
+
+      # The bundle has broken on its own before (shims for import.meta.resolve);
+      # building it here catches that before a release does.
+      - name: Bundle the Photon sidecar
+        run: |
+          cd vendor/photon-sidecar
+          npm ci
+          npm run bundle
