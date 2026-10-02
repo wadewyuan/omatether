@@ -16,7 +16,15 @@ working end to end. First-time setup on a fresh machine is `omatether setup`
 (`src/setup.rs` asks the questions; the Bot API and Spectrum calls behind
 them are `src/channel/{telegram,photon}_setup.rs`) — interactive, idempotent, validates credentials live,
 detects the Telegram user id off the first message the bot receives, writes
-the env file and generates the unit pointing at the binary that ran it.
+the env file, and starts the service. On a packaged install it uses the
+package's unit and offers to move aside a `~/.config/systemd/user` copy that
+would shadow it; from a source checkout it generates one naming the binary
+that ran it. It then waits a few seconds and checks the service *stayed* up —
+`systemctl start` returns once a `Type=simple` unit forks, so a `serve` that
+died on a bad credential used to be reported as running. Comparing a unit's
+`ExecStart` expands `%h` first: the live unit on the dev machine uses it, and
+a plain string match called it stale. **Unverified:** the packaged-unit
+branch (needs the package installed) and the did-not-stay-up branch live.
 Sharp edges in setup. Bot API method names are camelCase: `get_me` is a 404
 "Not Found", and it once made setup reject every valid token and call the
 working saved one dead. A saved token that no longer passes getMe stops the

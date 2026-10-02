@@ -36,7 +36,7 @@ pub async fn run() -> Result<()> {
     // Saved after each channel, not once at the end: a Photon step that fails
     // — a rejected secret, a closed stdin, a Ctrl-C — must not take a working
     // Telegram setup down with it.
-    telegram(&mut env, &mut prompter).await?;
+    let telegram_bot = telegram(&mut env, &mut prompter).await?;
     env.save()?;
     photon(&mut env, &mut prompter).await?;
     env.save()?;
@@ -48,9 +48,16 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    install_service().await?;
+    install_service(&mut prompter).await?;
 
-    println!("\nDone. `journalctl --user -fu omatether` watches it work.");
+    println!("\nDone. Send it a message to try it:");
+    if let Some(bot) = telegram_bot {
+        println!("  Telegram: @{bot}");
+    }
+    if env.photon().is_some() {
+        println!("  iMessage: your Photon line (`omatether photon-setup --phone …` shows it)");
+    }
+    println!("`journalctl --user -fu omatether` watches it work.");
     Ok(())
 }
 
@@ -98,14 +105,15 @@ fn on_path(name: &str) -> bool {
 
 // ---- telegram ----------------------------------------------------------
 
-async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
+/// Returns the bot's name when Telegram ends up configured.
+async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<Option<String>> {
     println!("Telegram:");
 
     if let Some((token, allowed)) = env.telegram() {
         match telegram_setup::get_me(&token).await {
             Ok(name) => {
                 println!("  ✓ already configured: @{name}, allowed: {allowed}\n");
-                return Ok(());
+                return Ok(Some(name));
             }
             Err(e) => {
                 // A configured-but-dead token is worth stopping for: the bot
@@ -114,7 +122,7 @@ async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
                 println!("  ✗ the saved token no longer works ({e:#}).");
                 if !prompter.confirm("  Replace it?", true).await? {
                     println!();
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
@@ -127,7 +135,7 @@ async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
         let token = prompter.ask("  Bot token").await?;
         if token.is_empty() {
             println!("  (skipping Telegram)\n");
-            return Ok(());
+            return Ok(None);
         }
         match telegram_setup::get_me(&token).await {
             Ok(name) => break (token, name),
@@ -146,7 +154,7 @@ async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
                 .await?;
             if id.is_empty() {
                 println!("  (skipping Telegram)\n");
-                return Ok(());
+                return Ok(None);
             }
             if id.chars().all(|c| c.is_ascii_digit()) {
                 break id;
@@ -158,7 +166,7 @@ async fn telegram(env: &mut EnvFile, prompter: &mut Prompter) -> Result<()> {
     env.set("OMATETHER_TELEGRAM_TOKEN", &token);
     env.set("OMATETHER_TELEGRAM_ALLOWED_USERS", &user_id);
     println!();
-    Ok(())
+    Ok(Some(bot_name))
 }
 
 /// The allowlist entry, read off the next message the bot receives rather
@@ -385,12 +393,26 @@ fn env_path() -> PathBuf {
 
 // ---- the service ---------------------------------------------------------
 
-/// Install the user unit pointing at *this* binary, then enable and start
-/// it. Generated rather than copied from contrib so a source checkout and a
-/// packaged install both land a unit that names a real path. An existing
-/// unit is left alone — it may be hand-tuned — but a stale ExecStart is
-/// said out loud.
-async fn install_service() -> Result<()> {
+/// Where the package puts its unit, and the binary that unit runs.
+const PACKAGED_UNIT: &str = "/usr/lib/systemd/user/omatether.service";
+const PACKAGED_EXE: &str = "/usr/bin/omatether";
+
+/// How long a freshly started service has to stay up before setup calls it
+/// running. `systemctl start` returns as soon as a `Type=simple` unit has
+/// forked, so a `serve` that dies on a bad credential a second later would
+/// otherwise be reported as working.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Get a unit in place that runs *this* binary, then start it and check it
+/// stayed up.
+///
+/// A packaged install already has a unit, kept current by pacman, so nothing
+/// is written; a copy in `~/.config/systemd/user` would shadow it and never
+/// see another fix. A source checkout gets one generated, naming the binary
+/// that ran setup. A user unit that runs some other binary — typically a
+/// source build left behind after installing the package — is replaced only
+/// with consent, and kept as `.bak`, because it may be hand-tuned.
+async fn install_service(prompter: &mut Prompter) -> Result<()> {
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating this binary")?;
@@ -400,23 +422,54 @@ async fn install_service() -> Result<()> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("systemd/user");
-    let unit_path = unit_dir.join("omatether.service");
+    let user_unit = unit_dir.join("omatether.service");
+    let packaged = exe == Path::new(PACKAGED_EXE) && Path::new(PACKAGED_UNIT).is_file();
 
-    if unit_path.exists() {
-        let text = std::fs::read_to_string(&unit_path).unwrap_or_default();
-        let expected = format!("ExecStart={}", exe.display());
-        if text.contains(&expected) {
-            println!("  ✓ the user service is installed and points at this binary");
-        } else {
-            println!("  · {} exists and is left as-is.", unit_path.display());
-            println!("    Its ExecStart is not this binary ({})", exe.display());
+    println!("Service:");
+    match (packaged, user_unit.exists()) {
+        (true, false) => println!("  ✓ using the packaged user service"),
+        (true, true) => {
+            println!(
+                "  · {} overrides the packaged unit, so package updates to it never apply.",
+                user_unit.display()
+            );
+            if prompter
+                .confirm("  Move it aside and use the packaged one?", true)
+                .await?
+            {
+                let bak = set_aside(&user_unit)?;
+                println!("  ✓ moved to {}", bak.display());
+            }
         }
-    } else {
-        std::fs::create_dir_all(&unit_dir)
-            .with_context(|| format!("creating {}", unit_dir.display()))?;
-        std::fs::write(&unit_path, render_unit(&exe))
-            .with_context(|| format!("writing {}", unit_path.display()))?;
-        println!("  ✓ wrote {}", unit_path.display());
+        (false, false) => {
+            std::fs::create_dir_all(&unit_dir)
+                .with_context(|| format!("creating {}", unit_dir.display()))?;
+            std::fs::write(&user_unit, render_unit(&exe))
+                .with_context(|| format!("writing {}", user_unit.display()))?;
+            println!("  ✓ wrote {}", user_unit.display());
+        }
+        (false, true) => {
+            let text = std::fs::read_to_string(&user_unit).unwrap_or_default();
+            match unit_exe(&text) {
+                Some(found) if same_file(&found, &exe) => {
+                    println!("  ✓ the user service is installed and runs this binary");
+                }
+                found => {
+                    let found = found.map_or("nothing".into(), |p| p.display().to_string());
+                    println!("  · {} runs {found},", user_unit.display());
+                    println!("    not this binary ({}).", exe.display());
+                    if prompter
+                        .confirm("  Replace it? The old unit is kept as .bak", true)
+                        .await?
+                    {
+                        let bak = set_aside(&user_unit)?;
+                        std::fs::write(&user_unit, render_unit(&exe))
+                            .with_context(|| format!("writing {}", user_unit.display()))?;
+                        println!("  ✓ rewrote it; the old one is {}", bak.display());
+                    }
+                }
+            }
+        }
     }
 
     // From here it is systemctl talking to the user manager; any of it can
@@ -425,28 +478,93 @@ async fn install_service() -> Result<()> {
     let _ = systemctl(&["daemon-reload"]).await;
 
     let active = systemctl(&["is-active", "omatether"]).await;
-    let active = matches!(active, Ok(out) if out.status.success());
+    let was_active = matches!(active, Ok(out) if out.status.success());
 
-    if active {
-        // The env file just changed under it; a restart picks it up.
-        let _ = systemctl(&["restart", "omatether"]).await;
-        println!("  ✓ the service was already running — restarted with the new configuration");
+    // Restart rather than start when it is up: the env file, and perhaps the
+    // unit, just changed under it.
+    let (verb, args): (&str, &[&str]) = if was_active {
+        ("restart", &["restart", "omatether"])
     } else {
-        match systemctl(&["enable", "--now", "omatether"]).await {
-            Ok(out) if out.status.success() => {
-                println!("  ✓ the service is enabled and running");
-            }
-            Ok(out) => {
-                println!(
-                    "  ✗ systemctl refused: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                println!("    Start it by hand: systemctl --user enable --now omatether");
-            }
-            Err(e) => println!("  ✗ could not run systemctl: {e}"),
+        ("start", &["enable", "--now", "omatether"])
+    };
+    match systemctl(args).await {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            println!(
+                "  ✗ systemctl refused to {verb} it: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            println!("    Start it by hand: systemctl --user enable --now omatether");
+            return Ok(());
+        }
+        Err(e) => {
+            println!("  ✗ could not run systemctl: {e}");
+            return Ok(());
         }
     }
-    Ok(())
+
+    tokio::time::sleep(SETTLE).await;
+    let up = matches!(
+        systemctl(&["is-active", "omatether"]).await,
+        Ok(out) if out.status.success()
+    );
+    if up {
+        if was_active {
+            println!("  ✓ restarted with the new configuration, and it is running");
+        } else {
+            println!("  ✓ enabled and running");
+        }
+        return Ok(());
+    }
+
+    // Said here, with the reason, rather than left for a silent chat.
+    println!("  ✗ the service did not stay up. Its last words:");
+    if let Ok(out) = tokio::process::Command::new("journalctl")
+        .args(["--user", "-u", "omatether", "-n", "15", "--no-pager", "-o", "cat"])
+        .output()
+        .await
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            println!("    {line}");
+        }
+    }
+    bail!("the service is not running — fix the above and re-run `omatether setup`")
+}
+
+/// The binary a unit's `ExecStart` runs, with `%h` expanded — the specifier
+/// systemd user units use for home, and the one a hand-written unit is most
+/// likely to have.
+fn unit_exe(unit: &str) -> Option<PathBuf> {
+    let line = unit
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("ExecStart="))?;
+    // Prefixes like `-` or `@` change how systemd runs the command, not which.
+    let cmd = line.trim_start_matches(['-', '@', ':', '+', '!']);
+    let first = cmd.split_whitespace().next()?;
+    let home = std::env::var("HOME").unwrap_or_default();
+    Some(PathBuf::from(first.replace("%h", &home)))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Rename `path` to `path.bak`, or `.bak.N` if that is taken, so nothing a
+/// person wrote is ever lost to setup.
+fn set_aside(path: &Path) -> Result<PathBuf> {
+    let mut bak = path.with_extension("service.bak");
+    let mut n = 1;
+    while bak.exists() {
+        bak = path.with_extension(format!("service.bak.{n}"));
+        n += 1;
+    }
+    std::fs::rename(path, &bak)
+        .with_context(|| format!("moving {} to {}", path.display(), bak.display()))?;
+    Ok(bak)
 }
 
 async fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -583,6 +701,46 @@ mod tests {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             written
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_units_binary_is_read_with_home_expanded() {
+        // The unit on the machine this was written on said `%h/…`, and a
+        // plain string match called it stale.
+        let home = std::env::var("HOME").unwrap();
+        let unit = "[Service]\nExecStart=%h/src/omatether/target/release/omatether serve --dir %h/src\n";
+        assert_eq!(
+            unit_exe(unit),
+            Some(PathBuf::from(format!("{home}/src/omatether/target/release/omatether")))
+        );
+        assert_eq!(
+            unit_exe(&render_unit(Path::new("/usr/bin/omatether"))),
+            Some(PathBuf::from("/usr/bin/omatether"))
+        );
+        assert_eq!(
+            unit_exe("ExecStart=-/opt/omatether serve"),
+            Some(PathBuf::from("/opt/omatether"))
+        );
+        assert_eq!(unit_exe("[Service]\nType=simple\n"), None);
+    }
+
+    #[test]
+    fn setting_aside_never_overwrites_an_earlier_backup() {
+        let dir = std::env::temp_dir().join(format!("omatether-setup-bak-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit = dir.join("omatether.service");
+
+        std::fs::write(&unit, "first").unwrap();
+        let a = set_aside(&unit).unwrap();
+        std::fs::write(&unit, "second").unwrap();
+        let b = set_aside(&unit).unwrap();
+
+        assert_ne!(a, b);
+        assert!(!unit.exists());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
 
         std::fs::remove_dir_all(&dir).ok();
     }
