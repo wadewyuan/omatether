@@ -3,6 +3,8 @@ name = "omatether"
 version = "0.1.0"
 edition = "2021"
 description = "Bridge between messaging channels and the Omarchy default coding agent"
+license = "MIT"
+repository = "https://github.com/wadewyuan/omatether"
 
 [dependencies]
 anyhow = "1"
