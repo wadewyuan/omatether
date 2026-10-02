@@ -8,11 +8,14 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="Your coding agent, over chat — Telegram and iMessage bridged to the agent on this machine"
 arch=('x86_64')
+install=omatether.install
 url="https://github.com/wadewyuan/omatether"
-license=('custom')
+license=('MIT')
+# A prebuilt binary has no debug symbols to split out.
+options=('!debug')
 provides=('omatether')
 conflicts=('omatether')
-depends=('systemd' 'tmux')
+depends=('gcc-libs' 'glibc' 'systemd' 'tmux')
 optdepends=(
   'nodejs: iMessage channel via Photon (Telegram-only installs do not need it)'
   'claude-code: Claude agent backend'
@@ -26,6 +29,8 @@ package() {
   cd "omatether-$pkgver-x86_64-unknown-linux-gnu"
   install -Dm755 omatether "$pkgdir/usr/bin/omatether"
   install -Dm644 omatether.service "$pkgdir/usr/lib/systemd/user/omatether.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 
   install -dm755 "$pkgdir/usr/lib/omatether"
   cp -a photon-sidecar "$pkgdir/usr/lib/omatether/photon-sidecar"

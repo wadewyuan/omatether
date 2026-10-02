@@ -35,7 +35,7 @@ use crate::event::{AgentEvent, Decision};
 use crate::store::Store;
 
 #[derive(Parser, Debug)]
-#[command(name = "omatether", about = "Your coding agent, over chat")]
+#[command(name = "omatether", version, about = "Your coding agent, over chat")]
 struct Args {
     #[command(subcommand)]
     command: Mode,
