@@ -24,8 +24,8 @@ optdepends=(
   'crush-bin: crush agent backend'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Filled in once v$pkgver is tagged: updpkgsums.
-sha256sums=('SKIP')
+# Regenerate with updpkgsums after each tag.
+sha256sums=('72deca5e2e718523e85db2d662d79d016d44888918ad8c67e386d2725c7281d8')
 
 # Everything that needs the network happens here, so build() and check()
 # run offline, per the Arch Rust package guidelines.

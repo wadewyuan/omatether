@@ -22,8 +22,8 @@ optdepends=(
   'crush-bin: crush agent backend'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/omatether-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
-# Filled in from the release's .sha256 once v$pkgver is published.
-sha256sums=('SKIP')
+# Regenerate with updpkgsums after each tag; it matches the release's .sha256.
+sha256sums=('e720f8d28b16dc0f12c69b5e0900aa69424826314391660cbbccc9284704d2e8')
 
 package() {
   cd "omatether-$pkgver-x86_64-unknown-linux-gnu"
