@@ -5,7 +5,7 @@
 //! only in [`Inbound`] and [`AgentEvent`].
 
 use std::collections::HashMap;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1387,7 +1387,21 @@ impl Core {
         );
         let path = self.spill_dir.join(name);
 
-        if let Err(e) = std::fs::create_dir_all(&self.spill_dir) {
+        // 0700, and chmod even when it is already there. The files are 0600,
+        // but the *names* are the thread keys — so a 0755 directory let anyone
+        // on the machine list the phone numbers and Telegram ids that talk to
+        // this bridge, which was never the intent: `inbox::save` already says
+        // it uses 0700 "for the same reason the spill directory is". The
+        // existing-directory case is not hypothetical — `create_dir_all` made
+        // every live one 0755.
+        if let Err(e) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.spill_dir)
+            .and_then(|()| {
+                std::fs::set_permissions(&self.spill_dir, std::fs::Permissions::from_mode(0o700))
+            })
+        {
             tracing::warn!("could not create {}: {e}", self.spill_dir.display());
             return None;
         }
@@ -1860,6 +1874,31 @@ mod tests {
         let path = core.spill(&test_key(), "sk-secret-token").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "group and other must have no access");
+
+        // And the directory, because the file *names* are the thread keys —
+        // a listable directory is the phone numbers that talk to this bridge.
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o077, 0, "the spill directory must not be listable");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live spill directories were all made 0755 by the previous
+    /// `create_dir_all`, so tightening only on creation would fix nothing on
+    /// any machine that has already run.
+    #[test]
+    fn an_already_loose_spill_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("sb-q3b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let core = core_with_spill_dir(&dir);
+        core.spill(&test_key(), "sk-secret-token").unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "an existing directory must be chmodded too");
 
         std::fs::remove_dir_all(&dir).ok();
     }

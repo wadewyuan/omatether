@@ -153,9 +153,14 @@ async fn call(token: &str, method: Method, body: Value) -> Result<Value> {
         .json(&body)
         .send()
         .await
+        // The URL has the token in it — see `telegram::scrub`. Setup leaks it
+        // to a terminal rather than the journal, but a terminal is scrolled
+        // back, screenshotted and pasted into an issue.
+        .map_err(super::telegram::scrub)
         .with_context(|| format!("reaching Telegram for {method}"))?
         .json()
         .await
+        .map_err(super::telegram::scrub)
         .with_context(|| format!("decoding Telegram's {method} reply"))?;
 
     if response.get("ok").and_then(Value::as_bool) != Some(true) {

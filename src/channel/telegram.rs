@@ -88,9 +88,11 @@ impl Telegram {
             .json(&body)
             .send()
             .await
+            .map_err(scrub)
             .with_context(|| format!("telegram {method}"))?
             .json()
             .await
+            .map_err(scrub)
             .with_context(|| format!("decoding telegram {method}"))?;
 
         if response.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -498,11 +500,14 @@ impl Telegram {
             .timeout(Duration::from_secs(120))
             .send()
             .await
+            .map_err(scrub)
             .context("downloading the file from telegram")?
             .error_for_status()
+            .map_err(scrub)
             .context("downloading the file from telegram")?
             .bytes()
             .await
+            .map_err(scrub)
             .context("reading the download")?;
 
         // The update's `file_size` is the only pre-check there is, and it is
@@ -617,6 +622,23 @@ impl Channel for Telegram {
         .await?;
         Ok(())
     }
+}
+
+/// Drop the URL from a transport error, because every Bot API URL carries the
+/// bot token in its path.
+///
+/// reqwest's `Display` quotes the URL it was given, and the poller reports its
+/// failures with `{e:#}` — so a network outage wrote the token into the journal
+/// once per poll, 110 times in the hour this was found. A bot token in a chat
+/// is a shell on this machine, and a log is read, shared and pasted far more
+/// freely than `~/.config/omatether/env` is. The cause (a timeout, DNS, a 409)
+/// survives untouched, and which call it was is already in our own context —
+/// that was the useful half of the line.
+///
+/// Apply it to every reqwest result built from `base` or `file_base`, including
+/// `error_for_status` and the body reads: they all carry the request's URL.
+pub(super) fn scrub(e: reqwest::Error) -> reqwest::Error {
+    e.without_url()
 }
 
 /// Telegram refusing to parse what we sent, as opposed to any other failure.
@@ -779,6 +801,33 @@ mod tests {
     #[test]
     fn empty_allowlist_is_refused() {
         assert!(Telegram::new("t", vec![], PathBuf::from("/nonexistent")).is_err());
+    }
+
+    /// The token must not survive into a log line. Uses a real transport
+    /// failure rather than a hand-built error, because what leaks is reqwest's
+    /// own `Display`, and a stub of it would not catch the version that changes
+    /// its mind. No network: the port is bound to learn a free one and then
+    /// dropped, so the connect is refused locally.
+    #[tokio::test]
+    async fn a_failed_call_does_not_log_the_token() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/bot1234:SECRET-TOKEN/getUpdates");
+
+        let raw = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        assert!(
+            format!("{raw}").contains("SECRET-TOKEN"),
+            "reqwest stopped quoting the url, so this test proves nothing: {raw}"
+        );
+
+        let scrubbed = anyhow::Error::new(scrub(raw)).context("telegram getUpdates");
+        let line = format!("{scrubbed:#}");
+        assert!(!line.contains("SECRET-TOKEN"), "token leaked: {line}");
+        // The cause is the half worth keeping.
+        assert!(line.contains("telegram getUpdates"), "{line}");
+        assert!(line.contains("error sending request"), "{line}");
     }
 
     #[test]

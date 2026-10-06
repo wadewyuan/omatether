@@ -265,6 +265,17 @@ Recovery is logged too: without it, a poll that fails for twenty minutes and
 then works again leaves no timeline for "my message got no reply" to sit
 against.
 
+**And printing that chain put the bot token in the journal.** The token is in
+every Bot API URL's path, reqwest's `Display` quotes the URL it failed on, and
+`{e:#}` reaches it — so one network outage wrote the token to the journal on
+every poll, 110 times in an hour, under `omatether::channel::telegram`. Every
+reqwest result built from `base` or `file_base` now goes through
+`telegram::scrub` (`reqwest::Error::without_url`) before it gets context,
+`error_for_status` and the body reads included; `telegram_setup` uses it too.
+A log is pasted into issues and scrolled past on a shared screen far more
+freely than `~/.config/omatether/env` is read. Nothing else leaks this way:
+Photon's secret travels as a header and its URL carries only the project id.
+
 **Telegram renders nothing without a `parse_mode`, and the mode has to be
 HTML.** A turn is markdown — the agents write it — so it used to arrive as raw
 `**asterisks**` and visible backticks. `MarkdownV2` is not the fix: it requires
@@ -447,6 +458,21 @@ Telegram needs the live bot (so, the running service), and Photon needs someone
 to text the line.
 
 ## Storage
+
+**Everything this service writes is 0600, and three of the four places had to
+be told twice.** The inbox files and the spill files always were. But the
+*spill directory* was `create_dir_all`, so 0755 — and the file names are the
+thread keys, which on Photon is the phone number, so a directory listing was
+the roster of who talks to this bridge. And `state.db` is created by sqlite
+rather than by us, so the umask made it 0644: thread keys and each one's
+working directory, world-readable. Two rules fall out of fixing them. **Chmod
+what is already there, not just what you create** — every live spill directory
+was made 0755 by the old code, so tightening only on creation fixes nothing on
+a machine that has already run. And **chmod the database before sqlite opens
+it**, creating it empty if need be: sqlite copies the main file's mode onto
+`-wal` and `-shm` when it makes them, so a chmod afterwards leaves a
+world-readable WAL holding the newest writes. All three have tests, each
+confirmed to fail with the fix removed.
 
 **Databases exist in the wild. Changing `CREATE TABLE` is not a migration.**
 `session_id` began `NOT NULL` and later had to accept null; only the fresh-database

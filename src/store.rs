@@ -62,6 +62,8 @@ impl Store {
             std::fs::create_dir_all(parent).ok();
         }
 
+        Self::restrict(path);
+
         let conn = Connection::open(path)
             .with_context(|| format!("opening state database at {}", path.display()))?;
 
@@ -80,6 +82,45 @@ impl Store {
         migrate(&conn)?;
 
         Ok(Self { conn })
+    }
+
+    /// Make the database 0600 *before* sqlite opens it, creating it empty if
+    /// it is not there yet.
+    ///
+    /// Left to the umask it was 0644, and what it holds is who talks to this
+    /// bridge and from where: the thread keys are phone numbers and Telegram
+    /// user ids, next to each one's working directory. The same reasoning as
+    /// the inbox and the spill directory, which were already 0600 — this file
+    /// was the one left out, because sqlite creates it rather than us.
+    ///
+    /// Before, not after, and the `-wal`/`-shm` too: sqlite copies the main
+    /// file's mode onto those when it creates them, so a chmod afterwards
+    /// leaves a world-readable WAL holding the most recent writes.
+    ///
+    /// Best effort on purpose. A database that refuses to chmod — one on a
+    /// filesystem with no unix modes — is still a database worth opening, and
+    /// failing here would take the service down over a hardening step.
+    fn restrict(path: &Path) {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let fresh = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path);
+
+        if fresh.is_err() {
+            // Already there — or unopenable, which `Connection::open` will
+            // report far better than a permissions warning would.
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = path.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::set_permissions(
+                    std::path::Path::new(&p),
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+        }
     }
 
     /// Wrap an already-open connection. For tests that build an older schema.
@@ -282,6 +323,46 @@ fn session_id_is_nullable(conn: &Connection) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The thread keys in here are phone numbers and Telegram user ids. Both
+    /// the fresh-file path and the chmod-what-is-there path are covered: every
+    /// database that already exists was created 0644 by the umask.
+    #[test]
+    fn the_database_is_not_readable_by_anyone_else() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("om-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (name, pre_create) in [("fresh.db", false), ("existing.db", true)] {
+            let path = dir.join(name);
+            if pre_create {
+                std::fs::write(&path, b"").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+
+            let store = Store::open(&path).unwrap();
+            // A write, so the -wal exists to be checked: sqlite takes the main
+            // file's mode when it creates one, which is why the chmod happens
+            // before the open and not after.
+            store
+                .get_or_create("photon:+15551234567", "/home/wy/Work", "claude")
+                .unwrap();
+
+            for suffix in ["", "-wal"] {
+                let mut p = path.as_os_str().to_owned();
+                p.push(suffix);
+                let p = std::path::PathBuf::from(p);
+                if !p.exists() {
+                    continue;
+                }
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+                assert_eq!(mode & 0o077, 0, "{} is readable by others", p.display());
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn first_sight_creates_a_session_and_it_sticks() {
