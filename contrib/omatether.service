@@ -10,7 +10,14 @@ Type=simple
 # Explicit rather than inherited: a user service does not source .bashrc, so
 # without this neither `claude` nor the other mise-installed agents are found.
 # node is on this PATH too: the Photon channel supervises a Node sidecar.
-Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin
+#
+# The mise shims come before ~/.local/bin, which is where an agent's own
+# native installer leaves a symlink to whichever version it last installed.
+# With that first, the service ran a `claude` two months older than the shell
+# did — and an agent's model catalog comes out of its handshake, so the bridge
+# offered a model line that had since been superseded and there was nothing on
+# screen to say why. The shims track the version you actually update.
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin
 
 # Channel credentials. At least one channel must be configured:
 #   OMATETHER_TELEGRAM_TOKEN, OMATETHER_TELEGRAM_ALLOWED_USERS
