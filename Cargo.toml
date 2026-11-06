@@ -19,6 +19,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     # bytes_stream(), for the sidecar's open-ended NDJSON response.
     "stream",
+    # Outbound files: a multipart body for sendPhoto/sendDocument.
+    "multipart",
 ] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

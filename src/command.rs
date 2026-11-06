@@ -21,6 +21,8 @@ pub enum Command {
     Model(ModelRequest),
     /// Get the line to type to take over at a real terminal.
     Attach,
+    /// Hand a file on this machine to the chat.
+    Send(String),
     /// Report agent, directory, session and whether a turn is running.
     Status,
     /// Show the last finished turn in full, tool calls and all.
@@ -82,6 +84,7 @@ pub fn parse(text: &str) -> Command {
             _ => ModelRequest::Set(rest.to_string()),
         }),
         "/attach" => Command::Attach,
+        "/send" => Command::Send(rest.to_string()),
         "/log" => Command::Log,
         "/auto" | "/yolo" => Command::Auto(match rest.to_ascii_lowercase().as_str() {
             "" => None,
@@ -103,6 +106,7 @@ omatether — your coding agent, over chat
 /agent <name>  switch agent (claude, codex, pi, ...)
 /model [name]  which model the agent runs (/model default to undo)
 /attach        how to take over at a real terminal
+/send <path>   have the bridge send you a file it made
 /status        agent, model, directory, session, whether a turn is running
 /log           the last turn in full, every tool call included
 /allow         approve a pending tool call
@@ -115,6 +119,12 @@ slash commands.
 Send a photo, a screenshot or a file and it is saved where the agent \
 can open it; anything you type with it comes through as the prompt. \
 Received files are deleted after a week.
+
+The agent can send a file back the same way, and so can you: ask it to \
+hand one over, or type /send <path>. Only files inside the thread's \
+working directory, this service's own inbox, or the temp directory are \
+sent, and nothing hidden — the bridge is not a way to read any file off \
+the machine.
 
 Threads start in auto mode: tool calls run without asking, and you \
 see each one in the reply as it happens. /auto off puts the gate \

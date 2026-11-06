@@ -8,6 +8,7 @@
 //                     (`text` may be empty — a sticker, or an image whose words
 //                     are all in `files`)
 //   POST /send     -> { spaceId, text, format? } -> { ok, messageId }
+//   POST /send-file -> { spaceId, path, caption? } -> { ok, messageId }
 //   POST /typing   -> { spaceId, state? }          -> { ok }
 //   POST /fetch    -> { messageId }                -> { ok, files: [...] }
 //                     downloads that message's attachments to the inbox; asked
@@ -50,7 +51,12 @@ function requireEnv(name) {
   return value;
 }
 
-const { Spectrum, text: spectrumText, markdown: spectrumMarkdown } = await import("spectrum-ts");
+const {
+  Spectrum,
+  text: spectrumText,
+  markdown: spectrumMarkdown,
+  attachment: spectrumAttachment,
+} = await import("spectrum-ts");
 const { imessage } = await import("spectrum-ts/providers/imessage");
 
 // Spectrum validates credentials against Photon's cloud during construction,
@@ -333,6 +339,20 @@ const server = http.createServer(async (req, res) => {
       // Defaulting to "text" keeps the unsafe direction the explicit one: a
       // caller that forgets the field gets its string through untouched.
       const result = await sendAs(space, text, format ?? "text");
+      return reply(res, 200, { ok: true, messageId: result?.id ?? null });
+    }
+
+    // The caption goes second, as its own plain message: iMessage delivers a
+    // file and its words separately anyway, inbound as well as out. The file is
+    // first so that a caption failing cannot cost the file.
+    if (req.method === "POST" && req.url === "/send-file") {
+      const { spaceId, path: filePath, caption } = await readJson(req);
+      if (!spaceId || typeof filePath !== "string") {
+        return reply(res, 400, { ok: false, error: "spaceId and path required" });
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await space.send(spectrumAttachment(filePath));
+      if (caption) await sendAs(space, caption, "text");
       return reply(res, 200, { ok: true, messageId: result?.id ?? null });
     }
 

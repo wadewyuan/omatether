@@ -457,6 +457,41 @@ has not been watched is a screenshot landing in `in/` and an agent opening it.
 Telegram needs the live bot (so, the running service), and Photon needs someone
 to text the line.
 
+## Sending files
+
+**The agent asks in text, and the core decides.** A `[send-file: /path — caption]`
+line is lifted out of the prose by the renderer and drained once
+(`take_files`), so a turn re-composed on every flush cannot send twice. It is
+text rather than a tool because that is the one thing all nine agents can do,
+the same reason an inbound file is a path. `/send <path>` goes through the same
+check, `sendfile::resolve`, and the brief only offers the marker when
+`can_send_files` is true.
+
+**Containment was not enough on its own.** The packaged unit serves `--dir %h`,
+so `$HOME` can be the working directory and `~/.ssh/id_rsa` is inside the root.
+So nothing with a dot-named step below its root is sent, judged on the
+canonical path (a symlink to a key is as hidden as the key). The roots are
+`in/` and `out/`, not the state directory, because that holds `state.db`. This
+is a guard against an agent being talked into it, not a sandbox: it goes only to
+an allowlisted chat, and an unhidden secret in the working directory still goes.
+
+**A failed upload is the one send the outbox reports to the chat.** The core has
+already moved on, and the prose around it still says "here is your chart".
+
+Telegram: `sendPhoto` is a choice made on type and size, and a refusal only
+Telegram can make (a full-page screenshot's proportions) goes again as
+`sendDocument`. Only a `Refused`: a transport error may have landed, and a retry
+would post the file twice. Captions stop at 1024 characters, not 4096, and over
+that is a 400 that loses the file. Multipart is verified as far as Telegram's
+parser: `cargo test -- --ignored live_upload` with the token set uses the
+`chat_id: 0` rig below, so it delivers nothing and leaves `getUpdates` alone.
+
+Photon: `/send-file` takes a path, and the SDK's `attachment(path)` reads it.
+The file goes first and the caption after as plain text, so a caption failing
+cannot cost the file. The builder is checked against 12.7.0 on a real file.
+**Unverified:** a file reaching a phone on either channel, and whether Photon
+has its own size ceiling below our 50 MB.
+
 ## Storage
 
 **Everything this service writes is 0600, and three of the four places had to
@@ -611,6 +646,21 @@ worst kind of bug to find.
   stands on its own. `/log` shows the whole turn with every call on its own
   line (`compose_log`) for whoever wants the working. It is kept in memory
   only, per thread. Spilling to a file is now for permission questions alone.
+- **A streaming turn settles to that same answer when it ends.** The `▸` tool
+  lines are progress, and progress stops being worth showing the moment the
+  turn is over — a finished Telegram message that still carries them is the
+  answer with the agent's working threaded through it, wrapped across four
+  lines of a phone screen. So on a channel that can edit, the last flush edits
+  the message to `compose_answer` (`TurnRenderer::settles`): the lines are
+  there the whole time it runs, and gone from what you scroll back to. Three
+  turns keep their working, each because settling would erase something still
+  on screen — one that has already **paged** (those messages were sealed with
+  their tool lines in them and can never be edited, so the answer under them
+  would only repeat prose that already arrived), one that ended **on a tool
+  call** (no answer exists, and the lines are the whole record of what ran),
+  and one that **failed** (same, at the moment it is worth most). The settle is
+  asked for ahead of `renderer.pending()`, because a turn whose last event
+  changed no text has nothing pending and still has to settle.
 - **Every chat thread tells its agent where it is read.** `core::brief`
   becomes `--append-system-prompt` (claude, pi) or
   `-c developer_instructions="…"` (codex), on every spawn. It is a system

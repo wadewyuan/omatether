@@ -15,10 +15,10 @@ pub mod photon_setup;
 pub mod telegram;
 pub mod telegram_setup;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 
 /// A channel asking to be tried again in a moment.
@@ -135,6 +135,32 @@ pub trait Channel: Send + Sync {
     /// `false` means every flush would be a new message, so the core holds the
     /// turn back and delivers it once, complete.
     fn can_edit(&self) -> bool;
+
+    /// Whether this channel can carry a file the agent produced.
+    ///
+    /// The other half of [`InboundKind::Text`]'s files: inbound lands a path in the
+    /// prompt, outbound hands the bytes back to the phone. Asked as a capability
+    /// rather than assumed, because the core has to be able to say "I can't send
+    /// files here" instead of quietly dropping the one the agent asked for.
+    fn can_send_files(&self) -> bool {
+        false
+    }
+
+    /// Hand a file this machine produced to the chat, with an optional caption.
+    ///
+    /// Only called when [`Channel::can_send_files`] is true. `path` has already been
+    /// checked by [`crate::sendfile`] — which files may leave this machine is the
+    /// core's policy, not each adapter's — so an adapter's own refusals are about
+    /// the platform: a picture too big for `sendPhoto`, a document over the upload
+    /// ceiling, a file that vanished between the decision and the send.
+    async fn send_file(
+        &self,
+        _thread: &ThreadKey,
+        _path: &Path,
+        _caption: &str,
+    ) -> Result<MessageId> {
+        bail!("{} cannot send files", self.name())
+    }
 
     /// Post a new message and return its id.
     async fn send(&self, thread: &ThreadKey, text: &str) -> Result<MessageId>;

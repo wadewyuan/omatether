@@ -14,6 +14,7 @@ mod event;
 mod outbox;
 mod pi;
 mod render;
+mod sendfile;
 mod setup;
 mod store;
 mod tmux;
@@ -190,7 +191,7 @@ async fn serve(
     tracing::info!("default agent {default_agent}");
     tracing::info!("state {}", state_path.display());
 
-    Core::new(store, channels, dir, default_agent, spill_dir)
+    Core::new(store, channels, dir, default_agent, spill_dir, state_dir)
         .run(inbound_rx)
         .await
 }
@@ -673,6 +674,8 @@ async fn handle_input(
         | command::Command::Cd(_)
         | command::Command::Agent(_)
         | command::Command::Attach
+        // The repl has no chat to send a file to.
+        | command::Command::Send(_)
         // The repl prints every tool call as it happens; there is nothing
         // left out to look back at.
         | command::Command::Log => {

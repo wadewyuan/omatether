@@ -12,7 +12,7 @@
 //! * **No buttons.** Permission questions arrive as text asking for `/allow`
 //!   or `/deny`, which the command parser already understands.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +31,9 @@ pub const CHANNEL: &str = "photon";
 /// iMessage has no documented hard limit, but a wall of text is unreadable on a
 /// phone and long agent output belongs somewhere else anyway.
 const MAX_TEXT: usize = 3000;
+
+/// How long the sidecar has to read a file and get it to Photon.
+const UPLOAD_TIMEOUT_SECS: u64 = 120;
 
 pub struct Photon {
     http: reqwest::Client,
@@ -352,6 +355,48 @@ impl Channel for Photon {
     /// iMessage cannot rewrite a sent message.
     fn can_edit(&self) -> bool {
         false
+    }
+
+    fn can_send_files(&self) -> bool {
+        true
+    }
+
+    /// Hand a file to the chat. The sidecar reads it, so this sends a path and not
+    /// the bytes: both ends are this machine, and the path has already been through
+    /// [`crate::sendfile`].
+    async fn send_file(&self, thread: &ThreadKey, path: &Path, caption: &str) -> Result<MessageId> {
+        let response: Value = self
+            .http
+            .post(format!("{}/send-file", self.base))
+            .header("x-omatether-token", &self.token)
+            .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS))
+            .json(&json!({
+                "spaceId": thread.chat_id,
+                "path": path,
+                "caption": clip(caption),
+            }))
+            .send()
+            .await
+            .context("photon /send-file")?
+            .json()
+            .await
+            .context("decoding photon /send-file")?;
+
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            bail!(
+                "{}",
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            );
+        }
+
+        Ok(response
+            .get("messageId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// A turn is markdown, because the agents write markdown. iMessage has no

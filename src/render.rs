@@ -31,6 +31,27 @@ enum Segment {
     },
 }
 
+/// What the agent asked to hand over, as it wrote it.
+///
+/// A path string rather than a [`std::path::Path`], because at this point it is
+/// still something a model typed — relative, quoted, maybe not real. Deciding what
+/// it means, and whether this service is willing to send it at all, is
+/// [`crate::sendfile`]'s job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRequest {
+    pub path: String,
+    pub caption: Option<String>,
+}
+
+/// What opens a file request: a line of its own, `[send-file: <path>]`, optionally
+/// `[send-file: <path> — caption]`.
+///
+/// Bracketed for the same reason inbound attachments are announced as an
+/// `[attachment: …]` line — the two directions read the same way, and a marker that
+/// looks like a sentence nobody would write is a marker that does not fire by
+/// accident.
+const FILE_MARKER: &str = "[send-file:";
+
 #[derive(Debug, Default)]
 pub struct TurnRenderer {
     segments: Vec<Segment>,
@@ -44,6 +65,16 @@ pub struct TurnRenderer {
     page: PageStart,
     thinking: bool,
     finished: bool,
+    /// Whether the turn ended badly, which keeps its working on screen.
+    failed: bool,
+    /// File requests harvested out of the text, waiting to be handed to the core.
+    ///
+    /// Kept here rather than passed up through [`Self::apply`]'s return value
+    /// because they are found while composing, and composition happens in a dozen
+    /// places. [`Self::take_files`] drains them, which is what makes "send this
+    /// once" true across a turn's many flushes: the text is re-composed whole every
+    /// time, and a marker still sitting in it would be sent again.
+    files: Vec<FileRequest>,
 }
 
 /// Where the message a turn is currently growing begins.
@@ -86,6 +117,7 @@ impl TurnRenderer {
                     Some(Segment::Text(existing)) => existing.push_str(text),
                     _ => self.segments.push(Segment::Text(text.clone())),
                 }
+                self.harvest(false);
             }
 
             // The complete block repeats what the deltas already delivered.
@@ -94,6 +126,7 @@ impl TurnRenderer {
                 self.thinking = false;
                 if !matches!(self.segments.last(), Some(Segment::Text(_))) {
                     self.segments.push(Segment::Text(text.clone()));
+                    self.harvest(false);
                 }
             }
 
@@ -112,16 +145,22 @@ impl TurnRenderer {
             AgentEvent::TurnEnd { ok, detail } => {
                 self.finished = true;
                 if !ok {
+                    self.failed = true;
                     self.segments.push(Segment::Text(format!(
                         "\n\n[turn failed: {}]",
                         detail.as_deref().unwrap_or("unknown")
                     )));
                 }
+                // The last line of a turn has no newline after it, and a marker
+                // written as the agent's final act is exactly the case that would
+                // otherwise never be read.
+                self.harvest(true);
             }
 
             AgentEvent::Error { message } => {
                 self.segments
                     .push(Segment::Text(format!("\n\n[error: {message}]")));
+                self.harvest(true);
             }
 
             // Handled by the core, or deliberately not shown.
@@ -283,6 +322,51 @@ impl TurnRenderer {
         self.sent = text;
     }
 
+    /// Whether this turn's message should now settle to its answer.
+    ///
+    /// The tool lines are progress, and progress stops being worth showing the
+    /// moment the turn is over: what is left on screen then is the answer with
+    /// the agent's working threaded through it, which on a phone is what stands
+    /// between the reader and what it concluded. So on a channel that can edit,
+    /// the last flush replaces the message with [`Self::compose_answer`] — the
+    /// same text a channel that cannot edit has always been sent — and `/log`
+    /// keeps the working. While the turn is running the lines stay: they are
+    /// the only sign of what it is doing, and the one the typing indicator
+    /// stops giving the moment any text reaches the chat.
+    ///
+    /// Three turns do not settle, and each would lose something that is on
+    /// screen now. One that has already filled a message: those pages were
+    /// sealed with their tool lines in them and can never be edited, so an
+    /// answer settled under them only repeats prose that has already arrived.
+    /// One that ended *on* a tool call — stopped, interrupted — has no answer
+    /// to settle to, and the working is the whole record of what ran. And one
+    /// that failed keeps its working for the same reason, which is the moment
+    /// it is worth most.
+    pub fn settles(&self) -> bool {
+        self.finished && !self.failed && !self.has_paged() && self.ends_on_text()
+    }
+
+    /// What [`Self::settles`] should send, or `None` when nothing changed.
+    ///
+    /// Same contract as [`Self::pending`].
+    pub fn settled(&self) -> Option<String> {
+        if !self.settles() {
+            return None;
+        }
+        let text = self.compose_answer();
+        (text != self.sent).then_some(text)
+    }
+
+    /// Whether the turn's last word is the agent's rather than a tool's.
+    fn ends_on_text(&self) -> bool {
+        matches!(self.segments.last(), Some(Segment::Text(text)) if !text.trim().is_empty())
+    }
+
+    /// Whether a message of this turn has been sealed and left behind.
+    fn has_paged(&self) -> bool {
+        self.page != PageStart::default()
+    }
+
     /// Whether any of this turn has reached the chat yet.
     ///
     /// What the working indicator is for: until the first flush lands there is
@@ -306,6 +390,130 @@ impl TurnRenderer {
     pub fn reset(&mut self) {
         *self = Self::new();
     }
+
+    /// Take the file requests found so far, once.
+    ///
+    /// Draining is the point: a turn is re-composed whole on every flush, so a
+    /// marker found twice would send twice.
+    pub fn take_files(&mut self) -> Vec<FileRequest> {
+        std::mem::take(&mut self.files)
+    }
+
+    /// Lift file-request lines out of the prose being built, and record them.
+    ///
+    /// Only lines that are *finished* are read — a delta can split a marker down the
+    /// middle (`[send-file: /home/wy/wo` then `rk/x.jpg]`), and harvesting a prefix
+    /// would send a path that was never written. `final` says the text will not grow
+    /// again, which is when the unterminated last line is safe to read too.
+    ///
+    /// Lines inside a fenced code block are left alone. An agent explaining the
+    /// marker, or pasting a log that happens to contain one, is writing about a
+    /// file, not handing one over.
+    fn harvest(&mut self, finished: bool) {
+        let Some(Segment::Text(_)) = self.segments.last() else {
+            return;
+        };
+
+        // Fence state at the start of the last segment, from the prose before it:
+        // a code block opened two paragraphs ago is still open, and the marker
+        // inside it belongs to the block.
+        let open = fence_parity(&self.segments[..self.segments.len() - 1]);
+
+        let (kept, found) = {
+            let Segment::Text(text) = &self.segments[self.segments.len() - 1] else {
+                unreachable!()
+            };
+            harvest_lines(text, open, finished)
+        };
+
+        if found.is_empty() {
+            return;
+        }
+        if let Some(Segment::Text(text)) = self.segments.last_mut() {
+            *text = kept;
+        }
+        self.files.extend(found);
+    }
+}
+
+/// Whether the prose so far leaves a code block open.
+fn fence_parity(segments: &[Segment]) -> bool {
+    segments
+        .iter()
+        .filter_map(|segment| match segment {
+            Segment::Text(text) => Some(text.as_str()),
+            Segment::Tool { .. } => None,
+        })
+        .flat_map(|text| text.lines())
+        .filter(|line| is_fence(line))
+        .count()
+        % 2
+        == 1
+}
+
+/// One line, read as a file request, or not a file request at all.
+fn file_marker(line: &str) -> Option<FileRequest> {
+    let rest = line.trim().strip_prefix(FILE_MARKER)?.strip_suffix(']')?;
+
+    // The em dash is what `compose` uses to announce an inbound file, so the two
+    // directions read alike; `--` is what an agent types when it does not have one.
+    let (path, caption) = match rest.split_once(" — ").or_else(|| rest.split_once(" -- ")) {
+        Some((path, caption)) => (path.trim(), caption.trim()),
+        None => (rest.trim(), ""),
+    };
+
+    (!path.is_empty()).then_some(FileRequest {
+        path: path.to_string(),
+        caption: (!caption.is_empty()).then(|| caption.to_string()),
+    })
+}
+
+/// Split finished lines into "stays in the message" and "hands a file over".
+///
+/// A marker line leaves the message entirely, newline included: it is an
+/// instruction, not something to read. `open_at_start` carries a code fence begun
+/// in earlier prose, and `final` permits reading a last line with no newline after
+/// it — which is safe only once the text is known to be finished.
+fn harvest_lines(text: &str, open_at_start: bool, finished: bool) -> (String, Vec<FileRequest>) {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut kept = String::with_capacity(text.len());
+    let mut found = Vec::new();
+    let mut open = open_at_start;
+    // Set when a marker was dropped between two newlines, so removing it does not
+    // leave a gap the agent did not write.
+    let mut glue = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let last = i + 1 == lines.len();
+        let body = line.trim_end_matches('\n');
+
+        // An unterminated last line is a half-written marker until the turn is
+        // over. Everything else is a whole line and can be read.
+        let readable = !last || finished || line.ends_with('\n');
+
+        if is_fence(body) {
+            open = !open;
+            kept.push_str(line);
+            continue;
+        }
+
+        if readable && !open {
+            if let Some(request) = file_marker(body) {
+                found.push(request);
+                glue = kept.ends_with('\n') && line.ends_with('\n');
+                continue;
+            }
+        }
+
+        if glue && line.starts_with('\n') && kept.ends_with('\n') {
+            kept.push_str(&line[1..]);
+        } else {
+            kept.push_str(line);
+        }
+        glue = false;
+    }
+
+    (kept, found)
 }
 
 /// Wrap literal text in a markdown code span, so a channel that renders
@@ -1057,6 +1265,63 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_turn_settles_to_its_answer_and_says_so_once() {
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("Checking:"));
+        r.apply(&tool("Bash", "ls"));
+        r.apply(&delta("\n\nTwo files."));
+        assert!(!r.settles(), "not while it is running");
+
+        r.mark_sent(r.compose());
+        r.apply(&AgentEvent::TurnEnd {
+            ok: true,
+            detail: None,
+        });
+        assert_eq!(r.settled().as_deref(), Some("Two files."));
+
+        // Same contract as `pending`: once it is what the chat shows, the next
+        // flush has nothing to do.
+        r.mark_sent("Two files.".to_string());
+        assert_eq!(r.settled(), None);
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_its_working() {
+        // The one time the tool lines matter most: they are what says how far
+        // it got before the error.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("Checking:"));
+        r.apply(&tool("Bash", "ls"));
+        r.apply(&AgentEvent::TurnEnd {
+            ok: false,
+            detail: Some("401".into()),
+        });
+        assert!(!r.settles());
+        assert!(r.compose().contains('▸'), "{}", r.compose());
+    }
+
+    #[test]
+    fn a_turn_that_has_already_paged_keeps_its_working() {
+        // The page above was sealed with its tool line in it and can never be
+        // edited, so an answer settled under it would only repeat prose that
+        // has already arrived.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta(&"x".repeat(95)));
+        r.apply(&tool("Bash", "ls"));
+        r.apply(&delta("\n\nTwo files."));
+        let pages = r.paginate(100);
+        assert_eq!(pages.sealed.len(), 1, "{pages:?}");
+        r.begin_page(pages.sealed[0].1.clone());
+
+        r.apply(&AgentEvent::TurnEnd {
+            ok: true,
+            detail: None,
+        });
+        assert!(!r.settles());
+        assert_eq!(r.settled(), None);
+    }
+
+    #[test]
     fn reset_clears_the_turn() {
         let mut r = TurnRenderer::new();
         r.apply(&delta("old"));
@@ -1064,5 +1329,89 @@ mod tests {
         r.reset();
         assert_eq!(r.compose(), "working…");
         assert_eq!(r.pending().as_deref(), Some("working…"), "a fresh turn");
+    }
+
+    #[test]
+    fn a_file_request_is_lifted_out_of_the_prose() {
+        let mut r = TurnRenderer::new();
+        r.apply(&delta(
+            "Here is the chart:\n\n[send-file: /tmp/chart.png]\n\nQueue is clear.",
+        ));
+        r.harvest(true);
+
+        let files = r.take_files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].path, "/tmp/chart.png");
+        assert_eq!(files[0].caption, None);
+
+        // What the person reads has no instruction in it.
+        let text = r.compose();
+        assert!(!text.contains("send-file"), "{text}");
+        assert!(text.contains("Here is the chart"), "{text}");
+        assert!(text.contains("Queue is clear"), "{text}");
+    }
+
+    #[test]
+    fn a_file_request_can_carry_a_caption() {
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("[send-file: /tmp/chart.png — the queue today]"));
+        r.harvest(true);
+
+        let files = r.take_files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].path, "/tmp/chart.png");
+        assert_eq!(files[0].caption.as_deref(), Some("the queue today"));
+    }
+
+    #[test]
+    fn a_file_request_is_handed_over_once() {
+        // Every flush re-composes the whole message. A marker left in the text
+        // would be sent again on the next tick, and again after that.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("[send-file: /tmp/chart.png]"));
+        r.harvest(true);
+        assert_eq!(r.take_files().len(), 1);
+        r.harvest(true);
+        assert!(r.take_files().is_empty(), "drained, not re-read");
+    }
+
+    #[test]
+    fn a_file_request_inside_a_code_block_is_left_alone() {
+        // An agent showing the syntax back to someone, or writing it into a
+        // script, is not asking for a file.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("```\n[send-file: /tmp/chart.png]\n```"));
+        r.harvest(true);
+        assert!(r.take_files().is_empty());
+        assert!(r.compose().contains("send-file"));
+    }
+
+    #[test]
+    fn a_file_request_half_written_is_not_read() {
+        // Deltas stop mid-word. Acting on `[send-file: /tmp/ch` would act on a
+        // file nobody asked for.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta("working\n[send-file: /tmp/ch"));
+        r.harvest(false);
+        assert!(r.take_files().is_empty());
+
+        r.apply(&delta("art.png]\nafter"));
+        r.harvest(true);
+        let files = r.take_files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].path, "/tmp/chart.png");
+    }
+
+    #[test]
+    fn a_file_request_in_the_middle_of_a_sentence_is_left_alone() {
+        // Only a line that is nothing but the marker is an instruction; a
+        // mention of one inside a sentence is prose about one.
+        let mut r = TurnRenderer::new();
+        r.apply(&delta(
+            "you can write [send-file: /tmp/x.png] on its own line",
+        ));
+        r.harvest(true);
+        assert!(r.take_files().is_empty());
+        assert!(r.compose().contains("send-file"));
     }
 }

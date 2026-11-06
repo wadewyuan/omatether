@@ -58,6 +58,7 @@ message rather than being cut.
 | `/model [name]` | List models, or switch without losing the conversation |
 | `/status` | Agent, model, directory, and whether a turn is running |
 | `/log` | The last turn in full, with every tool call |
+| `/send <path>` | Send a file from this machine to the chat |
 | `/attach` | The ssh command to take over at a real terminal |
 | `/auto [on\|off]` | Whether tool calls run without asking. **On by default** |
 | `/allow`, `/deny <why>` | Answer a permission question |
@@ -69,6 +70,11 @@ so `/review` works.
 **Photos and files** are saved to `~/.local/state/omatether/in/` and passed to
 the agent as a file path, with your caption as the prompt. The limit is 20 MB.
 Files are private to you and deleted after a week.
+
+**Files come back too.** Ask the agent for one, or type `/send <path>`. Only
+files in the thread's working directory, omatether's own inbox, or the temp
+directory are sent, up to 50 MB, and nothing hidden, so `~/.ssh` and `.env`
+stay put even when the agent is working in your home directory.
 
 ## Agents, and what they may do without asking
 

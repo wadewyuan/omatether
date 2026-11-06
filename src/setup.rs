@@ -520,7 +520,16 @@ async fn install_service(prompter: &mut Prompter) -> Result<()> {
     // Said here, with the reason, rather than left for a silent chat.
     println!("  ✗ the service did not stay up. Its last words:");
     if let Ok(out) = tokio::process::Command::new("journalctl")
-        .args(["--user", "-u", "omatether", "-n", "15", "--no-pager", "-o", "cat"])
+        .args([
+            "--user",
+            "-u",
+            "omatether",
+            "-n",
+            "15",
+            "--no-pager",
+            "-o",
+            "cat",
+        ])
         .output()
         .await
     {
@@ -587,7 +596,7 @@ fn render_unit(exe: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin\n\
+         Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin\n\
          EnvironmentFile=%h/.config/omatether/env\n\
          ExecStart={} serve --dir %h\n\
          Restart=on-failure\n\
@@ -710,10 +719,13 @@ mod tests {
         // The unit on the machine this was written on said `%h/…`, and a
         // plain string match called it stale.
         let home = std::env::var("HOME").unwrap();
-        let unit = "[Service]\nExecStart=%h/src/omatether/target/release/omatether serve --dir %h/src\n";
+        let unit =
+            "[Service]\nExecStart=%h/src/omatether/target/release/omatether serve --dir %h/src\n";
         assert_eq!(
             unit_exe(unit),
-            Some(PathBuf::from(format!("{home}/src/omatether/target/release/omatether")))
+            Some(PathBuf::from(format!(
+                "{home}/src/omatether/target/release/omatether"
+            )))
         );
         assert_eq!(
             unit_exe(&render_unit(Path::new("/usr/bin/omatether"))),
@@ -751,5 +763,18 @@ mod tests {
         assert!(unit.contains("ExecStart=/usr/bin/omatether serve --dir %h"));
         assert!(unit.contains("EnvironmentFile=%h/.config/omatether/env"));
         assert!(unit.contains("mise/shims"), "agents live behind mise shims");
+
+        // Order, not just presence: ~/.local/bin holds whatever an agent's own
+        // installer symlinked there once, and winning the lookup against the
+        // shims is how the service came to run a two-month-old `claude` while
+        // the shell ran the current one.
+        let path = unit
+            .lines()
+            .find(|line| line.starts_with("Environment=PATH="))
+            .expect("the unit sets PATH explicitly");
+        assert!(
+            path.find("mise/shims").unwrap() < path.find("/.local/bin").unwrap(),
+            "the shims track the version that gets updated: {path}"
+        );
     }
 }

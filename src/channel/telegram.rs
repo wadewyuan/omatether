@@ -9,7 +9,7 @@
 //! URL, no webhook and no inbound port — it stays reachable only over the
 //! tailnet.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -82,14 +82,89 @@ impl Telegram {
     }
 
     async fn call(&self, method: &str, body: Value) -> Result<Value> {
-        let response: Value = self
+        let response = self
             .http
             .post(format!("{}/{}", self.base, method))
             .json(&body)
             .send()
             .await
             .map_err(scrub)
-            .with_context(|| format!("telegram {method}"))?
+            .with_context(|| format!("telegram {method}"))?;
+
+        self.respond(method, response).await
+    }
+
+    /// One upload, streamed from disk.
+    async fn upload(
+        &self,
+        thread: &ThreadKey,
+        path: &Path,
+        mime: &str,
+        size: u64,
+        upload: &Upload,
+        caption: &str,
+    ) -> Result<MessageId> {
+        // The same chat/topic addressing every other send uses, flattened into
+        // form fields because a multipart body has no JSON in it to put them in.
+        let mut form = reqwest::multipart::Form::new();
+        if let Some(fields) = self.target(thread).as_object() {
+            for (name, value) in fields {
+                let text = match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                form = form.text(name.clone(), text);
+            }
+        }
+        if !caption.trim().is_empty() {
+            form = form.text("caption", clip_caption(caption));
+        }
+
+        // Streamed rather than read into memory: this is the one path where this
+        // service handles a file that is tens of megabytes.
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let part = reqwest::multipart::Part::stream_with_length(file, size)
+            .file_name(name)
+            .mime_str(mime)
+            .context("naming the file for telegram")?;
+        form = form.part(upload.field, part);
+
+        let response = self
+            .http
+            .post(format!("{}/{}", self.base, upload.method))
+            // The client's default is shaped around a 25-second long poll. An
+            // upload is a transfer, and a stalled one must not wedge this
+            // thread's outbound behind it.
+            .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(scrub)
+            .with_context(|| format!("telegram {}", upload.method))?;
+
+        let result = self.respond(upload.method, response).await?;
+        Ok(result
+            .get("message_id")
+            .and_then(Value::as_i64)
+            .map(|id| id.to_string())
+            .unwrap_or_default())
+    }
+
+    /// Read one Bot API reply: unwrap `result`, or turn what Telegram said into
+    /// the error this service cares about.
+    ///
+    /// Shared with the upload path because a multipart `sendPhoto` answers in
+    /// exactly the same envelope — including the 429 with `retry_after` in it, which
+    /// is the one failure the outbox knows how to wait out.
+    async fn respond(&self, method: &str, response: reqwest::Response) -> Result<Value> {
+        let response: Value = response
             .json()
             .await
             .map_err(scrub)
@@ -115,13 +190,14 @@ impl Telegram {
                 .into());
             }
 
-            bail!(
+            return Err(Refused(format!(
                 "telegram {method} failed: {}",
                 response
                     .get("description")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error")
-            );
+            ))
+            .into());
         }
 
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
@@ -182,13 +258,14 @@ impl Telegram {
     /// letters, digits and underscores, so none carry the leading slash and
     /// none carry arguments.
     pub async fn set_commands(&self) -> Result<()> {
-        const COMMANDS: [(&str, &str); 12] = [
+        const COMMANDS: [(&str, &str); 13] = [
             ("new", "start a fresh session in this thread"),
             ("stop", "interrupt the running turn"),
             ("cd", "set the working directory"),
             ("agent", "switch agent (claude, codex, pi, ...)"),
             ("model", "which model the agent runs"),
             ("attach", "how to take over at a real terminal"),
+            ("send", "send me a file the agent made"),
             ("status", "agent, model, directory, session"),
             ("log", "the last turn in full, every tool call included"),
             ("allow", "approve a pending tool call"),
@@ -614,6 +691,52 @@ impl Channel for Telegram {
         Ok(())
     }
 
+    /// Telegram takes an upload in both directions.
+    fn can_send_files(&self) -> bool {
+        true
+    }
+
+    /// Hand a file to the chat: `sendPhoto` for a picture, `sendDocument` for
+    /// everything else.
+    ///
+    /// The split is not cosmetic. Telegram re-encodes a photo — it previews inline,
+    /// which is what you want from a phone, and it loses the alpha channel, the
+    /// metadata — while a document
+    /// arrives byte for byte with its name. A screenshot belongs in the first group
+    /// and a `.svg`, a `.tiff` or a `.zip` in the second.
+    ///
+    /// The caption goes out **unrendered**, unlike a message. A caption is the
+    /// agent's own words and markup errors are common in them; a caption Telegram
+    /// refuses is a 400 that loses the *file*, and the file is the reason this call
+    /// exists.
+    ///
+    /// `sendPhoto` also refuses on things only Telegram can measure — a full-page
+    /// screenshot fails its width-to-height limit — so a picture it turns down goes
+    /// again as a document. A 429 is not a refusal and stays the outbox's to wait
+    /// out, and a transport error is not retried here: that upload may have landed.
+    async fn send_file(&self, thread: &ThreadKey, path: &Path, caption: &str) -> Result<MessageId> {
+        let meta =
+            std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a file", path.display());
+        }
+
+        let mime = mime_of(path);
+        let upload = upload_method(&mime, meta.len())?;
+
+        match self
+            .upload(thread, path, &mime, meta.len(), &upload, caption)
+            .await
+        {
+            Err(e) if upload.method == "sendPhoto" && is_refusal(&e) => {
+                tracing::info!(thread = %thread, "sending as a document instead: {e:#}");
+                self.upload(thread, path, &mime, meta.len(), &DOCUMENT, caption)
+                    .await
+            }
+            sent => sent,
+        }
+    }
+
     async fn ack_decision(&self, token: &str, note: &str) -> Result<()> {
         self.call(
             "answerCallbackQuery",
@@ -622,6 +745,127 @@ impl Channel for Telegram {
         .await?;
         Ok(())
     }
+}
+
+/// How long an upload may take before this gives up on it.
+const UPLOAD_TIMEOUT_SECS: u64 = 120;
+
+/// Telegram answered, and the answer was no.
+///
+/// Its own type because the upload path has to tell this from a transport error,
+/// where the bytes may have arrived and sending again would post the file twice.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn is_refusal(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Refused>().is_some()
+}
+
+/// The longest caption Telegram takes on a file.
+///
+/// A quarter of a message's limit, and over it the call is a 400 that loses the
+/// file. Cut rather than refused: the file is why the call exists.
+const MAX_CAPTION: usize = 1024;
+
+fn clip_caption(caption: &str) -> String {
+    if caption.chars().count() <= MAX_CAPTION {
+        return caption.to_string();
+    }
+    let kept: String = caption.chars().take(MAX_CAPTION - 1).collect();
+    format!("{kept}…")
+}
+
+/// `sendPhoto` or `sendDocument`, and the field each one wants the file under.
+#[derive(Debug, PartialEq)]
+struct Upload {
+    method: &'static str,
+    field: &'static str,
+}
+
+/// Telegram's own ceilings, as a choice rather than a retry.
+///
+/// `sendPhoto` refuses a picture over 10 MB and the Bot API will not accept an
+/// upload over 50 MB at all. Asking anyway costs a round trip and answers with a
+/// sentence nobody can act on; here the size already known turns into one that
+/// names the file.
+const PHOTO_MAX: u64 = 10 * 1024 * 1024;
+const DOCUMENT_MAX: u64 = 50 * 1024 * 1024;
+
+const DOCUMENT: Upload = Upload {
+    method: "sendDocument",
+    field: "document",
+};
+
+fn upload_method(mime: &str, size: u64) -> Result<Upload> {
+    if shows_inline(mime) && size <= PHOTO_MAX {
+        return Ok(Upload {
+            method: "sendPhoto",
+            field: "photo",
+        });
+    }
+    if size <= DOCUMENT_MAX {
+        return Ok(DOCUMENT);
+    }
+    bail!(
+        "it is {}, and Telegram will not take an upload over {}",
+        inbox::human(size),
+        inbox::human(DOCUMENT_MAX)
+    )
+}
+
+/// Whether Telegram renders this inline as a picture rather than as a file.
+///
+/// Only the formats the Bot API re-encodes as a photo. An `.svg` is text Telegram
+/// will not rasterize, a `.heic` is a phone's private format, a `.webp` is what
+/// Telegram uses for stickers, and a `.gif` would lose its animation — all four are
+/// better off arriving as themselves.
+fn shows_inline(mime: &str) -> bool {
+    matches!(mime, "image/jpeg" | "image/png" | "image/bmp")
+}
+
+/// A content type for the upload, from the name.
+///
+/// Telegram uses it to decide how to show the file, and `application/octet-stream`
+/// is the honest answer for anything unrecognized: it arrives as a file, which is
+/// what it is.
+fn mime_of(path: &Path) -> String {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "tif" | "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "json" => "application/json",
+        "txt" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "html" => "text/html",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 /// Drop the URL from a transport error, because every Bot API URL carries the
@@ -1155,5 +1399,136 @@ mod tests {
     #[test]
     fn short_text_is_untouched() {
         assert_eq!(clip("hello"), "hello");
+    }
+
+    #[test]
+    fn a_picture_is_sent_as_a_picture_and_a_file_as_a_file() {
+        let mb = 1024 * 1024;
+        assert_eq!(
+            upload_method("image/png", 8 * mb).unwrap(),
+            Upload {
+                method: "sendPhoto",
+                field: "photo"
+            }
+        );
+        // A screenshot the phone can preview inline, rather than a download.
+        assert_eq!(
+            upload_method("image/jpeg", 1).unwrap(),
+            Upload {
+                method: "sendPhoto",
+                field: "photo"
+            }
+        );
+        // Formats Telegram will not rasterize arrive as themselves.
+        for mime in ["image/svg+xml", "image/webp", "image/tiff", "image/gif"] {
+            assert_eq!(
+                upload_method(mime, 1024).unwrap(),
+                Upload {
+                    method: "sendDocument",
+                    field: "document"
+                },
+                "{mime}"
+            );
+        }
+        assert_eq!(
+            upload_method("application/pdf", 1024).unwrap(),
+            Upload {
+                method: "sendDocument",
+                field: "document"
+            }
+        );
+    }
+
+    #[test]
+    fn a_picture_too_big_for_send_photo_goes_as_a_document_instead() {
+        // Telegram refuses a photo over 10 MB; a document carries the same
+        // bytes. Asking anyway would lose the file over a 400.
+        let mb = 1024 * 1024;
+        assert_eq!(
+            upload_method("image/png", 12 * mb).unwrap(),
+            Upload {
+                method: "sendDocument",
+                field: "document"
+            }
+        );
+    }
+
+    #[test]
+    fn an_upload_telegram_will_not_take_is_refused_before_the_request() {
+        let error = upload_method("application/octet-stream", 60 * 1024 * 1024).unwrap_err();
+        let why = format!("{error}");
+        assert!(why.contains("60.0 MB"), "{why}");
+        assert!(why.contains("50.0 MB"), "{why}");
+    }
+
+    #[test]
+    fn a_long_caption_is_cut_to_what_telegram_takes() {
+        // Over the limit is a 400, which would lose the file over its label.
+        let clipped = clip_caption(&"é".repeat(MAX_CAPTION + 50));
+        assert_eq!(clipped.chars().count(), MAX_CAPTION);
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clip_caption("short"), "short");
+    }
+
+    #[test]
+    fn only_telegrams_own_no_is_a_refusal() {
+        // A transport error may have delivered the file; sending again doubles it.
+        assert!(is_refusal(
+            &Refused("telegram sendPhoto failed: PHOTO_INVALID_DIMENSIONS".into()).into()
+        ));
+        assert!(is_refusal(
+            &anyhow::Error::from(Refused("no".into())).context("telegram sendPhoto")
+        ));
+        assert!(!is_refusal(&anyhow::anyhow!(
+            "telegram sendPhoto: timed out"
+        )));
+        assert!(!is_refusal(
+            &crate::channel::RateLimited {
+                retry_after: Duration::from_secs(1)
+            }
+            .into()
+        ));
+    }
+
+    /// `sendPhoto` multipart against the real parser, with nothing delivered:
+    /// Telegram resolves the chat after reading the form, so `chat_id: 0` answering
+    /// "chat not found" means the upload itself was well formed.
+    ///
+    /// `OMATETHER_TELEGRAM_TOKEN=… cargo test -- --ignored live_upload`
+    #[tokio::test]
+    #[ignore = "needs a bot token; touches the Bot API"]
+    async fn live_upload_reaches_chat_resolution() {
+        let token = std::env::var("OMATETHER_TELEGRAM_TOKEN").unwrap();
+        let live = Telegram {
+            base: format!("https://api.telegram.org/bot{token}"),
+            ..telegram()
+        };
+        let dir = std::env::temp_dir().join(format!("omatether-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.txt");
+        std::fs::write(&path, "a file").unwrap();
+
+        let thread = ThreadKey {
+            channel: CHANNEL,
+            chat_id: "0".to_string(),
+            topic_id: None,
+        };
+        let error = live
+            .send_file(&thread, &path, "a caption")
+            .await
+            .unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(format!("{error:#}").contains("chat not found"), "{error:#}");
+    }
+
+    #[test]
+    fn a_name_becomes_a_content_type() {
+        assert_eq!(mime_of(Path::new("chart.PNG")), "image/png");
+        assert_eq!(mime_of(Path::new("order_combined.jpg")), "image/jpeg");
+        assert_eq!(mime_of(Path::new("clip.mp4")), "video/mp4");
+        assert_eq!(mime_of(Path::new("run.log")), "text/plain");
+        // The honest answer for something unrecognized: it arrives as a file.
+        assert_eq!(mime_of(Path::new("mystery")), "application/octet-stream");
     }
 }

@@ -19,6 +19,7 @@ use crate::command::{self, Command, ModelRequest};
 use crate::event::{AgentEvent, Decision};
 use crate::outbox::{OutJob, Outbox};
 use crate::render::{self, TurnRenderer};
+use crate::sendfile;
 use crate::store::Store;
 
 /// How often a streaming turn is pushed to the chat. Comfortably inside
@@ -145,6 +146,11 @@ pub struct Core {
     /// Where a permission question's tool input goes when it is too long to
     /// show inline.
     spill_dir: PathBuf,
+    /// The directory the state lives in: `out` for spills, `in` for received
+    /// files. Asked for separately from `spill_dir` because it is a policy input
+    /// — one of the places a file may be sent from — and a scratch spill directory
+    /// in a test should not quietly widen what that policy allows.
+    state_dir: PathBuf,
     /// What a thread talks to before anyone says otherwise.
     default_agent: String,
     /// Every channel this instance serves, keyed by the name it puts in a
@@ -185,11 +191,13 @@ impl Core {
         default_cwd: PathBuf,
         default_agent: String,
         spill_dir: PathBuf,
+        state_dir: PathBuf,
     ) -> Self {
         let (agent_tx, agent_rx) = mpsc::channel(256);
         Self {
             store,
             spill_dir,
+            state_dir,
             default_agent,
             channels: channels.into_iter().map(|c| (c.name(), c)).collect(),
             outboxes: HashMap::new(),
@@ -389,6 +397,7 @@ impl Core {
             Command::Agent(name) => self.on_agent(key, &name).await,
             Command::Model(want) => self.on_model(key, want).await,
             Command::Attach => self.on_attach(key).await,
+            Command::Send(path) => self.on_send(key, &path).await,
             Command::Log => self.on_log(key),
             Command::Auto(want) => self.on_auto(key, want).await,
             Command::Allow => self.decide(key, Decision::allow(), None).await,
@@ -1260,10 +1269,25 @@ impl Core {
     /// Handing the text over cannot fail slowly: the outbox takes it or says it
     /// is full, and either way the core moves on to the next thread.
     fn flush(&mut self, key: &ThreadKey) {
+        // First, because a file the agent asked for should not wait behind a
+        // debounce tick, and because every branch below can return early.
+        self.deliver_files(key);
+
         let can_edit = match self.channel(key) {
             Some(channel) => channel.can_edit(),
             None => return,
         };
+
+        // A turn that is over settles to its answer alone — see
+        // `TurnRenderer::settles` for why, and for the turns it does not apply
+        // to. Asked ahead of `pending`, because a turn whose last event changed
+        // no text has nothing pending and still has to settle.
+        if can_edit && self.threads.get(key).is_some_and(|t| t.renderer.settles()) {
+            if let Some(text) = self.threads.get(key).and_then(|t| t.renderer.settled()) {
+                self.flush_settled(key, text);
+            }
+            return;
+        }
 
         let text = match self.threads.get(key) {
             Some(thread) => {
@@ -1323,6 +1347,26 @@ impl Core {
         }
     }
 
+    /// A finished turn's answer, replacing the message the turn was written in.
+    ///
+    /// The last page stays the turn's message rather than being sealed, so that
+    /// the renderer's record of what the chat shows keeps matching it — a
+    /// second flush of the same finished turn must find nothing to do.
+    fn flush_settled(&mut self, key: &ThreadKey, text: String) {
+        let mut pages = render::split(&text, PAGE_BUDGET);
+        let Some(last) = pages.pop() else { return };
+        for page in pages {
+            if !self.queue(key, OutJob::Seal(page)) {
+                return;
+            }
+        }
+        if self.queue(key, OutJob::Turn(last)) {
+            if let Some(thread) = self.threads.get_mut(key) {
+                thread.renderer.mark_sent(text);
+            }
+        }
+    }
+
     /// A turn on a channel that can edit, as however many messages it takes.
     ///
     /// This replaced spilling there. The ssh pointer is an answer at a desk and
@@ -1359,6 +1403,127 @@ impl Core {
             if let Some(thread) = self.threads.get_mut(key) {
                 thread.renderer.mark_sent(text);
             }
+        }
+    }
+
+    /// Hand over every file the agent has asked for since the last flush.
+    ///
+    /// The agent asks by writing `[send-file: /path]` on a line of its own. The
+    /// renderer lifts that line out of the prose — it is an instruction, not
+    /// something to read from a phone — and the core decides whether this service
+    /// sends the file at all: see [`sendfile`].
+    ///
+    /// Drained once, which is what makes "one request, one send" hold across a
+    /// turn's many flushes. Every flush re-composes the whole message, so a marker
+    /// still sitting in the text would be sent again on the next tick.
+    ///
+    /// Both refusals are said out loud. A file that went nowhere with nothing said
+    /// about it is the shape of every bug this codebase has been written against.
+    ///
+    /// Reads the thread's directory from the store, which the rest of this file
+    /// avoids: a file request is rare, and paying a sqlite read on every flush — or
+    /// every tool call — to serve it would be the wrong trade.
+    fn deliver_files(&mut self, key: &ThreadKey) {
+        let requests = match self.threads.get_mut(key) {
+            Some(thread) => thread.renderer.take_files(),
+            None => return,
+        };
+        if requests.is_empty() {
+            return;
+        }
+
+        let can_send = self
+            .channel(key)
+            .is_some_and(|channel| channel.can_send_files());
+        let roots = self.send_roots(key);
+
+        for request in requests {
+            if !can_send {
+                tracing::warn!(
+                    thread = %key,
+                    "file requested on a channel that cannot carry one: {}",
+                    request.path
+                );
+                self.queue(
+                    key,
+                    OutJob::Say(format!(
+                        "This chat cannot carry a file, so {} stayed on the machine.",
+                        request.path
+                    )),
+                );
+                continue;
+            }
+
+            match sendfile::resolve(&request.path, &roots) {
+                Ok(path) => {
+                    tracing::info!(thread = %key, "sending {}", path.display());
+                    let caption = request.caption.unwrap_or_default();
+                    if !self.queue(key, OutJob::SendFile { path, caption }) {
+                        tracing::warn!(thread = %key, "no room to queue {}", request.path);
+                    }
+                }
+                Err(why) => {
+                    tracing::warn!(thread = %key, "refusing to send {}: {why}", request.path);
+                    self.queue(
+                        key,
+                        OutJob::Say(format!("I won't send {}: {why}.", request.path)),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where a file may be sent from, for this thread; [`sendfile`] has the why.
+    ///
+    /// `in/` and `out/` rather than the state directory itself, which also holds
+    /// `state.db` — every thread key, and so on Photon every phone number.
+    fn send_roots(&self, key: &ThreadKey) -> [PathBuf; 4] {
+        let cwd = self
+            .state(key)
+            .map(|state| PathBuf::from(state.cwd))
+            .unwrap_or_else(|_| self.default_cwd.clone());
+        [
+            cwd,
+            self.state_dir.join("in"),
+            self.state_dir.join("out"),
+            std::env::temp_dir(),
+        ]
+    }
+
+    /// A file someone asked for from the chat itself: `/send <path>`.
+    ///
+    /// The same policy as an agent's request, checked the same way — the person on
+    /// the phone is allowed to talk to this machine, not to read any file off it
+    /// through it.
+    async fn on_send(&mut self, key: &ThreadKey, written: &str) -> Result<()> {
+        let can_send = self
+            .channel(key)
+            .is_some_and(|channel| channel.can_send_files());
+        if !can_send {
+            return self.say(
+                key,
+                "This chat cannot carry a file. /attach gets you to the machine, \
+                 where you can open it yourself.",
+            );
+        }
+        if written.trim().is_empty() {
+            return self.say(key, "Usage: /send <path>");
+        }
+
+        let roots = self.send_roots(key);
+        match sendfile::resolve(written, &roots) {
+            Ok(path) => {
+                tracing::info!(thread = %key, "sending {}", path.display());
+                self.queue(
+                    key,
+                    OutJob::SendFile {
+                        path,
+                        caption: String::new(),
+                    },
+                );
+                Ok(())
+            }
+            Err(why) => self.say(key, &format!("I won't send {written}: {why}.")),
         }
     }
 
@@ -1436,7 +1601,9 @@ impl Core {
         }
 
         let state = self.state(key)?;
-        let brief = self.channel(key).map(|channel| brief(channel.can_edit()));
+        let brief = self
+            .channel(key)
+            .map(|channel| brief(channel.can_edit(), channel.can_send_files()));
 
         let (session, events) = agent::spawn(agent::SpawnConfig {
             agent: state.agent.clone(),
@@ -1541,7 +1708,7 @@ fn nothing_arrived(files: &[Attachment]) -> String {
     }
 }
 
-fn brief(can_edit: bool) -> String {
+fn brief(can_edit: bool, can_send_files: bool) -> String {
     let mut brief = String::from(
         "You are being driven from a chat app on the user's phone, not a terminal. \
          Lead with the answer and keep replies short. Do not paste logs, command \
@@ -1557,6 +1724,17 @@ fn brief(can_edit: bool) -> String {
              call, reaches the user; anything written before or between tool calls \
              is never shown. Make that final message stand on its own: what you \
              did, what you found, and anything you need them to decide.",
+        );
+    }
+    if can_send_files {
+        brief.push_str(
+            " To hand a file you made to the user, put `[send-file: /absolute/path]` \
+             on a line of its own — add ` — a caption` inside the brackets if the \
+             file needs one. That line is an instruction, not text: it is removed \
+             from your reply and the file is sent instead. Only files inside the \
+             working directory or the system temp directory will be sent, nothing \
+             hidden (no dot-named file or directory), and a refusal is reported to \
+             the chat.",
         );
     }
     brief
@@ -1738,6 +1916,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_finished_turn_on_an_editing_channel_settles_to_its_answer() {
+        // The screenshot this came from: an answer read from a phone with
+        // `▸ 2 tools · Bash curl -s --max-time 25 "https://…` wrapped across
+        // four lines through the middle of it. While the turn runs those lines
+        // are the only sign of what it is doing — the typing indicator stops
+        // the moment any text reaches the chat — so they stay until it ends,
+        // and the last edit takes them out.
+        let dir = std::env::temp_dir().join(format!("sb-settle-{}", std::process::id()));
+        let channel = CountingChannel::editing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+
+        for event in [
+            AgentEvent::TextDelta {
+                text: "Checking the log:".into(),
+            },
+            bash("journalctl --user -u omatether"),
+        ] {
+            core.threads.get_mut(&key).unwrap().renderer.apply(&event);
+            core.flush(&key);
+        }
+        settle().await;
+        let running = channel.messages();
+        assert!(
+            running[0].contains('▸'),
+            "progress while it runs: {running:?}"
+        );
+
+        core.on_agent_event(
+            &key,
+            AgentEvent::TextDelta {
+                text: "\n\nThe service is up.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        core.on_agent_event(
+            &key,
+            AgentEvent::TurnEnd {
+                ok: true,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+        settle().await;
+
+        // The same message, edited: the answer alone, in the one place the
+        // reader scrolls back to. `/log` still has the working.
+        assert_eq!(channel.messages(), vec!["The service is up.".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ended_on_a_tool_call_keeps_what_it_showed() {
+        // Stopped, or failed before it could reply. There is no answer to
+        // settle to, and an empty message would lose the only record of what
+        // ran.
+        let dir = std::env::temp_dir().join(format!("sb-settle-cut-{}", std::process::id()));
+        let channel = CountingChannel::editing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        finish_turn(
+            &mut core,
+            &key,
+            vec![
+                AgentEvent::TextDelta {
+                    text: "Checking the log:".into(),
+                },
+                bash("journalctl --user -u omatether"),
+            ],
+        )
+        .await;
+
+        let messages = channel.messages();
+        assert!(messages[0].contains('▸'), "{messages:?}");
+        assert!(messages[0].contains("Checking the log"), "{messages:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn log_shows_the_last_turn_with_every_tool_call() {
         let dir = std::env::temp_dir().join(format!("sb-log-{}", std::process::id()));
         let channel = CountingChannel::write_only();
@@ -1782,9 +2052,111 @@ mod tests {
         // On a channel that edits, the narration streams in as it is written
         // and is not lost, so telling the agent otherwise would be a lie that
         // changes how it writes.
-        assert!(brief(false).contains("final message"));
-        assert!(!brief(true).contains("final message"));
-        assert!(brief(true).contains("phone"));
+        assert!(brief(false, false).contains("final message"));
+        assert!(!brief(true, false).contains("final message"));
+        assert!(brief(true, false).contains("phone"));
+    }
+
+    #[test]
+    fn the_brief_only_offers_the_file_marker_to_a_channel_that_can_carry_a_file() {
+        // Telling the agent to ask for a file the chat cannot receive is how it
+        // spends a turn making a chart that then goes nowhere.
+        assert!(!brief(true, false).contains("send-file"));
+        assert!(brief(false, true).contains("send-file"));
+        // Including the directories it will be accepted from, because a refusal
+        // the agent could have avoided is a wasted turn too.
+        assert!(brief(true, true).contains("temp directory"));
+    }
+
+    #[tokio::test]
+    async fn a_file_the_agent_asks_for_is_sent_and_its_marker_is_not() {
+        let dir = std::env::temp_dir().join(format!("omatether-send-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("chart.png");
+        std::fs::write(&file, "a png").unwrap();
+
+        let channel = CountingChannel::editing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        finish_turn(
+            &mut core,
+            &key,
+            vec![AgentEvent::TextDelta {
+                text: format!(
+                    "Here is the chart.\n\n[send-file: {}]\n\nQueue is clear.",
+                    file.display()
+                ),
+            }],
+        )
+        .await;
+
+        assert_eq!(
+            channel.files(),
+            vec![(file.display().to_string(), String::new())]
+        );
+        let all = channel.messages().join("\n");
+        assert!(!all.contains("send-file"), "the instruction leaked: {all}");
+        assert!(all.contains("Here is the chart"), "{all}");
+        assert!(all.contains("Queue is clear"), "{all}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_there_is_refused_out_loud() {
+        let dir = std::env::temp_dir().join(format!("omatether-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let channel = CountingChannel::editing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        finish_turn(
+            &mut core,
+            &key,
+            vec![AgentEvent::TextDelta {
+                text: "Made it.\n[send-file: /tmp/omatether-definitely-not-here.png]".into(),
+            }],
+        )
+        .await;
+
+        assert!(channel.files().is_empty(), "{:?}", channel.files());
+        let all = channel.messages().join("\n");
+        assert!(all.contains("won't send"), "{all}");
+        assert!(!all.contains("send-file"), "{all}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_file_asked_for_on_a_channel_that_cannot_carry_one_is_said_so() {
+        // Silence here would look like the file was sent. The agent made it; the
+        // person has to be told it stayed on the machine.
+        let dir = std::env::temp_dir().join(format!("omatether-nowrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("chart.png");
+        std::fs::write(&file, "a png").unwrap();
+
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        finish_turn(
+            &mut core,
+            &key,
+            vec![AgentEvent::TextDelta {
+                text: format!("Here is the chart.\n[send-file: {}]", file.display()),
+            }],
+        )
+        .await;
+
+        assert!(channel.files().is_empty(), "{:?}", channel.files());
+        let all = channel.messages().join("\n");
+        assert!(all.contains("cannot carry a file"), "{all}");
+        assert!(!all.contains("send-file"), "{all}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A `Core` with a scratch spill directory, for the tests that write one.
@@ -1795,6 +2167,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "claude".into(),
             dir.to_path_buf(),
+            dir.join("state"),
         )
     }
 
@@ -1878,7 +2251,11 @@ mod tests {
         // And the directory, because the file *names* are the thread keys —
         // a listable directory is the phone numbers that talk to this bridge.
         let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode();
-        assert_eq!(dir_mode & 0o077, 0, "the spill directory must not be listable");
+        assert_eq!(
+            dir_mode & 0o077,
+            0,
+            "the spill directory must not be listable"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1898,7 +2275,11 @@ mod tests {
         core.spill(&test_key(), "sk-secret-token").unwrap();
 
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "an existing directory must be chmodded too");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "an existing directory must be chmodded too"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1929,7 +2310,10 @@ mod tests {
         messages: std::sync::Mutex<Vec<String>>,
         /// Every `typing` call, in order, as `on`.
         typing: std::sync::Mutex<Vec<bool>>,
+        /// Every file handed over, as (path, caption).
+        files: std::sync::Mutex<Vec<(String, String)>>,
         can_edit: bool,
+        can_send_files: bool,
     }
 
     impl CountingChannel {
@@ -1939,7 +2323,9 @@ mod tests {
                 sent: std::sync::Mutex::new(Vec::new()),
                 messages: std::sync::Mutex::new(Vec::new()),
                 typing: std::sync::Mutex::new(Vec::new()),
+                files: std::sync::Mutex::new(Vec::new()),
                 can_edit: true,
+                can_send_files: true,
             })
         }
 
@@ -1949,7 +2335,9 @@ mod tests {
                 sent: std::sync::Mutex::new(Vec::new()),
                 messages: std::sync::Mutex::new(Vec::new()),
                 typing: std::sync::Mutex::new(Vec::new()),
+                files: std::sync::Mutex::new(Vec::new()),
                 can_edit: false,
+                can_send_files: false,
             })
         }
 
@@ -1959,6 +2347,10 @@ mod tests {
 
         fn messages(&self) -> Vec<String> {
             self.messages.lock().unwrap().clone()
+        }
+
+        fn files(&self) -> Vec<(String, String)> {
+            self.files.lock().unwrap().clone()
         }
     }
 
@@ -1985,6 +2377,19 @@ mod tests {
             let index: usize = id.parse()?;
             self.messages.lock().unwrap()[index] = text.to_string();
             Ok(())
+        }
+        fn can_send_files(&self) -> bool {
+            self.can_send_files
+        }
+        async fn send_file(
+            &self,
+            _t: &ThreadKey,
+            path: &std::path::Path,
+            caption: &str,
+        ) -> Result<String> {
+            let mut files = self.files.lock().unwrap();
+            files.push((path.display().to_string(), caption.to_string()));
+            Ok(format!("f{}", files.len()))
         }
         async fn ask_permission(&self, t: &ThreadKey, text: &str, _q: &str) -> Result<String> {
             self.send(t, text).await
@@ -2109,6 +2514,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "claude".into(),
             dir.clone(),
+            dir.join("state"),
         );
 
         let mut renderer = TurnRenderer::new();
@@ -2171,6 +2577,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "claude".into(),
             dir.clone(),
+            dir.join("state"),
         );
         core.threads.insert(
             key.clone(),
@@ -2225,6 +2632,7 @@ mod tests {
             PathBuf::from("/tmp"),
             "claude".into(),
             dir.to_path_buf(),
+            dir.join("state"),
         )
     }
 

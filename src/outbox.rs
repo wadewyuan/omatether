@@ -16,6 +16,7 @@
 //! turn's message" is a job, not a value the core has to hold and hand back, so
 //! nothing in the core has to await a `send` to learn what to edit next.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -59,6 +60,13 @@ pub enum OutJob {
 
     /// A standalone note, outside any turn.
     Say(String),
+
+    /// Hand a file this machine produced to the chat.
+    ///
+    /// A job like every other send, for the same reason: an upload is the slowest
+    /// thing this service does, and the core cannot wait for one. `path` is already
+    /// inside what [`crate::sendfile`] allows.
+    SendFile { path: PathBuf, caption: String },
 
     /// Ask for a decision, remembering the message so it can be settled.
     Ask { text: String, question: String },
@@ -137,6 +145,22 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
 
             OutJob::Say(text) => {
                 report(&key, "send", retrying(|| channel.send(&key, &text)).await);
+            }
+
+            OutJob::SendFile { path, caption } => {
+                // The one send whose failure has to reach the chat: the core has
+                // already moved on, and "here is your chart" with no chart under
+                // it reads as the agent lying.
+                let sent = retrying(|| channel.send_file(&key, &path, &caption)).await;
+                if let Err(e) = &sent {
+                    let name = path
+                        .file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy();
+                    let note = format!("{name} could not be sent: {e:#}.");
+                    report(&key, "send", retrying(|| channel.send(&key, &note)).await);
+                }
+                report(&key, "send_file", sent);
             }
 
             OutJob::Ask {
@@ -288,6 +312,7 @@ mod tests {
     struct FakeChannel {
         sent: Arc<Mutex<Vec<String>>>,
         edits: Arc<Mutex<Vec<(MessageId, String)>>>,
+        files: Arc<Mutex<Vec<(String, String)>>>,
         rate_limits_left: AtomicUsize,
         retry_after: Duration,
         can_edit: bool,
@@ -298,6 +323,7 @@ mod tests {
             Arc::new(Self {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 edits: Arc::new(Mutex::new(Vec::new())),
+                files: Arc::new(Mutex::new(Vec::new())),
                 rate_limits_left: AtomicUsize::new(0),
                 retry_after: Duration::from_millis(0),
                 can_edit: true,
@@ -309,6 +335,7 @@ mod tests {
             Arc::new(Self {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 edits: Arc::new(Mutex::new(Vec::new())),
+                files: Arc::new(Mutex::new(Vec::new())),
                 rate_limits_left: AtomicUsize::new(times),
                 retry_after,
                 can_edit: true,
@@ -331,6 +358,10 @@ mod tests {
 
         fn sent(&self) -> Vec<String> {
             self.sent.lock().unwrap().clone()
+        }
+
+        fn files(&self) -> Vec<(String, String)> {
+            self.files.lock().unwrap().clone()
         }
     }
 
@@ -367,6 +398,22 @@ mod tests {
             _question: &str,
         ) -> Result<MessageId> {
             self.send(thread, text).await
+        }
+
+        fn can_send_files(&self) -> bool {
+            true
+        }
+
+        async fn send_file(
+            &self,
+            _thread: &ThreadKey,
+            path: &std::path::Path,
+            caption: &str,
+        ) -> Result<MessageId> {
+            anyhow::ensure!(path.exists(), "{} is gone", path.display());
+            let mut files = self.files.lock().unwrap();
+            files.push((path.display().to_string(), caption.to_string()));
+            Ok(format!("f{}", files.len()))
         }
     }
 
@@ -413,6 +460,53 @@ mod tests {
         let edits = channel.edits.lock().unwrap().clone();
         assert!(edits.iter().all(|(id, _)| id == "m1"), "all one message");
         assert_eq!(edits.last().unwrap().1, "working, done");
+    }
+
+    #[tokio::test]
+    async fn a_file_is_sent_once_and_keeps_its_caption() {
+        let dir =
+            std::env::temp_dir().join(format!("omatether-outbox-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chart.png");
+        std::fs::write(&path, "a png").unwrap();
+
+        let channel = FakeChannel::new();
+        let outbox = Outbox::spawn(key("1"), channel.clone());
+
+        outbox.queue(OutJob::SendFile {
+            path: path.clone(),
+            caption: "the queue today".into(),
+        });
+
+        assert!(
+            eventually(Duration::from_secs(2), || channel.files().len() == 1).await,
+            "the file should reach the channel"
+        );
+        assert_eq!(
+            channel.files(),
+            vec![(path.display().to_string(), "the queue today".into())]
+        );
+        // A file is not a message: nothing was posted in its place.
+        assert!(channel.sent().is_empty(), "{:?}", channel.sent());
+
+        // A file that is gone by the time the worker gets to it is reported, not
+        // swallowed.
+        std::fs::remove_file(&path).unwrap();
+        outbox.queue(OutJob::SendFile {
+            path,
+            caption: String::new(),
+        });
+        assert!(
+            eventually(Duration::from_secs(2), || channel
+                .sent()
+                .iter()
+                .any(|m| m.contains("could not be sent")))
+            .await,
+            "{:?}",
+            channel.sent()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
