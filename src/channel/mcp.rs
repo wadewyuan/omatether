@@ -72,6 +72,10 @@ const DEFAULT_WAIT: u64 = 45;
 /// The longest a caller may ask one request to wait.
 const MAX_WAIT: u64 = 600;
 
+/// How much of a running turn's progress a "still running" reply carries: the
+/// newest end of it, which is what says where the agent is now.
+const PROGRESS_SHOWN: usize = 3000;
+
 /// How long a `tailscale whois` answer is trusted.
 const WHOIS_TTL: Duration = Duration::from_secs(600);
 
@@ -83,6 +87,8 @@ pub struct Config {
     pub port: u16,
     /// Where files callers send are saved: the same inbox the chats use.
     pub inbox_dir: std::path::PathBuf,
+    /// The API key file; see [`crate::mcp_keys`].
+    pub keys_file: std::path::PathBuf,
     /// Node names or login names allowed to call. `None` is the whole tailnet.
     pub allowed: Option<Vec<String>>,
 }
@@ -96,6 +102,8 @@ struct Session {
     /// When the current request was made.
     since: Instant,
     notify: Arc<Notify>,
+    /// The running turn so far, as the core last reported it.
+    progress: String,
 }
 
 impl Default for Session {
@@ -105,6 +113,7 @@ impl Default for Session {
             busy: false,
             since: Instant::now(),
             notify: Arc::new(Notify::new()),
+            progress: String::new(),
         }
     }
 }
@@ -122,6 +131,9 @@ enum Item {
 /// Who is calling, as the tailnet knows it.
 #[derive(Debug, Clone)]
 struct Caller {
+    /// The name of the API key it presented: which agent this is. Sessions
+    /// belong to a key, so two agents on one machine do not share them.
+    key: String,
     /// The node's short name, e.g. `macbook-air`.
     node: String,
     /// The owning user's login, or `tagged-devices`.
@@ -135,6 +147,7 @@ pub struct Mcp {
     whois: Mutex<HashMap<IpAddr, (Caller, Instant)>>,
     next_id: std::sync::atomic::AtomicU64,
     inbox_dir: std::path::PathBuf,
+    keys_file: std::path::PathBuf,
 }
 
 impl Mcp {
@@ -149,6 +162,7 @@ impl Mcp {
             whois: Mutex::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             inbox_dir: config.inbox_dir.clone(),
+            keys_file: config.keys_file.clone(),
         });
         (mcp, rx)
     }
@@ -237,13 +251,22 @@ impl Mcp {
             return response;
         }
 
-        let caller = match self.identify(peer.ip()).await {
+        let mut caller = match self.identify(peer.ip()).await {
             Ok(caller) => caller,
             Err(e) => {
                 tracing::warn!(%peer, "mcp: refused: {e:#}");
                 return plain(StatusCode::FORBIDDEN, &format!("{e:#}"));
             }
         };
+        match self.authenticate(request.headers()) {
+            Ok(key) => caller.key = key,
+            Err(e) => {
+                tracing::warn!(%peer, node = %caller.node, "mcp: refused: {e:#}");
+                // No WWW-Authenticate: that header sends MCP clients off on
+                // OAuth discovery, and there is no OAuth here to find.
+                return plain(StatusCode::UNAUTHORIZED, &format!("{e:#}"));
+            }
+        }
 
         let body = match Limited::new(request.into_body(), MAX_REQUEST)
             .collect()
@@ -481,6 +504,7 @@ impl Mcp {
             }
             if !session.busy {
                 session.items.clear();
+                session.progress.clear();
                 session.since = Instant::now();
             }
             session.busy = true;
@@ -488,7 +512,7 @@ impl Mcp {
 
         let message = Inbound {
             thread: key.clone(),
-            user_id: format!("{}@{}", caller.login, caller.node),
+            user_id: format!("key {} ({} on {})", caller.key, caller.login, caller.node),
             kind: InboundKind::Text {
                 text: text.to_string(),
                 files,
@@ -554,10 +578,20 @@ impl Mcp {
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
+            let elapsed = session.since.elapsed().as_secs();
+            if session.progress.is_empty() {
+                text.push_str(&format!(
+                    "[still running after {elapsed}s; nothing to show yet]"
+                ));
+            } else {
+                text.push_str(&format!(
+                    "[still running after {elapsed}s. So far (▸ is a tool call):]\n{}",
+                    tail(&session.progress, PROGRESS_SHOWN)
+                ));
+            }
             text.push_str(&format!(
-                "[still running after {}s — call get_result with session \"{name}\" to keep \
-                 waiting, or stop_task to interrupt]",
-                session.since.elapsed().as_secs()
+                "\n\n[call get_result with session \"{name}\" to keep waiting, or stop_task \
+                 to interrupt]"
             ));
         } else if text.is_empty() && session.items.is_empty() {
             text.push_str("(no output)");
@@ -596,7 +630,7 @@ impl Mcp {
     }
 
     fn list(&self, caller: &Caller) -> Value {
-        let prefix = format!("{NAME}:{}:", caller.node);
+        let prefix = format!("{NAME}:{}:", caller.key);
         let sessions = self.sessions.lock().unwrap();
         let mut lines: Vec<String> = sessions
             .iter()
@@ -617,6 +651,32 @@ impl Mcp {
             lines.join("\n")
         };
         json!({ "content": [{ "type": "text", "text": text }] })
+    }
+
+    /// The name of the API key this request carries, or why it is refused.
+    ///
+    /// `Authorization: Bearer <key>`, or `X-API-Key: <key>` for clients that
+    /// only let you set a plain header. Fails closed: with no keys made, every
+    /// request is refused and the message says how to make one.
+    fn authenticate(&self, headers: &hyper::HeaderMap) -> Result<String> {
+        let presented = headers
+            .get(hyper::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| {
+                v.strip_prefix("Bearer ")
+                    .or_else(|| v.strip_prefix("bearer "))
+            })
+            .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let Some(presented) = presented else {
+            bail!("an API key is required: send `Authorization: Bearer <key>`");
+        };
+        let keys = crate::mcp_keys::load(&self.keys_file)?;
+        if keys.is_empty() {
+            bail!("no API keys are set up on this machine; its owner can make one with `omatether mcp-key add <name>`");
+        }
+        crate::mcp_keys::verify(&keys, presented).context("that API key is not valid")
     }
 
     /// Who is at `ip`, according to the tailnet — or why they may not call.
@@ -745,6 +805,20 @@ impl Channel for Mcp {
         Ok(self.push(thread, Item::Text(question)))
     }
 
+    fn wants_progress(&self) -> bool {
+        true
+    }
+
+    async fn progress(&self, thread: &ThreadKey, log: &str) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.entry(thread.to_string()).or_default();
+        // Only while a request is open on it: progress landing after the idle
+        // would be a finished turn's, shown under the next request.
+        if session.busy {
+            session.progress = log.to_string();
+        }
+    }
+
     async fn idle(&self, thread: &ThreadKey) {
         let notify = {
             let mut sessions = self.sessions.lock().unwrap();
@@ -839,7 +913,12 @@ fn parse_whois(info: &Value) -> Option<Caller> {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    Some(Caller { node, login })
+    // The key is not known yet: it comes from the request, not the network.
+    Some(Caller {
+        key: String::new(),
+        node,
+        login,
+    })
 }
 
 // ---- protocol ---------------------------------------------------------------
@@ -974,9 +1053,22 @@ fn string_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
 fn thread_key(caller: &Caller, session: &str) -> ThreadKey {
     ThreadKey {
         channel: NAME,
-        chat_id: caller.node.clone(),
+        chat_id: caller.key.clone(),
         topic_id: Some(session.to_string()),
     }
+}
+
+/// The last `max` characters of `text`, starting on a line boundary, with a
+/// marker where the rest was left out.
+fn tail(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let start = text.char_indices().nth(count - max).map_or(0, |(i, _)| i);
+    let cut = &text[start..];
+    let cut = cut.find('\n').map_or(cut, |n| &cut[n + 1..]);
+    format!("… (earlier steps left out)\n{cut}")
 }
 
 fn tool_error(text: &str) -> Value {
@@ -1036,6 +1128,7 @@ mod tests {
             port: 0,
             allowed: None,
             inbox_dir: std::env::temp_dir().join(format!("omt-mcp-inbox-{}", std::process::id())),
+            keys_file: std::env::temp_dir().join(format!("omt-mcp-keys-{}", std::process::id())),
         }
     }
 
@@ -1093,8 +1186,110 @@ mod tests {
         std::fs::remove_dir_all(test_config().inbox_dir).ok();
     }
 
+    #[test]
+    fn requests_need_a_valid_key_and_none_set_up_refuses_all() {
+        let config = test_config();
+        let (mcp, _rx) = Mcp::new(&config);
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = hyper::HeaderMap::new();
+            for (k, v) in pairs {
+                map.insert(*k, v.parse().unwrap());
+            }
+            map
+        };
+        let _ = std::fs::remove_file(&config.keys_file);
+        assert!(mcp
+            .authenticate(&headers(&[]))
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+        assert!(mcp
+            .authenticate(&headers(&[("authorization", "Bearer omt_x")]))
+            .unwrap_err()
+            .to_string()
+            .contains("mcp-key add"));
+
+        let key = crate::mcp_keys::add(&config.keys_file, "grokbot").unwrap();
+        let bearer = format!("Bearer {key}");
+        assert_eq!(
+            mcp.authenticate(&headers(&[("authorization", &bearer)]))
+                .unwrap(),
+            "grokbot"
+        );
+        assert_eq!(
+            mcp.authenticate(&headers(&[("x-api-key", &key)])).unwrap(),
+            "grokbot"
+        );
+        assert!(mcp
+            .authenticate(&headers(&[("authorization", "Bearer omt_wrong")]))
+            .is_err());
+        // Revoked takes effect on the next request, no restart.
+        crate::mcp_keys::revoke(&config.keys_file, "grokbot").unwrap();
+        assert!(mcp
+            .authenticate(&headers(&[("authorization", &bearer)]))
+            .is_err());
+        std::fs::remove_file(&config.keys_file).ok();
+    }
+
+    #[tokio::test]
+    async fn a_running_task_reports_how_far_it_has_got() {
+        let (mcp, mut rx) = Mcp::new(&test_config());
+        let first = mcp
+            .call(
+                &caller(),
+                "run_task",
+                &json!({ "prompt": "go", "wait_seconds": 0 }),
+            )
+            .await
+            .unwrap();
+        assert!(first["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to show yet"));
+        let inbound = rx.recv().await.unwrap();
+
+        mcp.progress(
+            &inbound.thread,
+            "▸ Bash systemd-analyze\nKernel stage is slow.",
+        )
+        .await;
+        let running = mcp
+            .call(&caller(), "get_result", &json!({ "wait_seconds": 0 }))
+            .await
+            .unwrap();
+        let text = running["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("▸ Bash systemd-analyze") && text.contains("get_result"),
+            "{text}"
+        );
+
+        mcp.send(&inbound.thread, "Answer.").await.unwrap();
+        mcp.idle(&inbound.thread).await;
+        // Late progress from the finished turn must not leak into the result.
+        mcp.progress(&inbound.thread, "▸ stale").await;
+        let done = mcp
+            .call(&caller(), "get_result", &json!({ "wait_seconds": 0 }))
+            .await
+            .unwrap();
+        assert_eq!(done["content"][0]["text"], "Answer.");
+    }
+
+    #[test]
+    fn progress_keeps_the_newest_end() {
+        let log: String = (0..500).map(|i| format!("▸ step {i}\n")).collect();
+        let cut = tail(&log, 300);
+        assert!(
+            cut.starts_with("… (earlier steps left out)\n▸ step"),
+            "{cut}"
+        );
+        assert!(cut.ends_with("▸ step 499\n"));
+        assert!(cut.chars().count() < 340);
+        assert_eq!(tail("short", 300), "short");
+    }
+
     fn caller() -> Caller {
         Caller {
+            key: "macbook-agent".into(),
             node: "macbook-air".into(),
             login: "someone@".into(),
         }
@@ -1145,7 +1340,7 @@ mod tests {
         );
         assert!(session_name(&json!({ "session": "a:b" })).is_err());
         assert!(session_name(&json!({ "session": "../x" })).is_err());
-        assert_eq!(thread_key(&caller(), "x").to_string(), "mcp:macbook-air:x");
+        assert_eq!(thread_key(&caller(), "x").to_string(), "mcp:macbook-agent:x");
     }
 
     #[tokio::test]
@@ -1213,7 +1408,7 @@ mod tests {
                     panic!()
                 };
                 assert_eq!(text, "build it");
-                assert_eq!(inbound.thread.to_string(), "mcp:macbook-air:default");
+                assert_eq!(inbound.thread.to_string(), "mcp:macbook-agent:default");
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 mcp.send(&inbound.thread, "Built.").await.unwrap();
                 mcp.idle(&inbound.thread).await;

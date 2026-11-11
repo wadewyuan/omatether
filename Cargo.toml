@@ -18,6 +18,8 @@ bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# SHA-256 and a CSPRNG for MCP API keys. Already in the tree under rustls.
+ring = "0.17"
 # rustls rather than the default openssl: one less system dependency for a
 # service that has to start reliably at boot.
 reqwest = { version = "0.12", default-features = false, features = [

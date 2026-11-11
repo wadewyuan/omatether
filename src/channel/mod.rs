@@ -217,6 +217,21 @@ pub trait Channel: Send + Sync {
     /// A program waiting on a request does: it is how it knows the answer it
     /// holds is the whole answer.
     async fn idle(&self, _thread: &ThreadKey) {}
+
+    /// Whether this channel wants [`Channel::progress`] while a turn runs.
+    ///
+    /// Only a channel that cannot edit needs it: one that can edit is already
+    /// showing the turn as it grows. A phone that cannot edit does not want
+    /// it either — it gets the answer whole, by design — so this is asked
+    /// for, not assumed from `can_edit`.
+    fn wants_progress(&self) -> bool {
+        false
+    }
+
+    /// The running turn so far, as `/log` would show it: every tool call on a
+    /// line of its own, and the text between them. Sent when it changes, at
+    /// most once a flush interval, and never after the turn's answer.
+    async fn progress(&self, _thread: &ThreadKey, _log: &str) {}
 }
 
 /// Who is on the other end of a channel.

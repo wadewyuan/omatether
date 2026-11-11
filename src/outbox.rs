@@ -87,6 +87,10 @@ pub enum OutJob {
     /// The core has finished with what this thread last asked for. Queued
     /// behind whatever that produced, so it lands after the answer.
     Idle,
+
+    /// The running turn so far, every tool call included, for a channel that
+    /// asked for it. See [`Channel::progress`].
+    Progress(String),
 }
 
 /// The core's handle on one thread's outbound task.
@@ -226,6 +230,8 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
             }
 
             OutJob::Idle => channel.idle(&key).await,
+
+            OutJob::Progress(log) => channel.progress(&key, &log).await,
         }
     }
 }

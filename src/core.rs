@@ -184,6 +184,9 @@ pub struct Core {
     /// `/log`. Memory only: it is a look back at what just happened, not a
     /// record, and it outlives the session for the same reason `outboxes` do.
     transcripts: HashMap<ThreadKey, String>,
+    /// The progress last handed to each thread's channel, so an unchanged
+    /// turn is not re-sent every tick. See [`Channel::progress`].
+    progress_sent: HashMap<ThreadKey, String>,
     agent_tx: mpsc::Sender<(ThreadKey, AgentEvent)>,
     agent_rx: mpsc::Receiver<(ThreadKey, AgentEvent)>,
 }
@@ -212,6 +215,7 @@ impl Core {
             idle: std::collections::HashSet::new(),
             held: HashMap::new(),
             transcripts: HashMap::new(),
+            progress_sent: HashMap::new(),
             agent_tx,
             agent_rx,
         }
@@ -440,6 +444,7 @@ impl Core {
 
         thread.renderer.reset();
         thread.turn_running = true;
+        self.progress_sent.remove(key);
 
         // A new turn grows a new message rather than continuing the last one's.
         self.queue(key, OutJob::NewTurn);
@@ -1341,6 +1346,8 @@ impl Core {
             return;
         }
 
+        self.send_progress(key);
+
         let text = match self.threads.get(key) {
             Some(thread) => {
                 // Two reasons to hold a turn back until it is done: a channel
@@ -1396,6 +1403,34 @@ impl Core {
         }
         if let Some(thread) = self.threads.get_mut(key) {
             thread.renderer.mark_sent(text);
+        }
+    }
+
+    /// The running turn so far, to a channel that asked for it and only when it
+    /// has changed.
+    ///
+    /// Never for a finished turn: the answer is what goes then, and progress
+    /// arriving after it would read as the turn carrying on.
+    fn send_progress(&mut self, key: &ThreadKey) {
+        if !self
+            .channel(key)
+            .is_some_and(|channel| channel.wants_progress())
+        {
+            return;
+        }
+        let Some(log) = self
+            .threads
+            .get(key)
+            .filter(|thread| thread.turn_running && !thread.renderer.is_finished())
+            .map(|thread| thread.renderer.compose_log())
+        else {
+            return;
+        };
+        if log.is_empty() || self.progress_sent.get(key) == Some(&log) {
+            return;
+        }
+        if self.queue(key, OutJob::Progress(log.clone())) {
+            self.progress_sent.insert(key.clone(), log);
         }
     }
 

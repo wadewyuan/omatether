@@ -11,6 +11,7 @@ mod codex;
 mod command;
 mod core;
 mod event;
+mod mcp_keys;
 mod outbox;
 mod pi;
 mod render;
@@ -73,6 +74,12 @@ enum Mode {
         phone: String,
     },
 
+    /// Manage the API keys agents use to call the MCP channel.
+    McpKey {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+
     /// Guided first-run setup: credentials, env file, systemd service.
     /// Safe to re-run — what is configured is kept.
     Setup,
@@ -97,6 +104,62 @@ enum Mode {
         /// Send this prompt immediately on start.
         prompt: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum KeyAction {
+    /// Make a key for one agent and print it. It is shown only this once.
+    Add {
+        /// A name for the agent it is for, e.g. grokbot. Its sessions are kept
+        /// under this name.
+        name: String,
+    },
+    /// List the keys by name. The keys themselves are not stored.
+    List,
+    /// Revoke a key. Takes effect on the next request; no restart needed.
+    Revoke { name: String },
+}
+
+fn mcp_key(action: KeyAction) -> Result<()> {
+    let path = mcp_keys::default_path();
+    match action {
+        KeyAction::Add { name } => {
+            let key = mcp_keys::add(&path, &name)?;
+            eprintln!("Key '{name}' made. It is shown once; keep it with the agent:\n");
+            println!("{key}");
+            eprintln!(
+                "\nThe agent sends it as `Authorization: Bearer <key>`, e.g.\n  \
+                 claude mcp add --transport http omatether http://{}:{}/mcp \\\n    \
+                 --header \"Authorization: Bearer <key>\"",
+                core_hostname(),
+                std::env::var("OMATETHER_MCP_PORT")
+                    .unwrap_or_else(|_| mcp::DEFAULT_PORT.to_string())
+            );
+        }
+        KeyAction::List => {
+            let keys = mcp_keys::load(&path)?;
+            if keys.is_empty() {
+                println!("No keys. Make one with `omatether mcp-key add <name>`.");
+            }
+            for key in keys {
+                println!("{}\tcreated {}", key.name, key.created);
+            }
+        }
+        KeyAction::Revoke { name } => {
+            if mcp_keys::revoke(&path, &name)? {
+                println!("Revoked '{name}'.");
+            } else {
+                bail!("there is no key named '{name}'");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn core_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "this-machine".to_string())
 }
 
 #[tokio::main]
@@ -132,6 +195,7 @@ async fn main() -> Result<()> {
             prompt,
         } => repl(dir, agent, session_id, model, prompt).await,
         Mode::Setup => setup::run().await,
+        Mode::McpKey { action } => mcp_key(action),
     }
 }
 
@@ -311,10 +375,21 @@ fn mcp_config(inbox_dir: PathBuf) -> Result<Option<mcp::Config>> {
             .as_ref()
             .map_or("any tailnet node".to_string(), |a| a.join(", "))
     );
+    let keys_file = mcp_keys::default_path();
+    match mcp_keys::load(&keys_file) {
+        Ok(keys) if keys.is_empty() => tracing::warn!(
+            "mcp: no API keys in {} — every request will be refused until one is \
+             made with `omatether mcp-key add <name>`",
+            keys_file.display()
+        ),
+        Ok(keys) => tracing::info!("mcp: {} API key(s)", keys.len()),
+        Err(e) => tracing::warn!("mcp: {e:#}"),
+    }
     Ok(Some(mcp::Config {
         port,
         allowed,
         inbox_dir,
+        keys_file,
     }))
 }
 

@@ -443,6 +443,26 @@ over the tailnet address: answer, resumed conversation, busy refusal, stop,
 file returned as a resource. **Unverified:** a real MCP client (Claude Code,
 Codex) connecting from another node.
 
+**API keys, because the tailnet is not proof.** The owner asked for it after
+the first outside agent connected: a tailnet node says which device, not which
+program on it, and the tailnet holds a VPS. `src/mcp_keys.rs` stores
+SHA-256 only (`~/.config/omatether/mcp-keys`, 0600, written by temp+rename),
+and the file is read on every request so `mcp-key add`/`revoke` need no
+restart — a restart is what cuts off the chat turn that is running. Fails
+closed: no keys, no calls. The 401 deliberately has no `WWW-Authenticate`,
+which would send MCP clients hunting for OAuth metadata that does not exist.
+Sessions are keyed by **key name**, not node (`mcp:<key>:<session>`), so two
+agents on one machine do not share a conversation; threads made before keys
+existed are orphaned under their node name, harmlessly.
+
+**A "running" reply carries progress, not a stream.** MCP progress
+notifications reach the client's UI and never the calling model, so they
+would not help the agent decide anything. Instead `Channel::wants_progress`
+makes the core send `compose_log` (the `/log` view) through the outbox as it
+changes, and the MCP channel shows its newest 3000 characters under "still
+running". Progress arriving after `idle` is dropped, or a finished turn's
+steps would show under the next request.
+
 **Inbound files reuse the chats' path whole.** `run_task.files` is decoded in
 `Mcp::receive`, saved by `inbox::save` (0600, pruned at a week, same 20 MB
 ceiling) and handed to the core as `Attachment`s, so `compose` writes the same

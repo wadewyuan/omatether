@@ -705,6 +705,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

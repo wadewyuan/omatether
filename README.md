@@ -115,12 +115,27 @@ OMATETHER_MCP=on
 
 and restart the service. It listens on this machine's Tailscale addresses
 only, not on the LAN or localhost, and every caller is identified with
-`tailscale whois`. Point a client at `http://<this-machine>:8742/mcp`
-(Streamable HTTP), for example:
+`tailscale whois`.
+
+**Every agent needs its own API key.** Without one, a request is refused;
+with no keys made at all, every request is.
 
 ```bash
-claude mcp add --transport http omatether http://omarchy:8742/mcp
+omatether mcp-key add grokbot     # prints the key, once
+omatether mcp-key list
+omatether mcp-key revoke grokbot  # takes effect at once, no restart
 ```
+
+Only a hash of each key is stored, in `~/.config/omatether/mcp-keys`. Point
+the agent's client at `http://<this-machine>:8742/mcp` (Streamable HTTP) with
+the key as a bearer token, for example:
+
+```bash
+claude mcp add --transport http omatether http://omarchy:8742/mcp \
+  --header "Authorization: Bearer omt_..."
+```
+
+`X-API-Key: omt_...` works too, for clients that only take a plain header.
 
 | Tool | Does |
 |---|---|
@@ -130,11 +145,13 @@ claude mcp add --transport http omatether http://omarchy:8742/mcp
 | `session_command` | `/status`, `/new`, `/cd`, `/agent`, `/model`, `/auto`, `/allow`, `/deny`, `/log`, `/send` |
 | `list_sessions` | The caller's sessions and which are running |
 
-Each caller gets its own sessions, named by it (`default` if not), and each
+Each key gets its own sessions, named by its agent (`default` if not), and each
 is a thread like a chat: its own conversation, directory and agent, kept
 across restarts. Sessions run in parallel; one session runs one task at a
 time. A call waits up to `wait_seconds` (default 45) and then returns
-`running`, so a long task never trips the client's timeout.
+`running`, so a long task never trips the client's timeout. A `running` reply
+says how far the agent has got (each tool call it ran and what it has written
+so far), so the caller can keep waiting, redirect it or stop it.
 
 **Files go both ways.** `run_task` takes `files`, each a `name` with its
 contents as base64 `data` (or plain `text`), up to 20 MB each. They land in the
@@ -142,9 +159,10 @@ same inbox as a photo from your phone, private and deleted after a week, and the
 agent gets their paths. Files the agent hands back arrive inline in the result,
 images as images, under the same rules as `/send`.
 
-> **Auto mode is on here too**, as on every channel: anything on your tailnet
-> that can reach the port can run commands on this machine as you. Use
-> `OMATETHER_MCP_ALLOWED` or your tailnet ACLs if not every node should.
+> **Auto mode is on here too**, as on every channel: an agent holding a key
+> can run commands on this machine as you. Give each agent its own key, so
+> one can be revoked without the others. `OMATETHER_MCP_ALLOWED` or your
+> tailnet ACLs can also narrow which devices may connect at all.
 
 ## Running it
 
