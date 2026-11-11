@@ -443,6 +443,16 @@ over the tailnet address: answer, resumed conversation, busy refusal, stop,
 file returned as a resource. **Unverified:** a real MCP client (Claude Code,
 Codex) connecting from another node.
 
+**Inbound files reuse the chats' path whole.** `run_task.files` is decoded in
+`Mcp::receive`, saved by `inbox::save` (0600, pruned at a week, same 20 MB
+ceiling) and handed to the core as `Attachment`s, so `compose` writes the same
+`[attachment: …]` lines a phone's photo gets. A file that fails to decode or is
+too big is still an attachment, carrying its reason, so the agent says so
+instead of the file vanishing; only a malformed `files` argument is a tool
+error. The request cap is 64 MB because of this — base64 is a third bigger
+than the file. Verified end to end: a JPEG and a text file sent over the
+tailnet, opened and read back by a real Claude turn.
+
 ## Attachments
 
 **A file becomes a path in the prompt, not an upload.** `src/channel/inbox.rs`

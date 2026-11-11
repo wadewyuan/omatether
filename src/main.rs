@@ -175,7 +175,7 @@ async fn serve(
         channels.push(photon);
     }
 
-    if let Some(config) = mcp_config()? {
+    if let Some(config) = mcp_config(inbox_dir.clone())? {
         let (mcp, inbound) = Mcp::new(&config);
         mcp.clone().serve(config.port);
         merge(inbound, inbound_tx.clone());
@@ -288,7 +288,7 @@ async fn start_photon(sidecar: Option<PathBuf>, inbox_dir: PathBuf) -> Result<Op
 /// The MCP channel is on when `OMATETHER_MCP` says so. Off by default: it is
 /// the one channel that listens, and a machine should not start doing that
 /// because a package was upgraded.
-fn mcp_config() -> Result<Option<mcp::Config>> {
+fn mcp_config(inbox_dir: PathBuf) -> Result<Option<mcp::Config>> {
     let on = std::env::var("OMATETHER_MCP").unwrap_or_default();
     match on.trim().to_ascii_lowercase().as_str() {
         "" | "0" | "off" | "false" | "no" => return Ok(None),
@@ -311,7 +311,11 @@ fn mcp_config() -> Result<Option<mcp::Config>> {
             .as_ref()
             .map_or("any tailnet node".to_string(), |a| a.join(", "))
     );
-    Ok(Some(mcp::Config { port, allowed }))
+    Ok(Some(mcp::Config {
+        port,
+        allowed,
+        inbox_dir,
+    }))
 }
 
 fn allowlist(var: &str) -> Result<Vec<String>> {

@@ -1815,7 +1815,10 @@ fn brief_for_agent(can_send_files: bool) -> String {
          exact paths, commands and values it may need, and anything that failed \
          or is left undone. It cannot see your screen or ask you follow-up \
          questions mid-turn, so do not stop to ask for confirmation of routine \
-         steps; if you genuinely cannot proceed, say exactly what you need.",
+         steps; if you genuinely cannot proceed, say exactly what you need. \
+         A file it sends is saved on this machine and appears in its prompt as \
+         an `[attachment: name — /path (type, size)]` line: open that path to \
+         see it.",
     );
     if can_send_files {
         brief.push_str(

@@ -124,7 +124,7 @@ claude mcp add --transport http omatether http://omarchy:8742/mcp
 
 | Tool | Does |
 |---|---|
-| `run_task` | Send a prompt to a session's agent and wait for its answer |
+| `run_task` | Send a prompt, and any files, to a session's agent and wait for its answer |
 | `get_result` | Keep waiting on a task that returned `running` |
 | `stop_task` | Interrupt it |
 | `session_command` | `/status`, `/new`, `/cd`, `/agent`, `/model`, `/auto`, `/allow`, `/deny`, `/log`, `/send` |
@@ -134,8 +134,13 @@ Each caller gets its own sessions, named by it (`default` if not), and each
 is a thread like a chat: its own conversation, directory and agent, kept
 across restarts. Sessions run in parallel; one session runs one task at a
 time. A call waits up to `wait_seconds` (default 45) and then returns
-`running`, so a long task never trips the client's timeout. Files the agent
-hands over come back inline, up to 20 MB.
+`running`, so a long task never trips the client's timeout.
+
+**Files go both ways.** `run_task` takes `files`, each a `name` with its
+contents as base64 `data` (or plain `text`), up to 20 MB each. They land in the
+same inbox as a photo from your phone, private and deleted after a week, and the
+agent gets their paths. Files the agent hands back arrive inline in the result,
+images as images, under the same rules as `/send`.
 
 > **Auto mode is on here too**, as on every channel: anything on your tailnet
 > that can reach the port can run commands on this machine as you. Use

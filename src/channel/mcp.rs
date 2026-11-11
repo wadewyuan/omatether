@@ -43,7 +43,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify};
 
-use super::{Audience, Channel, Inbound, InboundKind, MessageId, ThreadKey};
+use super::{inbox, Attachment, Audience, Channel, Inbound, InboundKind, MessageId, ThreadKey};
 
 /// The name this channel puts in a [`ThreadKey`].
 const NAME: &str = "mcp";
@@ -51,8 +51,11 @@ const NAME: &str = "mcp";
 /// Where the MCP endpoint is served when no port is configured.
 pub const DEFAULT_PORT: u16 = 8742;
 
-/// Largest request body accepted. A prompt, not a payload.
-const MAX_REQUEST: usize = 1024 * 1024;
+/// Largest request body accepted.
+///
+/// Sized for files, not prompts: one attachment may be [`inbox::MAX_BYTES`],
+/// base64 grows that by a third, and a caller may send a few at once.
+const MAX_REQUEST: usize = 64 * 1024 * 1024;
 
 /// Largest file handed back inline. Base64 in a JSON response grows it by a
 /// third and the caller has to hold all of it in context, so well under what
@@ -78,6 +81,8 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 pub struct Config {
     pub port: u16,
+    /// Where files callers send are saved: the same inbox the chats use.
+    pub inbox_dir: std::path::PathBuf,
     /// Node names or login names allowed to call. `None` is the whole tailnet.
     pub allowed: Option<Vec<String>>,
 }
@@ -129,6 +134,7 @@ pub struct Mcp {
     allowed: Option<Vec<String>>,
     whois: Mutex<HashMap<IpAddr, (Caller, Instant)>>,
     next_id: std::sync::atomic::AtomicU64,
+    inbox_dir: std::path::PathBuf,
 }
 
 impl Mcp {
@@ -142,6 +148,7 @@ impl Mcp {
             allowed: config.allowed.clone(),
             whois: Mutex::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            inbox_dir: config.inbox_dir.clone(),
         });
         (mcp, rx)
     }
@@ -341,8 +348,15 @@ impl Mcp {
 
         match tool {
             "run_task" => {
-                let prompt = string_arg(args, "prompt")?;
-                self.submit(caller, &key, prompt, true).await?;
+                let files = self.receive(&key, args)?;
+                let prompt = args
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if prompt.trim().is_empty() && files.is_empty() {
+                    bail!("'prompt' is required, unless files are sent");
+                }
+                self.submit_with(caller, &key, prompt, files, true).await?;
                 Ok(self.wait(&key, &session, wait).await)
             }
             "session_command" => {
@@ -383,6 +397,78 @@ impl Mcp {
         text: &str,
         exclusive: bool,
     ) -> Result<()> {
+        self.submit_with(caller, key, text, Vec::new(), exclusive)
+            .await
+    }
+
+    /// Save the files a `run_task` carries into the inbox, as the chat
+    /// channels do with a photo or a document.
+    ///
+    /// A file that cannot be decoded or is too big is still an [`Attachment`],
+    /// with the reason as its error, so the agent is told about it rather than
+    /// the file silently going missing. Only a malformed `files` argument is
+    /// refused outright, since that is the caller's bug to fix.
+    fn receive(&self, key: &ThreadKey, args: &Value) -> Result<Vec<Attachment>> {
+        let Some(list) = args.get("files") else {
+            return Ok(Vec::new());
+        };
+        let list = list.as_array().context("'files' must be an array")?;
+        let mut files = Vec::new();
+        for (i, file) in list.iter().enumerate() {
+            let name = file
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| !n.trim().is_empty())
+                .with_context(|| format!("files[{i}] needs a 'name'"))?
+                .to_string();
+            let bytes = match (
+                file.get("data").and_then(Value::as_str),
+                file.get("text").and_then(Value::as_str),
+            ) {
+                (Some(data), None) => base64::engine::general_purpose::STANDARD
+                    .decode(data.trim())
+                    .map_err(|e| format!("its data is not valid base64 ({e})")),
+                (None, Some(text)) => Ok(text.as_bytes().to_vec()),
+                _ => bail!("files[{i}] needs exactly one of 'data' (base64) or 'text'"),
+            };
+            let mime = file
+                .get("mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| mime_for(&name))
+                .to_string();
+            let size = bytes.as_ref().map_or(0, |b| b.len() as u64);
+            let saved = bytes.and_then(|bytes| {
+                if bytes.len() as u64 > inbox::MAX_BYTES {
+                    return Err(format!(
+                        "it is {}, over the {} limit",
+                        inbox::human(bytes.len() as u64),
+                        inbox::human(inbox::MAX_BYTES)
+                    ));
+                }
+                inbox::save(&self.inbox_dir, key, &name, &bytes)
+                    .map_err(|e| format!("it could not be saved: {e}"))
+            });
+            files.push(Attachment {
+                name,
+                mime,
+                size,
+                saved,
+            });
+        }
+        if !files.is_empty() {
+            inbox::prune(&self.inbox_dir);
+        }
+        Ok(files)
+    }
+
+    async fn submit_with(
+        &self,
+        caller: &Caller,
+        key: &ThreadKey,
+        text: &str,
+        files: Vec<Attachment>,
+        exclusive: bool,
+    ) -> Result<()> {
         {
             let mut sessions = self.sessions.lock().unwrap();
             let session = sessions.entry(key.to_string()).or_default();
@@ -405,7 +491,7 @@ impl Mcp {
             user_id: format!("{}@{}", caller.login, caller.node),
             kind: InboundKind::Text {
                 text: text.to_string(),
-                files: Vec::new(),
+                files,
             },
         };
         if self.inbound.send(message).await.is_err() {
@@ -786,15 +872,32 @@ fn tools() -> Value {
             "title": "Run a task with a local agent",
             "description": "Send a prompt to the coding agent in a session on the user's \
                 workstation and wait for its answer. Continues that session's conversation. \
-                Fails if the session is still busy with an earlier task.",
+                Fails if the session is still busy with an earlier task. Files and images \
+                can go with it: they are saved on the workstation and the agent is told \
+                where, the same as a photo sent from a phone.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string", "description": "The task, as you would type it to the agent." },
+                    "prompt": { "type": "string", "description": "The task, as you would type it to the agent. May be empty when files are sent." },
+                    "files": {
+                        "type": "array",
+                        "description": format!("Files for the agent, each up to {}. Give \
+                            'data' as base64 for any file, or 'text' for a text file.",
+                            inbox::human(inbox::MAX_BYTES)),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "File name, e.g. screenshot.png." },
+                                "data": { "type": "string", "description": "Contents, base64." },
+                                "text": { "type": "string", "description": "Contents, as text (instead of data)." },
+                                "mime_type": { "type": "string", "description": "Optional; guessed from the name." },
+                            },
+                            "required": ["name"],
+                        },
+                    },
                     "session": session,
                     "wait_seconds": wait,
                 },
-                "required": ["prompt"],
             },
         },
         {
@@ -928,6 +1031,68 @@ fn mime_for(name: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    fn test_config() -> Config {
+        Config {
+            port: 0,
+            allowed: None,
+            inbox_dir: std::env::temp_dir().join(format!("omt-mcp-inbox-{}", std::process::id())),
+        }
+    }
+
+    /// A file sent with a task lands in the inbox and reaches the core as an
+    /// attachment; one that cannot be decoded still arrives, as its reason.
+    #[tokio::test]
+    async fn files_sent_with_a_task_arrive_as_attachments() {
+        let (mcp, mut rx) = Mcp::new(&test_config());
+        mcp.call(
+            &caller(),
+            "run_task",
+            &json!({
+                "prompt": "",
+                "files": [
+                    { "name": "../../shot.png", "data": base64::engine::general_purpose::STANDARD.encode(b"PNGDATA") },
+                    { "name": "notes.md", "text": "hello" },
+                    { "name": "broken.bin", "data": "!!!not base64" },
+                ],
+                "wait_seconds": 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let inbound = rx.recv().await.unwrap();
+        let InboundKind::Text { files, .. } = inbound.kind else {
+            panic!()
+        };
+        assert_eq!(files.len(), 3);
+
+        let shot = files[0].saved.as_ref().unwrap();
+        assert_eq!(std::fs::read(shot).unwrap(), b"PNGDATA");
+        assert!(shot.starts_with(&test_config().inbox_dir), "{shot:?}");
+        assert!(shot.to_string_lossy().ends_with("-shot.png"), "{shot:?}");
+        assert_eq!(files[0].mime, "image/png");
+        assert_eq!(
+            std::fs::read_to_string(files[1].saved.as_ref().unwrap()).unwrap(),
+            "hello"
+        );
+        assert!(files[2].saved.as_ref().unwrap_err().contains("base64"));
+
+        assert!(mcp
+            .call(
+                &caller(),
+                "run_task",
+                &json!({ "session": "x", "files": [{ "name": "a" }] })
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+        assert!(mcp
+            .call(&caller(), "run_task", &json!({ "session": "y" }))
+            .await
+            .is_err());
+        std::fs::remove_dir_all(test_config().inbox_dir).ok();
+    }
+
     fn caller() -> Caller {
         Caller {
             node: "macbook-air".into(),
@@ -985,10 +1150,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_and_list_tools() {
-        let (mcp, _rx) = Mcp::new(&Config {
-            port: 0,
-            allowed: None,
-        });
+        let (mcp, _rx) = Mcp::new(&test_config());
         let init = mcp
             .dispatch(
                 &caller(),
@@ -1042,10 +1204,7 @@ mod tests {
     /// an inbound, the reply is collected, and idle is what releases the caller.
     #[tokio::test]
     async fn a_task_returns_what_the_core_sent_once_it_is_idle() {
-        let (mcp, mut rx) = Mcp::new(&Config {
-            port: 0,
-            allowed: None,
-        });
+        let (mcp, mut rx) = Mcp::new(&test_config());
         let core = {
             let mcp = mcp.clone();
             tokio::spawn(async move {
@@ -1075,10 +1234,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_session_refuses_a_second_task_but_not_a_stop() {
-        let (mcp, mut rx) = Mcp::new(&Config {
-            port: 0,
-            allowed: None,
-        });
+        let (mcp, mut rx) = Mcp::new(&test_config());
         let first = mcp
             .call(
                 &caller(),
