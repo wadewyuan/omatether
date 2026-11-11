@@ -12,6 +12,12 @@ async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false }
+# The MCP channel's HTTP server. Already in the tree under reqwest, so this
+# turns on the server half rather than adding a stack.
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # rustls rather than the default openssl: one less system dependency for a
 # service that has to start reliably at boot.
 reqwest = { version = "0.12", default-features = false, features = [

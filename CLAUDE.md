@@ -406,6 +406,43 @@ Telegram bug above, in a second place. Both now carry it through as
 allowlist runs *first*, because a stranger gets silence rather than a reply that
 confirms the number is a bridge.
 
+## MCP (other agents on the tailnet)
+
+**A channel, not a side door.** A tool call becomes an `Inbound` on thread
+`mcp:<caller node>:<session>`, so sessions, `/cd`, `/agent`, auto mode and
+the store all work unchanged. The only thing the core learns is
+`Channel::audience() == Agent`, which swaps the phone brief for one that asks
+for a complete, self-contained final message.
+
+**The caller has to know when it has the whole answer, and nothing in the
+chat channels said so.** Typing-off looked like the signal and is not: a
+command answered on the spot never raises the indicator, and on an editing
+channel it drops while the turn is still running. So the core announces
+`Channel::idle` (an `OutJob::Idle`, behind the turn's last pages) once per
+stretch of work, from `announce_idle` after every inbound, agent event and
+release. Two traps, both with tests: busy is `turn_running`, **not** the
+session's busy flag, which Claude clears a few events before the turn's last
+one — an idle then lands ahead of the answer. And `handle_inbound` forgets the
+thread's idle *before* handling, or a second `/status` on an idle thread is
+never announced and its caller waits out the full `wait_seconds`.
+
+**Tailnet only, three ways.** Bound to the `tailscale ip` addresses alone
+(retried every 15s until Tailscale is up, so boot order cannot take Telegram
+down); a peer outside 100.64/10 and fd7a:115c:a1e0::/48 is dropped; and every
+request's peer must answer `tailscale whois`, which is also where its name
+comes from. A request carrying `Origin` is refused, since only a browser sends
+one (DNS rebinding). No token by design: a tailnet node is already an
+authenticated device. Auto mode stays on, as everywhere — the owner chose that.
+
+**Transport is the JSON half of Streamable HTTP** — POST in, JSON out, 202 for
+notifications, 405 for GET, no SSE and no session header. Long turns are
+`wait_seconds` (default 45, under most clients' 60s) then `running`, picked up
+by `get_result`; one exclusive request per session, `/stop`/`/allow`/`/deny`
+get through anyway. Verified end to end against a real Claude turn with curl
+over the tailnet address: answer, resumed conversation, busy refusal, stop,
+file returned as a resource. **Unverified:** a real MCP client (Claude Code,
+Codex) connecting from another node.
+
 ## Attachments
 
 **A file becomes a path in the prompt, not an upload.** `src/channel/inbox.rs`

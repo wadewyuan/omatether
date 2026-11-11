@@ -28,6 +28,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::Agent;
+use crate::channel::mcp::{self, Mcp};
 use crate::channel::photon::{self, Photon};
 use crate::channel::telegram::Telegram;
 use crate::channel::{Channel, Inbound};
@@ -174,11 +175,18 @@ async fn serve(
         channels.push(photon);
     }
 
+    if let Some(config) = mcp_config()? {
+        let (mcp, inbound) = Mcp::new(&config);
+        mcp.clone().serve(config.port);
+        merge(inbound, inbound_tx.clone());
+        channels.push(mcp);
+    }
+
     if channels.is_empty() {
         bail!(
             "no channels configured. Set OMATETHER_TELEGRAM_TOKEN (with \
              OMATETHER_TELEGRAM_ALLOWED_USERS), or OMATETHER_PHOTON_PROJECT_ID \
-             (with _SECRET and OMATETHER_PHOTON_ALLOWED_USERS), or both."
+             (with _SECRET and OMATETHER_PHOTON_ALLOWED_USERS), or OMATETHER_MCP=on."
         );
     }
 
@@ -275,6 +283,35 @@ async fn start_photon(sidecar: Option<PathBuf>, inbox_dir: PathBuf) -> Result<Op
 
     tracing::info!("photon ready, allowed: {}", allowed.join(", "));
     Ok(Some(photon))
+}
+
+/// The MCP channel is on when `OMATETHER_MCP` says so. Off by default: it is
+/// the one channel that listens, and a machine should not start doing that
+/// because a package was upgraded.
+fn mcp_config() -> Result<Option<mcp::Config>> {
+    let on = std::env::var("OMATETHER_MCP").unwrap_or_default();
+    match on.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" | "no" => return Ok(None),
+        "1" | "on" | "true" | "yes" => {}
+        other => bail!("OMATETHER_MCP should be on or off, not '{other}'"),
+    }
+    let port = match std::env::var("OMATETHER_MCP_PORT") {
+        Ok(port) => port
+            .trim()
+            .parse()
+            .with_context(|| format!("OMATETHER_MCP_PORT is not a port: '{port}'"))?,
+        Err(_) => mcp::DEFAULT_PORT,
+    };
+    // Unset is the whole tailnet, which is the point: the tailnet is the
+    // boundary. A list narrows it to named nodes or logins.
+    let allowed = allowlist("OMATETHER_MCP_ALLOWED").ok();
+    tracing::info!(
+        "mcp on port {port}, allowed: {}",
+        allowed
+            .as_ref()
+            .map_or("any tailnet node".to_string(), |a| a.join(", "))
+    );
+    Ok(Some(mcp::Config { port, allowed }))
 }
 
 fn allowlist(var: &str) -> Result<Vec<String>> {

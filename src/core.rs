@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use crate::agent::{self, Agent};
-use crate::channel::{inbox, Attachment, Channel, Inbound, InboundKind, ThreadKey};
+use crate::channel::{inbox, Attachment, Audience, Channel, Inbound, InboundKind, ThreadKey};
 use crate::command::{self, Command, ModelRequest};
 use crate::event::{AgentEvent, Decision};
 use crate::outbox::{OutJob, Outbox};
@@ -174,6 +174,10 @@ pub struct Core {
     /// session it belonged to is gone, and `/new` and `/cd` drop sessions
     /// mid-turn.
     typing: HashMap<ThreadKey, std::time::Instant>,
+    /// Threads that have been told they are idle since they were last busy,
+    /// so [`Channel::idle`] goes out once per stretch of work and not after
+    /// every event. See [`Core::announce_idle`].
+    idle: std::collections::HashSet<ThreadKey>,
     /// Messages collected but not yet sent as a turn. See [`COALESCE`].
     held: HashMap<ThreadKey, Held>,
     /// Each thread's last finished turn in full, every tool call included, for
@@ -205,6 +209,7 @@ impl Core {
             fresh_cwd: work_dir(),
             threads: HashMap::new(),
             typing: HashMap::new(),
+            idle: std::collections::HashSet::new(),
             held: HashMap::new(),
             transcripts: HashMap::new(),
             agent_tx,
@@ -224,16 +229,13 @@ impl Core {
             let release_at = self.next_release();
 
             tokio::select! {
-                Some(message) = inbound.recv() => {
-                    if let Err(e) = self.on_inbound(message).await {
-                        tracing::error!("handling inbound: {e:#}");
-                    }
-                }
+                Some(message) = inbound.recv() => self.handle_inbound(message).await,
 
                 Some((key, event)) = self.agent_rx.recv() => {
                     if let Err(e) = self.on_agent_event(&key, event).await {
                         tracing::error!("handling agent event: {e:#}");
                     }
+                    self.announce_idle(&key);
                 }
 
                 _ = tokio::time::sleep_until(release_at) => {
@@ -265,6 +267,21 @@ impl Core {
     }
 
     // ---- inbound -------------------------------------------------------
+
+    /// One inbound, start to finish, and the idle that ends it if it started
+    /// nothing that runs on.
+    async fn handle_inbound(&mut self, message: Inbound) {
+        let key = message.thread.clone();
+        // A new request starts a new stretch of work. Without this a command
+        // answered on the spot, on a thread already announced idle, would
+        // never be announced again, and its caller would wait forever.
+        self.idle.remove(&key);
+        if let Err(e) = self.on_inbound(message).await {
+            tracing::error!("handling inbound: {e:#}");
+        }
+        // Whatever happened, including an error.
+        self.announce_idle(&key);
+    }
 
     async fn on_inbound(&mut self, message: Inbound) -> Result<()> {
         // The audit line for a service that can run shell commands on request.
@@ -379,12 +396,14 @@ impl Core {
         // Newline rather than a space: the parts were separate messages, and
         // two sentences run together read as one badly-punctuated sentence.
         let text = held.parts.join("\n");
-        match compose(&text, &held.files) {
+        let released = match compose(&text, &held.files) {
             Some(prompt) => self.on_prompt(key, &prompt).await,
             // Nothing to send: no words, and not one file arrived. Say why
             // instead of starting a turn about nothing.
             None => self.say(key, &nothing_arrived(&held.files)),
-        }
+        };
+        self.announce_idle(key);
+        released
     }
 
     async fn on_command(&mut self, key: &ThreadKey, command: Command) -> Result<()> {
@@ -1198,6 +1217,39 @@ impl Core {
         }
     }
 
+    /// Whether the core still owes this thread something: a message being
+    /// collected, or a turn running that is not stopped on a question.
+    ///
+    /// Not [`Core::is_working`], which is about the indicator: that one goes
+    /// quiet once a streaming turn is on screen, while the turn is still very
+    /// much running.
+    fn is_busy(&self, key: &ThreadKey) -> bool {
+        if self.held.contains_key(key) {
+            return true;
+        }
+        // `turn_running` and not the session's busy flag: some adapters clear
+        // that a few events before the turn's last one arrives, and an idle
+        // sent then would land ahead of the answer.
+        self.threads
+            .get(key)
+            .is_some_and(|thread| thread.turn_running && thread.pending.is_none())
+    }
+
+    /// Tell the thread's channel it is idle, once per stretch of work.
+    ///
+    /// Called after everything that can end one — an inbound handled, an agent
+    /// event, a held message released — rather than at each place a turn
+    /// can finish, because there are more of those than anyone will remember
+    /// to keep in step: a command answered at once, a prompt rejected as busy,
+    /// a turn finished, stopped or waiting on a permission question.
+    fn announce_idle(&mut self, key: &ThreadKey) {
+        if self.is_busy(key) {
+            self.idle.remove(key);
+        } else if self.idle.insert(key.clone()) {
+            self.queue(key, OutJob::Idle);
+        }
+    }
+
     /// Bring one thread's indicator in line with whether it is working.
     ///
     /// Idempotent and cheap to call often: it re-sends only once the platform
@@ -1601,9 +1653,13 @@ impl Core {
         }
 
         let state = self.state(key)?;
-        let brief = self
-            .channel(key)
-            .map(|channel| brief(channel.can_edit(), channel.can_send_files()));
+        let brief = self.channel(key).map(|channel| {
+            brief(
+                channel.audience(),
+                channel.can_edit(),
+                channel.can_send_files(),
+            )
+        });
 
         let (session, events) = agent::spawn(agent::SpawnConfig {
             agent: state.agent.clone(),
@@ -1708,7 +1764,10 @@ fn nothing_arrived(files: &[Attachment]) -> String {
     }
 }
 
-fn brief(can_edit: bool, can_send_files: bool) -> String {
+fn brief(audience: Audience, can_edit: bool, can_send_files: bool) -> String {
+    if audience == Audience::Agent {
+        return brief_for_agent(can_send_files);
+    }
     let mut brief = String::from(
         "You are being driven from a chat app on the user's phone, not a terminal. \
          Lead with the answer and keep replies short. Do not paste logs, command \
@@ -1735,6 +1794,35 @@ fn brief(can_edit: bool, can_send_files: bool) -> String {
              working directory or the system temp directory will be sent, nothing \
              hidden (no dot-named file or directory), and a refusal is reported to \
              the chat.",
+        );
+    }
+    brief
+}
+
+/// The brief for a thread another AI agent is driving over MCP.
+///
+/// Different enough from the phone's to be its own text: the reader is a
+/// program that will act on the answer, so precision beats brevity, and
+/// nothing is read until the turn is over.
+fn brief_for_agent(can_send_files: bool) -> String {
+    let mut brief = String::from(
+        "You are being driven by another AI agent, calling from a machine on the \
+         user's private network through omatether's MCP server, not by a person at \
+         a terminal. Its prompt is a task delegated to you on this machine. Only \
+         your final message of each turn, the text after your last tool call, is \
+         returned to it; anything before or between tool calls is not. Make that \
+         final message complete and self-contained: what you did, the result, \
+         exact paths, commands and values it may need, and anything that failed \
+         or is left undone. It cannot see your screen or ask you follow-up \
+         questions mid-turn, so do not stop to ask for confirmation of routine \
+         steps; if you genuinely cannot proceed, say exactly what you need.",
+    );
+    if can_send_files {
+        brief.push_str(
+            " To return a file you made, put `[send-file: /absolute/path]` on a \
+             line of its own; the caller receives its contents. Only files inside \
+             the working directory or the system temp directory are sent, nothing \
+             hidden (no dot-named file or directory).",
         );
     }
     brief
@@ -1862,6 +1950,94 @@ mod tests {
             name: "Bash".into(),
             input: serde_json::json!({ "command": command }),
         }
+    }
+
+    const IDLE: &str = "<idle>";
+
+    /// What an MCP caller waits on: one idle, after the answer, not before it
+    /// and not again on every later event.
+    #[tokio::test]
+    async fn a_finished_turn_goes_idle_once_and_after_its_answer() {
+        let dir = std::env::temp_dir().join(format!("sb-idle-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+        core.announce_idle(&key);
+        core.on_agent_event(
+            &key,
+            AgentEvent::TextDelta {
+                text: "Done.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        core.announce_idle(&key);
+        core.on_agent_event(
+            &key,
+            AgentEvent::TurnEnd {
+                ok: true,
+                detail: None,
+            },
+        )
+        .await
+        .unwrap();
+        core.announce_idle(&key);
+        core.on_agent_event(
+            &key,
+            AgentEvent::RateLimit {
+                five_hour: Some(0.1),
+                seven_day: None,
+            },
+        )
+        .await
+        .unwrap();
+        core.announce_idle(&key);
+        settle().await;
+
+        assert_eq!(
+            *channel.sent.lock().unwrap(),
+            vec!["Done.".to_string(), IDLE.to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A command answered on the spot never makes the thread busy, and the
+    /// caller still has to be released — including after an earlier idle.
+    #[tokio::test]
+    async fn a_command_on_an_idle_thread_still_goes_idle() {
+        let dir = std::env::temp_dir().join(format!("sb-idle-cmd-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        for _ in 0..2 {
+            core.handle_inbound(Inbound {
+                thread: key.clone(),
+                user_id: "t".into(),
+                kind: InboundKind::Text {
+                    text: "/help".into(),
+                    files: Vec::new(),
+                },
+            })
+            .await;
+        }
+        settle().await;
+
+        let sent = channel.sent.lock().unwrap().clone();
+        assert_eq!(sent.iter().filter(|s| *s == IDLE).count(), 2, "{sent:?}");
+        assert_eq!(sent.last().unwrap(), IDLE);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -2052,20 +2228,20 @@ mod tests {
         // On a channel that edits, the narration streams in as it is written
         // and is not lost, so telling the agent otherwise would be a lie that
         // changes how it writes.
-        assert!(brief(false, false).contains("final message"));
-        assert!(!brief(true, false).contains("final message"));
-        assert!(brief(true, false).contains("phone"));
+        assert!(brief(Audience::Person, false, false).contains("final message"));
+        assert!(!brief(Audience::Person, true, false).contains("final message"));
+        assert!(brief(Audience::Person, true, false).contains("phone"));
     }
 
     #[test]
     fn the_brief_only_offers_the_file_marker_to_a_channel_that_can_carry_a_file() {
         // Telling the agent to ask for a file the chat cannot receive is how it
         // spends a turn making a chart that then goes nowhere.
-        assert!(!brief(true, false).contains("send-file"));
-        assert!(brief(false, true).contains("send-file"));
+        assert!(!brief(Audience::Person, true, false).contains("send-file"));
+        assert!(brief(Audience::Person, false, true).contains("send-file"));
         // Including the directories it will be accepted from, because a refusal
         // the agent could have avoided is a wasted turn too.
-        assert!(brief(true, true).contains("temp directory"));
+        assert!(brief(Audience::Person, true, true).contains("temp directory"));
     }
 
     #[tokio::test]
@@ -2393,6 +2569,10 @@ mod tests {
         }
         async fn ask_permission(&self, t: &ThreadKey, text: &str, _q: &str) -> Result<String> {
             self.send(t, text).await
+        }
+        /// Into `sent`, so a test can see where it fell among the messages.
+        async fn idle(&self, _t: &ThreadKey) {
+            self.sent.lock().unwrap().push(IDLE.to_string());
         }
     }
 

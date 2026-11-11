@@ -101,6 +101,46 @@ The last six run in a tmux session through `omarchy-agent`. Their replies
 appear in that terminal rather than in the chat; `/attach` gives you the
 command to open it.
 
+## Other agents on your tailnet (MCP)
+
+omatether can also be an MCP server, so an AI agent on another machine on your
+[Tailscale](https://tailscale.com) network can hand tasks to the agents on
+this one. Add to `~/.config/omatether/env`:
+
+```
+OMATETHER_MCP=on
+# OMATETHER_MCP_PORT=8742                      # the default
+# OMATETHER_MCP_ALLOWED=macbook-air,ci-runner  # node or login names; unset = whole tailnet
+```
+
+and restart the service. It listens on this machine's Tailscale addresses
+only, not on the LAN or localhost, and every caller is identified with
+`tailscale whois`. Point a client at `http://<this-machine>:8742/mcp`
+(Streamable HTTP), for example:
+
+```bash
+claude mcp add --transport http omatether http://omarchy:8742/mcp
+```
+
+| Tool | Does |
+|---|---|
+| `run_task` | Send a prompt to a session's agent and wait for its answer |
+| `get_result` | Keep waiting on a task that returned `running` |
+| `stop_task` | Interrupt it |
+| `session_command` | `/status`, `/new`, `/cd`, `/agent`, `/model`, `/auto`, `/allow`, `/deny`, `/log`, `/send` |
+| `list_sessions` | The caller's sessions and which are running |
+
+Each caller gets its own sessions, named by it (`default` if not), and each
+is a thread like a chat: its own conversation, directory and agent, kept
+across restarts. Sessions run in parallel; one session runs one task at a
+time. A call waits up to `wait_seconds` (default 45) and then returns
+`running`, so a long task never trips the client's timeout. Files the agent
+hands over come back inline, up to 20 MB.
+
+> **Auto mode is on here too**, as on every channel: anything on your tailnet
+> that can reach the port can run commands on this machine as you. Use
+> `OMATETHER_MCP_ALLOWED` or your tailnet ACLs if not every node should.
+
 ## Running it
 
 ```bash
@@ -108,8 +148,9 @@ systemctl --user status omatether
 journalctl --user -fu omatether
 ```
 
-It opens no ports. Telegram is polled from this machine, and the iMessage
-helper listens on localhost only.
+It opens no ports unless you turn on MCP, and then only on the tailnet.
+Telegram is polled from this machine, and the iMessage helper listens on
+localhost only.
 
 **Manual setup**, if you'd rather not use `omatether setup`: write
 `~/.config/omatether/env` with mode 600:

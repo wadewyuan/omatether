@@ -10,6 +10,7 @@
 
 pub mod inbox;
 mod markup;
+pub mod mcp;
 pub mod photon;
 pub mod photon_setup;
 pub mod telegram;
@@ -201,4 +202,28 @@ pub trait Channel: Send + Sync {
     async fn typing(&self, _thread: &ThreadKey, _on: bool) -> Result<()> {
         Ok(())
     }
+
+    /// Who reads this channel. Decides how the agent is briefed.
+    fn audience(&self) -> Audience {
+        Audience::Person
+    }
+
+    /// The core has done all it is going to do about what this thread last
+    /// sent: a turn finished, a command answered, or a question is waiting
+    /// on an answer. Delivered through the outbox, behind every message that
+    /// work produced.
+    ///
+    /// A person on a phone needs no such signal, since they read the reply.
+    /// A program waiting on a request does: it is how it knows the answer it
+    /// holds is the whole answer.
+    async fn idle(&self, _thread: &ThreadKey) {}
+}
+
+/// Who is on the other end of a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Audience {
+    /// Someone in a chat app on their phone.
+    Person,
+    /// Another AI agent, calling over MCP.
+    Agent,
 }

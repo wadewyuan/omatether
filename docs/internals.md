@@ -52,6 +52,7 @@ else's.
 | `src/channel/telegram.rs` | Bot API client and the long-poll loop. |
 | `src/channel/markup.rs` | Markdown → the HTML subset Telegram parses. |
 | `src/channel/photon.rs` | The iMessage channel and its sidecar supervisor. |
+| `src/channel/mcp.rs` | The MCP channel: other agents on the tailnet, over HTTP. |
 | `src/channel/inbox.rs` | Where a file someone sent lands on disk. |
 | `src/channel/*_setup.rs` | The live API calls behind `omatether setup`. |
 

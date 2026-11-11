@@ -83,6 +83,10 @@ pub enum OutJob {
 
     /// Show, or stop showing, that the agent is working.
     Typing { on: bool },
+
+    /// The core has finished with what this thread last asked for. Queued
+    /// behind whatever that produced, so it lands after the answer.
+    Idle,
 }
 
 /// The core's handle on one thread's outbound task.
@@ -220,6 +224,8 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
             OutJob::Typing { on } => {
                 report(&key, "typing", channel.typing(&key, on).await);
             }
+
+            OutJob::Idle => channel.idle(&key).await,
         }
     }
 }
