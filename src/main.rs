@@ -114,7 +114,23 @@ enum KeyAction {
         /// under this name.
         name: String,
     },
-    /// List the keys by name. The keys themselves are not stored.
+    /// Hold a key for one tailnet device to collect itself, so it is never
+    /// shown here or anywhere else. The device POSTs to
+    /// http://<this-machine>:<port>/claim within the time limit and gets the
+    /// key in the response, once.
+    Offer {
+        /// A name for the agent it is for, e.g. grokbot.
+        name: String,
+        /// The device, by its tailnet name as `tailscale status` shows it.
+        #[arg(long)]
+        node: String,
+        /// Minutes the offer stays open.
+        #[arg(long, default_value_t = 15)]
+        minutes: u64,
+    },
+    /// Withdraw an offer nobody has claimed yet.
+    Withdraw { name: String },
+    /// List the keys by name, and open offers. The keys themselves are not stored.
     List,
     /// Revoke a key. Takes effect on the next request; no restart needed.
     Revoke { name: String },
@@ -136,13 +152,45 @@ fn mcp_key(action: KeyAction) -> Result<()> {
                     .unwrap_or_else(|_| mcp::DEFAULT_PORT.to_string())
             );
         }
+        KeyAction::Offer {
+            name,
+            node,
+            minutes,
+        } => {
+            let offer = mcp_keys::offer(&path, &name, &node, minutes)?;
+            println!(
+                "Key '{}' is waiting for {} for {} minutes. On that device:\n  \
+                 curl -sS -X POST http://{}:{}/claim\n\
+                 It works once; the key is made then and shown only there.",
+                offer.name,
+                offer.node,
+                minutes.clamp(1, 24 * 60),
+                core_hostname(),
+                std::env::var("OMATETHER_MCP_PORT")
+                    .unwrap_or_else(|_| mcp::DEFAULT_PORT.to_string())
+            );
+        }
+        KeyAction::Withdraw { name } => {
+            if mcp_keys::withdraw(&path, &name)? {
+                println!("Withdrew the offer for '{name}'.");
+            } else {
+                bail!("there is no open offer for '{name}'");
+            }
+        }
         KeyAction::List => {
             let keys = mcp_keys::load(&path)?;
-            if keys.is_empty() {
-                println!("No keys. Make one with `omatether mcp-key add <name>`.");
+            let offers = mcp_keys::load_offers(&path)?;
+            if keys.is_empty() && offers.is_empty() {
+                println!("No keys. Make one with `omatether mcp-key add <name>` or `offer`.");
             }
             for key in keys {
                 println!("{}\tcreated {}", key.name, key.created);
+            }
+            for offer in offers {
+                println!(
+                    "{}\toffered to {}, expires {}",
+                    offer.name, offer.node, offer.expires
+                );
             }
         }
         KeyAction::Revoke { name } => {

@@ -234,7 +234,8 @@ impl Mcp {
     }
 
     async fn handle(&self, request: Request<Incoming>, peer: SocketAddr) -> Response<Full<Bytes>> {
-        if request.uri().path() != "/mcp" {
+        let path = request.uri().path().to_string();
+        if path != "/mcp" && path != "/claim" {
             return plain(StatusCode::NOT_FOUND, "not found; the endpoint is /mcp");
         }
         // A browser sends Origin; an agent's MCP client does not. Refusing it
@@ -258,6 +259,9 @@ impl Mcp {
                 return plain(StatusCode::FORBIDDEN, &format!("{e:#}"));
             }
         };
+        if path == "/claim" {
+            return self.claim(&caller, peer);
+        }
         match self.authenticate(request.headers()) {
             Ok(key) => caller.key = key,
             Err(e) => {
@@ -651,6 +655,40 @@ impl Mcp {
             lines.join("\n")
         };
         json!({ "content": [{ "type": "text", "text": text }] })
+    }
+
+    /// Hand a device the key its owner offered it, once.
+    ///
+    /// No key is needed to ask, since getting one is the point; what is needed
+    /// is to *be* the device the offer names, which `tailscale whois` has
+    /// already established from the connection, not from anything the request
+    /// says. The key is made here and appears only in this response.
+    fn claim(&self, caller: &Caller, peer: SocketAddr) -> Response<Full<Bytes>> {
+        match crate::mcp_keys::claim(&self.keys_file, &caller.node) {
+            Ok(Some((name, key))) => {
+                tracing::info!(%peer, node = %caller.node, key = %name, "mcp: key claimed");
+                let mut response = plain(StatusCode::OK, &format!("{key}\n"));
+                response
+                    .headers_mut()
+                    .insert(hyper::header::CACHE_CONTROL, "no-store".parse().unwrap());
+                response
+            }
+            Ok(None) => {
+                tracing::warn!(%peer, node = %caller.node, "mcp: claim with no key waiting");
+                plain(
+                    StatusCode::NOT_FOUND,
+                    &format!(
+                        "no key is waiting for {}. Ask the owner to offer one \
+                         (omatether mcp-key offer <name> --node {}); offers expire.",
+                        caller.node, caller.node
+                    ),
+                )
+            }
+            Err(e) => {
+                tracing::error!("mcp: claim: {e:#}");
+                plain(StatusCode::INTERNAL_SERVER_ERROR, "could not issue the key")
+            }
+        }
     }
 
     /// The name of the API key this request carries, or why it is refused.
@@ -1340,7 +1378,10 @@ mod tests {
         );
         assert!(session_name(&json!({ "session": "a:b" })).is_err());
         assert!(session_name(&json!({ "session": "../x" })).is_err());
-        assert_eq!(thread_key(&caller(), "x").to_string(), "mcp:macbook-agent:x");
+        assert_eq!(
+            thread_key(&caller(), "x").to_string(),
+            "mcp:macbook-agent:x"
+        );
     }
 
     #[tokio::test]

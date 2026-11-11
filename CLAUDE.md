@@ -455,6 +455,16 @@ Sessions are keyed by **key name**, not node (`mcp:<key>:<session>`), so two
 agents on one machine do not share a conversation; threads made before keys
 existed are orphaned under their node name, harmlessly.
 
+**Never put a key where the owner's chat can see it.** `mcp-key add` prints
+the key, and an agent driven from Telegram that runs it — or sends the file
+it wrote — has put a shell credential into chat history. That happened twice
+and both keys were revoked. `mcp-key offer <name> --node <device>` is the
+way: the offer file (`mcp-key-offers`, beside the keys) holds no key at all;
+`POST /claim` from that exact device (by `whois` of the connection) makes the
+key, stores its hash, closes the offer first and returns the key once. No key
+is required to call `/claim`, so it is the one unauthenticated path: it does
+nothing unless an unexpired offer names the caller's node.
+
 **A "running" reply carries progress, not a stream.** MCP progress
 notifications reach the client's UI and never the calling model, so they
 would not help the agent decide anything. Instead `Channel::wants_progress`

@@ -126,6 +126,19 @@ omatether mcp-key list
 omatether mcp-key revoke grokbot  # takes effect at once, no restart
 ```
 
+Better, so the key is never shown anywhere but on the agent's machine: offer
+it to that device and let the agent collect it.
+
+```bash
+omatether mcp-key offer grokbot --node grokbot-user-518630511   # open 15 minutes
+# then, on that device, once:
+curl -sS -X POST http://omarchy:8742/claim
+```
+
+The key is made at the claim and returned only in that response. Only the
+named tailnet device can claim it (checked with `tailscale whois`, not by
+anything the request says), only once, and only before the offer expires.
+
 Only a hash of each key is stored, in `~/.config/omatether/mcp-keys`. Point
 the agent's client at `http://<this-machine>:8742/mcp` (Streamable HTTP) with
 the key as a bearer token, for example:
