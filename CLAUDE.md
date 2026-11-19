@@ -264,9 +264,10 @@ handed to opencode as an `instructions` entry and to copilot through
 
 Verified against opencode 2.3.2 through `omatether repl`: a turn, a tool call
 allowed and denied, `/model` list/switch/refuse/default, resume across two
-processes, `/cancel` then a fresh turn. The brief was proven obeyed by a raw
-protocol probe handing opencode an `instructions` file the same way — not
-through `serve`, since the repl sends no brief. **Unverified:** any
+processes, `/cancel` then a fresh turn. The brief through `serve` from
+Telegram: opencode's own reasoning for the reply cites "the phone chat
+instructions" (read back from its store, `~/.local/share/opencode/opencode.db`,
+table `session_message` — opencode 2.3.2 has no `export`). **Unverified:** any
 copilot turn. `copilot login` has never been run on this machine, so
 `session/new` answers "Authentication required" (the error now says to run it).
 Close it with `copilot login` and `omatether repl --agent copilot --dir . "run
