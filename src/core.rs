@@ -851,7 +851,7 @@ impl Core {
             "Take over at a terminal:\n\n  ssh {host} -t tmux attach -t {session}\n\n\
              That session exists only for detached agents ({}). For {} the \
              conversation lives in the agent's own store — resume it with its session id: {}",
-            "omp, crush, grok, gemini",
+            "omp, crush, grok",
             state.agent,
             state.session_id.as_deref().unwrap_or("(none yet)")
         );

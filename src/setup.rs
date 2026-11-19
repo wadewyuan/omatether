@@ -79,7 +79,7 @@ fn check_dependencies() {
     }
 
     if on_path("tmux") {
-        println!("  ✓ tmux (detached agents: omp, crush, grok, gemini)");
+        println!("  ✓ tmux (detached agents: omp, crush, grok)");
     } else {
         println!("  · tmux missing — the detached tier needs it: omarchy-pkg-add tmux");
     }

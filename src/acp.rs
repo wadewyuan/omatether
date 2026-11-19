@@ -1678,6 +1678,6 @@ mod tests {
     fn only_opencode_and_copilot_have_a_profile() {
         assert_eq!(Profile::for_agent("opencode"), Some(Profile::Opencode));
         assert_eq!(Profile::for_agent("copilot"), Some(Profile::Copilot));
-        assert_eq!(Profile::for_agent("gemini"), None);
+        assert_eq!(Profile::for_agent("crush"), None);
     }
 }

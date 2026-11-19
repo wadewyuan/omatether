@@ -112,7 +112,6 @@ pub const AGENTS: &[(&str, Backend)] = &[
     ("opencode", Backend::Acp),
     ("crush", Backend::Tmux),
     ("grok", Backend::Tmux),
-    ("gemini", Backend::Tmux),
     ("copilot", Backend::Acp),
 ];
 
@@ -289,9 +288,12 @@ mod tests {
 
     #[test]
     fn every_omarchy_agent_has_a_backend() {
-        // The list `omarchy default agent` accepts, as of writing.
+        // From `omarchy default agent`'s list, minus gemini: Google refuses
+        // the Gemini CLI to individual accounts now ("no longer supported for
+        // Gemini Code Assist for individuals", gemini 0.68.0 over ACP), and
+        // Omarchy itself maps the name to Antigravity.
         for name in [
-            "pi", "omp", "opencode", "claude", "codex", "crush", "grok", "gemini", "copilot",
+            "pi", "omp", "opencode", "claude", "codex", "crush", "grok", "copilot",
         ] {
             assert!(backend_for(name).is_some(), "{name} has no backend");
         }
@@ -309,7 +311,7 @@ mod tests {
         for name in ["claude", "codex", "pi", "opencode", "copilot"] {
             assert!(takes_model(name), "{name} takes a model");
         }
-        for name in ["omp", "crush", "grok", "gemini"] {
+        for name in ["omp", "crush", "grok"] {
             assert!(!takes_model(name), "{name} has no way to be told one");
         }
         assert!(!takes_model("emacs"));
@@ -336,7 +338,7 @@ mod tests {
         for name in ["claude", "opencode", "copilot"] {
             assert!(gates(name), "{name}");
         }
-        for name in ["codex", "pi", "omp", "gemini", "emacs"] {
+        for name in ["codex", "pi", "omp", "emacs"] {
             assert!(!gates(name), "{name}");
         }
         // codex exec's only approval mode is automatic; pi -p runs its tools

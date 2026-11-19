@@ -1,9 +1,10 @@
 //! The fallback tier: any agent, in a detached tmux session.
 //!
-//! Seven of Omarchy's nine agents have no structured output mode, so there is
-//! nothing to stream and no way to gate a tool. What they do have is a terminal
-//! interface, and `omarchy-agent --inline` execs the agent directly rather than
-//! opening a window — so it runs fine under tmux with no compositor in sight.
+//! Several of the agents Omarchy can launch have no structured output mode,
+//! so there is nothing to stream and no way to gate a tool. What they do have
+//! is a terminal interface, and `omarchy-agent --inline` execs the agent
+//! directly rather than opening a window — so it runs fine under tmux with no
+//! compositor in sight.
 //!
 //! This makes `/agent pi` mean something honest: the agent starts, works, and
 //! you take over at a real terminal when you get back. The reply is the tmux
@@ -148,7 +149,7 @@ impl Agent for TmuxSession {
         }
 
         // `--inline` execs the agent rather than opening a terminal window, so
-        // there is no compositor to find. Whichever of the nine is named, its
+        // there is no compositor to find. Whichever agent is named, its
         // own auto-approve flags are applied by omarchy-agent.
         let status = Command::new("tmux")
             .args([

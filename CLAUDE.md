@@ -287,7 +287,7 @@ the reply cites "the phone chat instructions" (read back from its store,
 `/model` switching on copilot (an account with more than `auto` is needed to
 see one succeed).
 
-## Detached tier (the other four agents)
+## Detached tier (the other three agents)
 
 `omarchy-agent --inline` execs the agent directly instead of opening a terminal
 window, so it runs under tmux with no compositor. That is the whole trick. No
@@ -578,10 +578,10 @@ tailnet, opened and read back by a real Claude turn.
 **A file becomes a path in the prompt, not an upload.** `src/channel/inbox.rs`
 writes the bytes under `$XDG_STATE_HOME/omatether/in/<thread>/` and
 `core::compose` appends one `[attachment: name — /path (mime, size)]` line per
-file after the person's words. That is the only reason this works across nine
+file after the person's words. That is the only reason this works across eight
 agents at once: every one of them is a CLI with filesystem tools, so a path is
 the single representation claude, codex, pi *and* the tmux tier can all act on.
-Base64 up a vision API would have been per-agent work nine times over, and
+Base64 up a vision API would have been per-agent work eight times over, and
 would have skipped the detached tier entirely. Seam B never learned about it —
 `Agent::prompt` still takes a `&str`.
 
@@ -629,7 +629,7 @@ to text the line.
 **The agent asks in text, and the core decides.** A `[send-file: /path — caption]`
 line is lifted out of the prose by the renderer and drained once
 (`take_files`), so a turn re-composed on every flush cannot send twice. It is
-text rather than a tool because that is the one thing all nine agents can do,
+text rather than a tool because that is the one thing all eight agents can do,
 the same reason an inbound file is a path. `/send <path>` goes through the same
 check, `sendfile::resolve`, and the brief only offers the marker when
 `can_send_files` is true.

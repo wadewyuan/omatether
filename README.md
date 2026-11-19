@@ -67,7 +67,7 @@ message rather than being cut.
 | `/new` | Fresh session, starting in `~/Work` |
 | `/stop` | Interrupt the running turn |
 | `/cd <path>` | Change the working directory (starts a fresh session) |
-| `/agent <name>` | Switch agent: claude, codex, pi, omp, opencode, crush, grok, gemini, copilot |
+| `/agent <name>` | Switch agent: claude, codex, pi, opencode, copilot, omp, crush, grok |
 | `/model [name]` | List models, or switch without losing the conversation |
 | `/status` | Agent, model, directory, and whether a turn is running |
 | `/log` | The last turn in full, with every tool call |
@@ -105,7 +105,7 @@ Only Claude, opencode and Copilot can be asked at all:
 | `opencode`, `copilot` | yes | **yes** | yes |
 | `codex` | yes | no | yes |
 | `pi` | yes | no | yes |
-| omp, crush, grok, gemini | no | no | no |
+| omp, crush, grok | no | no | no |
 
 opencode and Copilot are driven over the
 [Agent Client Protocol](https://agentclientprotocol.com) (`opencode acp`,
@@ -117,11 +117,11 @@ question, and a command you told it to always allow stays allowed.
 opencode treats a refusal as the end of the turn. Copilot needs `copilot login`
 run once on the machine first.
 
-> **Codex, Pi and the last four run their tools as they decide, and omatether
+> **Codex, Pi and the last three run their tools as they decide, and omatether
 > cannot stop them.** Switching to one is one `/agent` away for anyone on the
 > allowlist. `/agent` says so when you switch.
 
-The last four run in a tmux session through `omarchy-agent`. Their replies
+The last three run in a tmux session through `omarchy-agent`. Their replies
 appear in that terminal rather than in the chat; `/attach` gives you the
 command to open it.
 

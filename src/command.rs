@@ -135,7 +135,7 @@ Not every agent can be gated at all, even with /auto off:
                can ask you before commands, edits and deletes
   codex        approves its own tools inside a sandbox
   pi           runs and approves its own tools
-  everything else (omp, crush, grok, gemini)
+  everything else (omp, crush, grok)
                runs detached with its own auto-approve flags, unsandboxed,
                and nothing here can stop a tool call";
 
