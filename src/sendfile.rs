@@ -139,6 +139,10 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("omatether-sendfile-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        // resolve() answers with the canonical path, and on macOS the temp
+        // directory is not one: /var is a link to /private/var.
+        let base = base.canonicalize().unwrap();
         let cwd = base.join("work");
         let state = base.join("state");
         std::fs::create_dir_all(&cwd).unwrap();

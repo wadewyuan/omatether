@@ -369,6 +369,12 @@ happens on the core's task. **The Tailscale CLI is inside the app bundle**
 (`/Applications/Tailscale.app/Contents/MacOS/Tailscale`) unless the user
 installed it onto `PATH`; `mcp::tailscale()` falls back to it.
 
+**macOS's temp directory is behind a symlink** (`/var` → `/private/var`), and
+the send-file check answers with canonical paths, so a test that compares
+against `temp_dir().join(…)` passes on Linux and fails on a Mac. Canonicalize
+the scratch directory first. `TMPDIR=<a symlink to a real dir> cargo test`
+reproduces it on Linux.
+
 Type-checking for macOS from Linux needs no Mac: the only obstacle is the C
 in sqlite and ring, and `cargo check` never links, so a stub `clang` that
 writes empty objects is enough (`CC_aarch64_apple_darwin=<stub>

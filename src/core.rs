@@ -2333,6 +2333,9 @@ mod tests {
     async fn a_file_the_agent_asks_for_is_sent_and_its_marker_is_not() {
         let dir = std::env::temp_dir().join(format!("omatether-send-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // What goes out is the canonical path, and on macOS the temp
+        // directory is not one: /var is a link to /private/var.
+        let dir = dir.canonicalize().unwrap();
         let file = dir.join("chart.png");
         std::fs::write(&file, "a png").unwrap();
 
