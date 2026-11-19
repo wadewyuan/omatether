@@ -61,7 +61,7 @@ const COALESCE_MAX: Duration = Duration::from_secs(3);
 /// A gate on every tool is unusable from a phone — the agent reads a dozen
 /// files before it does anything consequential. Gating what writes or executes
 /// keeps the prompts meaningful.
-const GATED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit"];
+const GATED_TOOLS: &[&str] = &["Bash", "Write", "Edit", "NotebookEdit", "Delete", "Move"];
 
 /// The most one message holds when text is delivered whole — a turn on a
 /// channel that cannot edit, or `/log` — before the rest goes in the next.
@@ -569,7 +569,7 @@ impl Core {
             None => {
                 let note = format!(
                     "Tool calls: {}.\n\n/auto on approves them without asking; \
-                     /auto off asks first, for Bash, Write and Edit.",
+                     /auto off asks first, for commands, edits and deletes.",
                     approvals(&state.agent, state.auto)
                 );
                 return self.say(key, &note);
@@ -595,12 +595,12 @@ impl Core {
         } else {
             format!(
                 "Auto mode off. {}",
-                match agent::backend_for(&state.agent) {
-                    Some(agent::Backend::Claude) =>
-                        "Bash, Write and Edit will wait for Allow or Deny.",
-                    _ =>
-                        "This agent approves its own tools, though — the gate \
-                          only applies to claude. /agent claude to get it back.",
+                if agent::gates(&state.agent) {
+                    "Commands, edits and deletes will wait for Allow or Deny."
+                } else {
+                    "This agent approves its own tools, though — the gate \
+                     only applies to claude, opencode and copilot. /agent \
+                     claude to get it back."
                 }
             )
         };
@@ -678,6 +678,10 @@ impl Core {
             Some(agent::Backend::Pi) => {
                 note.push_str("\n\nPi runs and approves its own tools — no Allow/Deny here.")
             }
+            // Gated like claude, so nothing to warn about — but a first run
+            // that needs a login fails at the first message, and copilot's
+            // gate has not yet been watched working.
+            Some(agent::Backend::Acp) => {}
             // The gate is this product's one safety feature, and this tier does
             // not have it. Someone who just approved a Bash call on claude is
             // one command away from an agent that approves its own — that
@@ -723,7 +727,7 @@ impl Core {
             let note = format!(
                 "{} runs through omarchy-agent, which takes no model. Set it in \
                  {}'s own config, or /attach and change it there. /agent claude, \
-                 codex or pi for one that can be told from here.",
+                 codex, pi, opencode or copilot for one that can be told from here.",
                 state.agent, state.agent
             );
             return self.say(key, &note);
@@ -847,7 +851,7 @@ impl Core {
             "Take over at a terminal:\n\n  ssh {host} -t tmux attach -t {session}\n\n\
              That session exists only for detached agents ({}). For {} the \
              conversation lives in the agent's own store — resume it with its session id: {}",
-            "omp, opencode, crush, grok, gemini, copilot",
+            "omp, crush, grok, gemini",
             state.agent,
             state.session_id.as_deref().unwrap_or("(none yet)")
         );
@@ -1872,8 +1876,12 @@ fn brief_for_agent(can_send_files: bool) -> String {
 /// would otherwise read as a promise nothing is keeping.
 fn approvals(agent: &str, auto: bool) -> &'static str {
     match agent::backend_for(agent) {
-        Some(agent::Backend::Claude) if auto => "run without asking (/auto off to be asked)",
-        Some(agent::Backend::Claude) => "Bash, Write and Edit ask first",
+        Some(agent::Backend::Claude | agent::Backend::Acp) if auto => {
+            "run without asking (/auto off to be asked)"
+        }
+        Some(agent::Backend::Claude | agent::Backend::Acp) => {
+            "commands, edits and deletes ask first"
+        }
         _ => "run without asking — this agent cannot be gated",
     }
 }
@@ -3513,7 +3521,7 @@ mod tests {
         let key = fake_key();
         let mut core = core_with(channel.clone(), &dir);
 
-        core.on_agent(&key, "opencode").await.unwrap();
+        core.on_agent(&key, "crush").await.unwrap();
         core.on_model(&key, ModelRequest::Set("gpt-5".into()))
             .await
             .unwrap();

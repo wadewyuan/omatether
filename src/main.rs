@@ -4,6 +4,7 @@
 //! agent driver with a terminal on the front, useful for watching the wire
 //! protocol when a Claude Code release changes it.
 
+mod acp;
 mod agent;
 mod channel;
 mod claude;

@@ -92,6 +92,9 @@ pub enum Backend {
     Codex,
     /// `pi -p --mode json`: one process per turn, continuity via `--session`.
     Pi,
+    /// The Agent Client Protocol over one long-lived process: streaming,
+    /// gated, and a model that can be changed mid-conversation.
+    Acp,
     /// A detached tmux session. No streaming and no gating, but it works for
     /// every agent Omarchy supports.
     Tmux,
@@ -106,11 +109,11 @@ pub const AGENTS: &[(&str, Backend)] = &[
     ("codex", Backend::Codex),
     ("pi", Backend::Pi),
     ("omp", Backend::Tmux),
-    ("opencode", Backend::Tmux),
+    ("opencode", Backend::Acp),
     ("crush", Backend::Tmux),
     ("grok", Backend::Tmux),
     ("gemini", Backend::Tmux),
-    ("copilot", Backend::Tmux),
+    ("copilot", Backend::Acp),
 ];
 
 pub fn backend_for(name: &str) -> Option<Backend> {
@@ -163,7 +166,17 @@ pub struct SpawnConfig {
 pub fn takes_model(agent: &str) -> bool {
     matches!(
         backend_for(agent),
-        Some(Backend::Claude) | Some(Backend::Codex) | Some(Backend::Pi)
+        Some(Backend::Claude) | Some(Backend::Codex) | Some(Backend::Pi) | Some(Backend::Acp)
+    )
+}
+
+/// Whether this agent's tool calls can be put to a person — the static answer
+/// to [`Agent::gates_tools`], for the places that have to say so before any
+/// session exists (`/auto`, `/status`).
+pub fn gates(agent: &str) -> bool {
+    matches!(
+        backend_for(agent),
+        Some(Backend::Claude) | Some(Backend::Acp)
     )
 }
 
@@ -184,6 +197,10 @@ pub async fn list_models(agent: &str, cwd: &Path) -> Result<Vec<String>> {
             "claude's model list comes with a live session — send it a message \
              first, and /model will show it"
         ),
+        Some(Backend::Acp) => match crate::acp::Profile::for_agent(agent) {
+            Some(profile) => crate::acp::list_models(profile, cwd).await,
+            None => bail!("{agent} has no ACP profile"),
+        },
         Some(Backend::Tmux) => bail!("{agent} runs through omarchy-agent, which takes no model"),
         None => bail!("unknown agent '{agent}'"),
     }
@@ -241,6 +258,20 @@ pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receive
             Ok((Box::new(session), events))
         }
 
+        Backend::Acp => {
+            let profile = crate::acp::Profile::for_agent(&config.agent)
+                .ok_or_else(|| anyhow::anyhow!("{} has no ACP profile", config.agent))?;
+            let (session, events) = crate::acp::AcpSession::spawn(crate::acp::Config {
+                profile,
+                cwd: config.cwd,
+                session_id: config.session_id,
+                model: config.model,
+                brief: config.brief,
+            })
+            .await?;
+            Ok((Box::new(session), events))
+        }
+
         Backend::Tmux => {
             let (session, events) = crate::tmux::TmuxSession::new(crate::tmux::Config {
                 agent: canonical_name(&config.agent).unwrap_or("claude"),
@@ -273,12 +304,12 @@ mod tests {
 
     #[test]
     fn only_the_agents_omatether_spawns_itself_can_be_told_a_model() {
-        // The three with a command line of our own making. The detached tier
+        // The ones with a command line of our own making. The detached tier
         // runs through omarchy-agent, which has nowhere to put one.
-        for name in ["claude", "codex", "pi"] {
+        for name in ["claude", "codex", "pi", "opencode", "copilot"] {
             assert!(takes_model(name), "{name} takes a model");
         }
-        for name in ["omp", "opencode", "crush", "grok", "gemini", "copilot"] {
+        for name in ["omp", "crush", "grok", "gemini"] {
             assert!(!takes_model(name), "{name} has no way to be told one");
         }
         assert!(!takes_model("emacs"));
@@ -298,8 +329,16 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_gates_tools_today() {
+    fn claude_and_the_acp_agents_gate_tools() {
         assert_eq!(backend_for("claude"), Some(Backend::Claude));
+        assert_eq!(backend_for("opencode"), Some(Backend::Acp));
+        assert_eq!(backend_for("copilot"), Some(Backend::Acp));
+        for name in ["claude", "opencode", "copilot"] {
+            assert!(gates(name), "{name}");
+        }
+        for name in ["codex", "pi", "omp", "gemini", "emacs"] {
+            assert!(!gates(name), "{name}");
+        }
         // codex exec's only approval mode is automatic; pi -p runs its tools
         // as it decides on them. Neither has a callback to route to a human.
         assert_eq!(backend_for("codex"), Some(Backend::Codex));

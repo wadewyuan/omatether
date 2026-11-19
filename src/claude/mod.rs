@@ -52,7 +52,7 @@ const EVENT_BUFFER: usize = 256;
 ///
 /// Deliberately a fixed list, not a `CLAUDE*` prefix sweep: variables like
 /// `CLAUDE_CODE_USE_BEDROCK` are legitimate operator configuration.
-const INHERITED_SESSION_VARS: &[&str] = &[
+pub(crate) const INHERITED_SESSION_VARS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_EXECPATH",

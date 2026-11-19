@@ -110,7 +110,7 @@ omatether — your coding agent, over chat
 /status        agent, model, directory, session, whether a turn is running
 /log           the last turn in full, every tool call included
 /allow         approve a pending tool call
-/deny <why>    refuse it, and tell the agent why
+/deny <why>    refuse it, and tell the agent why (claude hears the why)
 /auto [on|off] approve tool calls without asking (on by default)
 
 Anything else is sent to the agent as typed, including its own \
@@ -128,13 +128,14 @@ the machine.
 
 Threads start in auto mode: tool calls run without asking, and you \
 see each one in the reply as it happens. /auto off puts the gate \
-back for this thread — Allow/Deny before every Bash, Write and Edit.
+back for this thread — Allow/Deny before every command, edit and delete.
 
 Not every agent can be gated at all, even with /auto off:
-  claude       can ask you before Bash, Write and Edit
+  claude, opencode, copilot
+               can ask you before commands, edits and deletes
   codex        approves its own tools inside a sandbox
   pi           runs and approves its own tools
-  everything else (omp, opencode, crush, grok, gemini, copilot)
+  everything else (omp, crush, grok, gemini)
                runs detached with its own auto-approve flags, unsandboxed,
                and nothing here can stop a tool call";
 

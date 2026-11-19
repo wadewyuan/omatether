@@ -93,24 +93,34 @@ stay put even when the agent is working in your home directory.
 
 **Tool calls run without asking by default.** Asking about every command from
 a phone quickly turns into tapping Allow without reading, which only looks
-like review. Use `/auto off` in a thread to be asked before Claude runs
-`Bash`, `Write`, `Edit` or `NotebookEdit`. On Telegram you get Allow / Deny
+like review. Use `/auto off` in a thread to be asked before the agent runs a
+command, edits a file or deletes one. On Telegram you get Allow / Deny
 buttons; on iMessage you reply `/allow` or `/deny`.
 
-Only Claude can be asked at all:
+Only Claude, opencode and Copilot can be asked at all:
 
 | Agent | Streams replies | Can ask before a tool call | Model choice |
 |---|---|---|---|
 | `claude` | yes | **yes** | yes |
+| `opencode`, `copilot` | yes | **yes** | yes |
 | `codex` | yes | no | yes |
 | `pi` | yes | no | yes |
-| omp, opencode, crush, grok, gemini, copilot | no | no | no |
+| omp, crush, grok, gemini | no | no | no |
 
-> **Codex, Pi and the last six run their tools as they decide, and omatether
+opencode and Copilot are driven over the
+[Agent Client Protocol](https://agentclientprotocol.com) (`opencode acp`,
+`copilot --acp`). omatether turns opencode's asking on for every tool; a rule
+in opencode's own config that allows a tool still wins. Copilot asks the way it
+does in a terminal, so a command you told it to always allow stays allowed.
+`/deny <why>` refuses the call, but ACP has no way to pass the *why* along, and
+opencode treats a refusal as the end of the turn. Copilot needs `copilot login`
+run once on the machine first.
+
+> **Codex, Pi and the last four run their tools as they decide, and omatether
 > cannot stop them.** Switching to one is one `/agent` away for anyone on the
 > allowlist. `/agent` says so when you switch.
 
-The last six run in a tmux session through `omarchy-agent`. Their replies
+The last four run in a tmux session through `omarchy-agent`. Their replies
 appear in that terminal rather than in the chat; `/attach` gives you the
 command to open it.
 

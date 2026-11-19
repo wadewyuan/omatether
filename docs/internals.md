@@ -22,7 +22,9 @@ agent is a subprocess, since that is how each one is shipped.
 
 Seam B is shaped after **ACP** (Agent Client Protocol), whose four verbs —
 prompt, streamed update, permission request, cancel — are exactly what a chat
-bridge needs.
+bridge needs. opencode and copilot speak ACP itself, through `src/acp.rs`;
+claude, codex and pi keep hand-written adapters for their own JSON, which
+reach further into those CLIs than ACP wrappers would.
 
 The core never asks which channel or agent it is talking to. It branches on
 capabilities instead — `Channel::can_edit`, `Agent::streams`,
@@ -47,6 +49,7 @@ else's.
 | `src/claude/wire.rs` | Claude's `stream-json` frames → normalized events. |
 | `src/codex.rs` | `codex exec --json`, `resume` for continuity. |
 | `src/pi.rs` | `pi -p --mode json`, `--session` for continuity. |
+| `src/acp.rs` | Agent Client Protocol: opencode and copilot, one process each. |
 | `src/tmux.rs` | The detached tier, for agents with no structured output. |
 | `src/channel/mod.rs` | Seam A: the trait every channel implements. |
 | `src/channel/telegram.rs` | Bot API client and the long-poll loop. |

@@ -197,7 +197,83 @@ twice. Vocabulary is confirmed against both a live run and pi's own
 `docs/json.md` (pi 0.84.4) — note there is **no** `turn_aborted` frame, despite
 it being an obvious guess.
 
-## Detached tier (the other six agents)
+## ACP adapter (opencode, copilot)
+
+`src/acp.rs` is one generic Agent Client Protocol client — JSON-RPC 2.0, one
+object per line, over the stdio of one long-lived `opencode acp` or `copilot
+--acp`. Everything ACP leaves to the agent (how to launch it, how to make it
+ask, where the brief goes) is in `Profile`, and nothing else in that file
+knows which agent it is talking to. A third ACP agent is a `Profile` arm and
+a row in `AGENTS`.
+
+**ACP carries the question; whether one is ever sent is the agent's own
+config.** opencode's default config allows everything, so out of the box no
+`session/request_permission` arrives and an "ungated" agent looks exactly like
+one with nothing to ask — the same trap as Claude's failed hook registration.
+The gate is `OPENCODE_CONFIG_CONTENT` with `permission: {"*": "ask"}`, merged
+into whatever the operator already set there. A more specific rule in
+opencode's own config files still wins, deliberately. Copilot asks by default;
+`COPILOT_ALLOW_ALL` is scrubbed so an inherited one cannot turn that off.
+Unlike Claude's hook, **there is no handshake that confirms the gate** — ACP
+has no "you will ask me" in `initialize`. So the gate is confirmed by a live
+turn, not per spawn. Re-check it whenever opencode moves: send `ls` via the
+repl and watch for `[permission]`.
+
+**Reject ends opencode's turn.** Answering a permission request with the
+`reject_once` option makes opencode stop and reply to `session/prompt` with
+`stopReason: "cancelled"`, not carry on without the tool. The adapter remembers
+a denial happened during the turn and says "stopped at the tool call that was
+denied" rather than a bare "cancelled", which reads as a fault. ACP also has no
+field for a reason, so `/deny <why>` loses the why.
+
+**The turn ends at the `session/prompt` *reply*, not at any notification.**
+Updates stream as `session/update`; the reply carries `stopReason`. A cancel
+is a `session/cancel` notification, answered by that reply as
+`"cancelled"` (~50ms in practice) — by which time the core has moved on. The
+pending prompt is therefore marked *silenced* on cancel, or its late reply
+would end whatever turn started next.
+
+**A tool call arrives in pieces.** `tool_call` at `pending` carries only
+`cwd`; the command arrives in the first `tool_call_update`. Updates are merged
+per `toolCallId` (including `rawInput`, key by key) and the call is announced
+once, at the first status past `pending`. `kind` maps onto Claude's names
+(`execute`→`Bash`, `edit`→`Edit`, `delete`→`Delete`, …) so the renderer and
+`GATED_TOOLS` need no ACP knowledge; `Delete` and `Move` were added to the
+gate list for this.
+
+**Resume is `session/resume`, preferred over `session/load`.** Both are
+advertised by opencode; `load` *replays the whole transcript* as
+`session/update`s before it answers, and those are swallowed (`replaying`)
+when it is the only option. A resume that fails starts a new session and says
+so in the chat, rather than leaving the thread unable to start.
+
+**Model is a config option, not a flag.** Current ACP reports it as a
+`configOptions` entry of category `model` in the session reply; changing it is
+`session/set_config_option`, which refuses an unknown id with a reason
+(`model not found: opencode/nope`). The older `models` /
+`session/set_model` shape is also read. `/model default` sets back the value
+the session reported before anyone asked — ACP has no unset. opencode remembers
+the model per session, so a resumed one starts on what it last ran.
+
+**The brief is a file.** ACP has no system-prompt field. It is written to
+`$XDG_STATE_HOME/omatether/brief/<sha256 prefix>/AGENTS.md` (0700/0600), and
+handed to opencode as an `instructions` entry and to copilot through
+`COPILOT_CUSTOM_INSTRUCTIONS_DIRS`. copilot only discovers it as `AGENTS.md`
+(`copilot instruction list` finds that name in a custom dir and not
+`copilot-instructions.md`), which is why that is the name for both.
+
+Verified against opencode 2.3.2 through `omatether repl`: a turn, a tool call
+allowed and denied, `/model` list/switch/refuse/default, resume across two
+processes, `/cancel` then a fresh turn. The brief was proven obeyed by a raw
+protocol probe handing opencode an `instructions` file the same way — not
+through `serve`, since the repl sends no brief. **Unverified:** any
+copilot turn. `copilot login` has never been run on this machine, so
+`session/new` answers "Authentication required" (the error now says to run it).
+Close it with `copilot login` and `omatether repl --agent copilot --dir . "run
+ls"`: check that a `[permission]` arrives, that the brief is obeyed, and which
+model shape its session reply uses.
+
+## Detached tier (the other four agents)
 
 `omarchy-agent --inline` execs the agent directly instead of opening a terminal
 window, so it runs under tmux with no compositor. That is the whole trick. No
