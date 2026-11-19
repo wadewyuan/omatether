@@ -111,7 +111,8 @@ opencode and Copilot are driven over the
 [Agent Client Protocol](https://agentclientprotocol.com) (`opencode acp`,
 `copilot --acp`). omatether turns opencode's asking on for every tool; a rule
 in opencode's own config that allows a tool still wins. Copilot asks the way it
-does in a terminal, so a command you told it to always allow stays allowed.
+does in a terminal: commands it judges read-only, like `ls`, run without a
+question, and a command you told it to always allow stays allowed.
 `/deny <why>` refuses the call, but ACP has no way to pass the *why* along, and
 opencode treats a refusal as the end of the turn. Copilot needs `copilot login`
 run once on the machine first.

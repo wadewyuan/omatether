@@ -25,8 +25,9 @@
 //! conversation with nothing replayed, `set_config_option` refusing an unknown
 //! model with a reason, `session/cancel` answered with `stopReason:
 //! "cancelled"` in ~50ms, and the brief obeyed from an `instructions` file.
-//! Copilot 1.0.114 is verified only as far as the handshake: `session/new`
-//! answers "Authentication required" until `copilot login` has been run.
+//! Copilot 1.0.114 likewise, except `/cancel`; its differences (no
+//! `in_progress`, `load` rather than `resume`, an `allow_all` option, a brief
+//! that has to be laid out as a `.instructions.md`) are noted where handled.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -71,9 +72,10 @@ pub enum Profile {
     Opencode,
     /// `copilot --acp`. Asks before shell commands and edits by default
     /// (`copilot help permissions`); `COPILOT_ALLOW_ALL` is scrubbed so an
-    /// inherited one cannot quietly turn that off. The brief goes in as an
-    /// `AGENTS.md` in a directory named by `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`,
-    /// which `copilot instruction list` reports as loaded.
+    /// inherited one cannot quietly turn that off, and a session reporting
+    /// `allow_all: on` is switched off before use. The brief goes in as a
+    /// `.github/instructions/*.instructions.md` under a directory named by
+    /// `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`.
     Copilot,
 }
 
@@ -101,18 +103,18 @@ impl Profile {
     }
 
     /// Put the gate and the brief where this agent reads them.
-    fn configure(self, command: &mut Command, brief: Option<&Path>) {
+    fn configure(self, command: &mut Command, brief: Option<&Brief>) {
         match self {
             Profile::Opencode => {
                 let existing = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
                 command.env(
                     "OPENCODE_CONFIG_CONTENT",
-                    opencode_config(existing.as_deref(), brief),
+                    opencode_config(existing.as_deref(), brief.map(|b| b.file.as_path())),
                 );
             }
             Profile::Copilot => {
                 command.env_remove("COPILOT_ALLOW_ALL");
-                if let Some(dir) = brief.and_then(Path::parent) {
+                if let Some(dir) = brief.map(|b| &b.root) {
                     let mut dirs = dir.to_string_lossy().to_string();
                     if let Ok(existing) = std::env::var("COPILOT_CUSTOM_INSTRUCTIONS_DIRS") {
                         if !existing.is_empty() {
@@ -125,12 +127,30 @@ impl Profile {
         }
     }
 
-    /// The file name the brief is written under. Copilot only picks up
-    /// instruction files by name, and `AGENTS.md` is the one its custom
-    /// directories are searched for; opencode takes any path.
-    fn brief_file(self) -> &'static str {
-        "AGENTS.md"
+    /// Where under its directory the brief is written, and what goes in it.
+    ///
+    /// opencode takes any path. Copilot does not: an `AGENTS.md` in a custom
+    /// directory is *listed* by `copilot instruction list` — as a "nested"
+    /// one — and then not applied, which cost a wrong claim in the docs to
+    /// find. `.github/instructions/*.instructions.md` there is listed as a
+    /// repository instruction and obeyed (copilot 1.0.114, three runs of
+    /// three). `applyTo: "**"` is what that format uses for "everywhere";
+    /// copilot obeyed it without, but it costs nothing to say.
+    fn brief_layout(self, brief: &str) -> (&'static str, String) {
+        match self {
+            Profile::Opencode => ("brief.md", brief.to_string()),
+            Profile::Copilot => (
+                ".github/instructions/omatether.instructions.md",
+                format!("---\napplyTo: \"**\"\n---\n{brief}"),
+            ),
+        }
     }
+}
+
+/// A brief on disk: the file, and the directory it was laid out under.
+struct Brief {
+    root: PathBuf,
+    file: PathBuf,
 }
 
 /// `OPENCODE_CONFIG_CONTENT` with the gate on and the brief attached, on top
@@ -317,7 +337,7 @@ impl AcpSession {
         for var in crate::claude::INHERITED_SESSION_VARS {
             command.env_remove(var);
         }
-        profile.configure(&mut command, brief_path.as_deref());
+        profile.configure(&mut command, brief_path.as_ref());
 
         let mut child = command
             .spawn()
@@ -381,6 +401,23 @@ impl AcpSession {
             open_session(&shared, &init, &cwd, config.session_id.as_deref())
                 .await
                 .map_err(|e| anyhow!("{agent}: {e:#}{}", login_hint(&init, &e)))?;
+
+        // The one gate fact ACP lets us read. Turned off if it is on, and a
+        // session that will not turn it off does not start: a gate that is
+        // claimed and not there is worse than an agent that admits it has none.
+        if allow_all_on(&session) {
+            shared
+                .request(
+                    "session/set_config_option",
+                    json!({"sessionId": session_id, "configId": "allow_all", "value": "off"}),
+                    STARTUP_TIMEOUT,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow!("{agent} has allow-all on and would not turn it off: {e:#}")
+                })?;
+            tracing::info!(target: "omatether::acp", agent, "turned allow_all off");
+        }
 
         let (models, current, model_switch) = model_catalog(&session);
         let mut this = Self {
@@ -560,16 +597,18 @@ fn model_catalog(reply: &Value) -> (Vec<String>, Option<String>, ModelSwitch) {
                 .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
         })
     {
-        let models = option
-            .get("options")
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(|o| o.get("value").and_then(Value::as_str))
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let models = dedupe(
+            option
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|o| o.get("value").and_then(Value::as_str))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         let current = option
             .get("currentValue")
             .and_then(Value::as_str)
@@ -583,16 +622,18 @@ fn model_catalog(reply: &Value) -> (Vec<String>, Option<String>, ModelSwitch) {
     }
 
     if let Some(state) = reply.get("models") {
-        let models = state
-            .get("availableModels")
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter_map(|m| m.get("modelId").and_then(Value::as_str))
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let models = dedupe(
+            state
+                .get("availableModels")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|m| m.get("modelId").and_then(Value::as_str))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         let current = state
             .get("currentModelId")
             .and_then(Value::as_str)
@@ -603,10 +644,34 @@ fn model_catalog(reply: &Value) -> (Vec<String>, Option<String>, ModelSwitch) {
     (Vec::new(), None, ModelSwitch::None)
 }
 
+/// Copilot lists `auto` twice (copilot 1.0.114, an account offered only that).
+fn dedupe(list: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    list.into_iter()
+        .filter(|m| seen.insert(m.clone()))
+        .collect()
+}
+
+/// A session setting that would answer every question before it is asked:
+/// copilot reports `allow_all` among its `configOptions`, and "on" there is
+/// the gate gone with nothing in the protocol to say so. The id and the "on"
+/// value are both read off a live copilot 1.0.114 session reply.
+fn allow_all_on(reply: &Value) -> bool {
+    reply
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|o| {
+                o.get("id").and_then(Value::as_str) == Some("allow_all")
+                    && o.get("currentValue").and_then(Value::as_str) == Some("on")
+            })
+        })
+}
+
 /// Write the brief where the agent will read it: a 0600 file in a 0700
 /// directory under the state dir, named by its content so threads that share
 /// a brief share a file and nothing is rewritten under a running agent.
-fn write_brief(profile: Profile, brief: &str) -> Result<PathBuf> {
+fn write_brief(profile: Profile, brief: &str) -> Result<Brief> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     let digest = ring::digest::digest(&ring::digest::SHA256, brief.as_bytes());
@@ -614,21 +679,30 @@ fn write_brief(profile: Profile, brief: &str) -> Result<PathBuf> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let dir = crate::dirs_state_home().join("omatether/brief").join(hex);
+    let root = crate::dirs_state_home()
+        .join("omatether/brief")
+        .join(hex)
+        .join(profile.name());
+    let (relative, text) = profile.brief_layout(brief);
+    let path = root.join(relative);
+    let dir = path.parent().expect("a layout names a file");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        .create(dir)?;
+    // Chmod what is already there, not just what is created — see Storage
+    // in CLAUDE.md.
+    for step in dir.ancestors().take_while(|d| d.starts_with(&root)) {
+        std::fs::set_permissions(step, std::fs::Permissions::from_mode(0o700))?;
+    }
 
-    let path = dir.join(profile.brief_file());
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(brief) {
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
         let tmp = dir.join(".brief.tmp");
-        std::fs::write(&tmp, brief)?;
+        std::fs::write(&tmp, &text)?;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         std::fs::rename(&tmp, &path)?;
     }
-    Ok(path)
+    Ok(Brief { root, file: path })
 }
 
 async fn read_stderr(stderr: tokio::process::ChildStderr, shared: Arc<Shared>) {
@@ -868,11 +942,18 @@ fn normalize_update(shared: &Shared, update: Value) -> Vec<AgentEvent> {
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("pending");
-            // Announced once, when it starts to run (or ends without having
-            // been seen running). `pending` is too early: opencode's first
-            // frame for a shell call carries only the directory, and the
-            // command arrives in the next.
-            if status == "pending" {
+            // Announced once, as soon as there is something to say about it.
+            // A bare `pending` is too early — opencode's first frame for a
+            // shell call carries only the directory, and the command arrives
+            // in the next. But waiting for `in_progress` is too late on
+            // copilot, which never sends one: its calls go `pending` (with
+            // the command) straight to `completed`, and a long command would
+            // show nothing until it had finished.
+            let says_something = merged
+                .get("rawInput")
+                .and_then(Value::as_object)
+                .is_some_and(|input| input.keys().any(|k| k != "cwd" && k != "workdir"));
+            if status == "pending" && !says_something {
                 return Vec::new();
             }
             let id = merged
@@ -1301,6 +1382,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_call_that_names_its_command_is_announced_at_once() {
+        // Live copilot 1.0.114: no `in_progress` ever; `pending` then
+        // `completed`, and the pending frame already has the command.
+        let (s, _rx) = shared();
+        let events = handle_frame(
+            &s,
+            update(json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Create or update b.txt",
+            "kind": "execute", "status": "pending",
+            "rawInput": {"command": "touch b.txt", "description": "Create or update b.txt"}})),
+        );
+        assert!(
+            matches!(&events[..], [AgentEvent::ToolCall { name, input, .. }]
+            if name == "Bash" && input["command"] == "touch b.txt")
+        );
+        let events = handle_frame(
+            &s,
+            update(json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"})),
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn a_permission_request_is_a_question_and_the_answer_names_an_option() {
         let (s, mut rx) = shared();
         let events = handle_frame(
@@ -1455,6 +1560,32 @@ mod tests {
         assert_eq!(switch, ModelSwitch::SetModel);
 
         assert_eq!(model_catalog(&json!({})).2, ModelSwitch::None);
+
+        // Copilot's duplicated `auto`.
+        let copilot = json!({"configOptions": [{"id": "model", "category": "model",
+            "currentValue": "auto", "options": [{"value": "auto"}, {"value": "auto"}]}]});
+        assert_eq!(model_catalog(&copilot).0, ["auto"]);
+    }
+
+    #[test]
+    fn copilot_gets_its_brief_where_it_applies_one() {
+        let (path, text) = Profile::Copilot.brief_layout("Be brief.");
+        assert_eq!(path, ".github/instructions/omatether.instructions.md");
+        assert!(text.starts_with("---\napplyTo: \"**\"\n---\n"));
+        assert!(text.ends_with("Be brief."));
+        assert_eq!(Profile::Opencode.brief_layout("Be brief.").1, "Be brief.");
+    }
+
+    #[test]
+    fn copilot_allow_all_is_noticed() {
+        let reply = |value: &str| {
+            json!({"configOptions": [
+            {"id": "allow_all", "category": "other", "currentValue": value,
+             "options": [{"value": "on"}, {"value": "off"}]}]})
+        };
+        assert!(allow_all_on(&reply("on")));
+        assert!(!allow_all_on(&reply("off")));
+        assert!(!allow_all_on(&json!({})));
     }
 
     #[test]
@@ -1506,6 +1637,41 @@ mod tests {
             parse_model_lines(out),
             ["opencode/beam-free", "opencode/big-pickle"]
         );
+    }
+
+    /// The brief, through this adapter's own spawn, against the real CLI.
+    /// Spends a turn on each agent, so opt in:
+    /// `cargo test -- --ignored live_brief`.
+    #[tokio::test]
+    #[ignore = "runs opencode and copilot; spends a model turn on each"]
+    async fn live_brief_is_obeyed() {
+        for profile in [Profile::Opencode, Profile::Copilot] {
+            let (mut session, mut events) = AcpSession::spawn(Config {
+                profile,
+                cwd: std::env::temp_dir(),
+                session_id: None,
+                model: None,
+                brief: Some(
+                    "Always end every reply with the single word PINEAPPLE on its own line.".into(),
+                ),
+            })
+            .await
+            .unwrap();
+            session.prompt("Say hello in five words.").await.unwrap();
+            let mut reply = String::new();
+            while let Some(event) = events.recv().await {
+                match event {
+                    AgentEvent::TextDelta { text } => reply.push_str(&text),
+                    AgentEvent::TurnEnd { ok, detail } => {
+                        assert!(ok, "{}: {detail:?}", profile.name());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            session.shutdown().await.unwrap();
+            assert!(reply.contains("PINEAPPLE"), "{}: {reply}", profile.name());
+        }
     }
 
     #[test]

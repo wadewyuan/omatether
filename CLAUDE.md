@@ -212,16 +212,20 @@ config.** opencode's default config allows everything, so out of the box no
 one with nothing to ask — the same trap as Claude's failed hook registration.
 The gate is `OPENCODE_CONFIG_CONTENT` with `permission: {"*": "ask"}`, merged
 into whatever the operator already set there. A more specific rule in
-opencode's own config files still wins, deliberately. Copilot asks by default;
-`COPILOT_ALLOW_ALL` is scrubbed so an inherited one cannot turn that off.
-Unlike Claude's hook, **there is no handshake that confirms the gate** — ACP
-has no "you will ask me" in `initialize`. So the gate is confirmed by a live
-turn, not per spawn. Re-check it whenever opencode moves: send `ls` via the
-repl and watch for `[permission]`.
+opencode's own config files still wins, deliberately. Copilot asks by default,
+except for commands it judges read-only — **`ls` runs without a question on
+copilot**, so test its gate with something that writes (`touch b.txt`).
+`COPILOT_ALLOW_ALL` is scrubbed so an inherited one cannot turn that off, and
+copilot's session reply carries an `allow_all` config option: one reported
+`on` is set `off` before the session is used, and a session that refuses does
+not start. Beyond that, **there is no handshake that confirms the gate** — ACP
+has no "you will ask me" in `initialize` — so it is confirmed by a live turn,
+not per spawn. Re-check it whenever either CLI moves.
 
-**Reject ends opencode's turn.** Answering a permission request with the
-`reject_once` option makes opencode stop and reply to `session/prompt` with
-`stopReason: "cancelled"`, not carry on without the tool. The adapter remembers
+**Reject ends opencode's turn; copilot's carries on.** Answering a permission
+request with the `reject_once` option makes opencode stop and reply to
+`session/prompt` with `stopReason: "cancelled"`, not carry on without the
+tool. Copilot reports the call refused and finishes the turn normally. The adapter remembers
 a denial happened during the turn and says "stopped at the tool call that was
 denied" rather than a bare "cancelled", which reads as a fault. ACP also has no
 field for a reason, so `/deny <why>` loses the why.
@@ -236,43 +240,52 @@ would end whatever turn started next.
 **A tool call arrives in pieces.** `tool_call` at `pending` carries only
 `cwd`; the command arrives in the first `tool_call_update`. Updates are merged
 per `toolCallId` (including `rawInput`, key by key) and the call is announced
-once, at the first status past `pending`. `kind` maps onto Claude's names
+once, as soon as its input says more than a working directory — at
+`pending` on copilot, which never sends `in_progress` at all (its calls go
+`pending` → `completed`, so waiting for a running status would show a long
+command only after it had finished). `kind` maps onto Claude's names
 (`execute`→`Bash`, `edit`→`Edit`, `delete`→`Delete`, …) so the renderer and
 `GATED_TOOLS` need no ACP knowledge; `Delete` and `Move` were added to the
 gate list for this.
 
-**Resume is `session/resume`, preferred over `session/load`.** Both are
-advertised by opencode; `load` *replays the whole transcript* as
-`session/update`s before it answers, and those are swallowed (`replaying`)
-when it is the only option. A resume that fails starts a new session and says
+**Resume is `session/resume`, preferred over `session/load`.** opencode
+advertises both; copilot only `load`, which *replays the whole transcript* as
+`session/update`s before it answers. Those are swallowed (`replaying`) —
+verified on copilot: a resumed session answered from the earlier turn and
+none of that turn reached the output. A resume that fails starts a new session and says
 so in the chat, rather than leaving the thread unable to start.
 
 **Model is a config option, not a flag.** Current ACP reports it as a
 `configOptions` entry of category `model` in the session reply; changing it is
 `session/set_config_option`, which refuses an unknown id with a reason
-(`model not found: opencode/nope`). The older `models` /
-`session/set_model` shape is also read. `/model default` sets back the value
+(`model not found: opencode/nope`; copilot: `not one of this session's
+models`). The older `models` / `session/set_model` shape is also read; copilot
+sends both shapes, and lists `auto` twice, hence the dedupe. The copilot
+account on this machine is offered only `auto`. `/model default` sets back the value
 the session reported before anyone asked — ACP has no unset. opencode remembers
 the model per session, so a resumed one starts on what it last ran.
 
-**The brief is a file.** ACP has no system-prompt field. It is written to
-`$XDG_STATE_HOME/omatether/brief/<sha256 prefix>/AGENTS.md` (0700/0600), and
+**The brief is a file.** ACP has no system-prompt field. It is written under
+`$XDG_STATE_HOME/omatether/brief/<sha256 prefix>/<agent>/` (0700/0600), and
 handed to opencode as an `instructions` entry and to copilot through
-`COPILOT_CUSTOM_INSTRUCTIONS_DIRS`. copilot only discovers it as `AGENTS.md`
-(`copilot instruction list` finds that name in a custom dir and not
-`copilot-instructions.md`), which is why that is the name for both.
+`COPILOT_CUSTOM_INSTRUCTIONS_DIRS`. **For copilot the layout is the whole
+trick, and listing is not loading.** An `AGENTS.md` in a custom dir shows up in
+`copilot instruction list` — as a "nested" instruction — and is then not
+applied; this file once said it worked on the strength of that listing. What
+copilot obeys is `.github/instructions/*.instructions.md` there, listed as a
+repository instruction. `cargo test -- --ignored live_brief` spawns both agents
+through this adapter with a brief that demands a marker word and checks the
+reply carries it; run it when either CLI moves.
 
-Verified against opencode 2.3.2 through `omatether repl`: a turn, a tool call
-allowed and denied, `/model` list/switch/refuse/default, resume across two
-processes, `/cancel` then a fresh turn. The brief through `serve` from
-Telegram: opencode's own reasoning for the reply cites "the phone chat
-instructions" (read back from its store, `~/.local/share/opencode/opencode.db`,
-table `session_message` — opencode 2.3.2 has no `export`). **Unverified:** any
-copilot turn. `copilot login` has never been run on this machine, so
-`session/new` answers "Authentication required" (the error now says to run it).
-Close it with `copilot login` and `omatether repl --agent copilot --dir . "run
-ls"`: check that a `[permission]` arrives, that the brief is obeyed, and which
-model shape its session reply uses.
+Verified against opencode 2.3.2 and copilot 1.0.114 through `omatether repl`:
+a turn, a tool call allowed and denied, `/model`, resume across two processes;
+on opencode also `/model` switch and default, and `/cancel` then a fresh
+turn. The brief through `serve` from Telegram: opencode's own reasoning for
+the reply cites "the phone chat instructions" (read back from its store,
+`~/.local/share/opencode/opencode.db`, table `session_message` — opencode
+2.3.2 has no `export`). **Unverified:** copilot from a real chat thread, and
+`/model` switching on copilot (an account with more than `auto` is needed to
+see one succeed).
 
 ## Detached tier (the other four agents)
 
