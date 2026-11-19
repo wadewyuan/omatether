@@ -10,8 +10,10 @@ mod channel;
 mod claude;
 mod codex;
 mod command;
+mod config;
 mod core;
 mod event;
+mod launchd;
 mod mcp_keys;
 mod outbox;
 mod pi;
@@ -82,7 +84,8 @@ enum Mode {
         action: KeyAction,
     },
 
-    /// Guided first-run setup: credentials, env file, systemd service.
+    /// Guided first-run setup: credentials, env file, and the background
+    /// service (systemd on Linux, launchd on macOS).
     /// Safe to re-run — what is configured is kept.
     Setup,
 
@@ -149,7 +152,7 @@ fn mcp_key(action: KeyAction) -> Result<()> {
                 "\nThe agent sends it as `Authorization: Bearer <key>`, e.g.\n  \
                  claude mcp add --transport http omatether http://{}:{}/mcp \\\n    \
                  --header \"Authorization: Bearer <key>\"",
-                core_hostname(),
+                crate::core::hostname(),
                 std::env::var("OMATETHER_MCP_PORT")
                     .unwrap_or_else(|_| mcp::DEFAULT_PORT.to_string())
             );
@@ -167,7 +170,7 @@ fn mcp_key(action: KeyAction) -> Result<()> {
                 offer.name,
                 offer.node,
                 minutes.clamp(1, 24 * 60),
-                core_hostname(),
+                crate::core::hostname(),
                 std::env::var("OMATETHER_MCP_PORT")
                     .unwrap_or_else(|_| mcp::DEFAULT_PORT.to_string())
             );
@@ -206,14 +209,7 @@ fn mcp_key(action: KeyAction) -> Result<()> {
     Ok(())
 }
 
-fn core_hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|h| h.trim().to_string())
-        .unwrap_or_else(|_| "this-machine".to_string())
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -222,7 +218,28 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match Args::parse().command {
+    // Before the runtime exists, so no other thread can be reading the
+    // environment while it is written. Every subcommand gets it: `serve`
+    // under launchd has no other way to see its credentials, and
+    // `photon-setup` no longer needs them exported by hand.
+    let env_file = config::env_path();
+    match config::load_into_env(&env_file) {
+        Ok(taken) if !taken.is_empty() => {
+            tracing::debug!("{}: {}", env_file.display(), taken.join(", "))
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("{e:#}"),
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(run(Args::parse()))
+}
+
+async fn run(args: Args) -> Result<()> {
+    match args.command {
         Mode::Serve {
             dir,
             state,
@@ -468,15 +485,31 @@ fn default_sidecar_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("OMATETHER_PHOTON_SIDECAR_DIR") {
         return PathBuf::from(dir);
     }
-    for candidate in [
-        PathBuf::from("/usr/lib/omatether/photon-sidecar"),
-        dirs_data_home().join("omatether/photon-sidecar"),
-    ] {
-        if candidate.is_dir() {
-            return candidate;
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+    let candidates = sidecar_candidates(exe.as_deref(), &dirs_data_home());
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/photon-sidecar"))
+}
+
+/// Where an installed sidecar may be, best first. Beside the binary comes
+/// first: `<prefix>/share/omatether/photon-sidecar` for a prefix install —
+/// Homebrew's Cellar (the binary is resolved through its `bin/` symlink
+/// first), `/usr/local`, a tarball unpacked anywhere — and the binary's own
+/// directory, which is how the release tarball lays it out. Then the Arch
+/// package's fixed path and the per-user one.
+fn sidecar_candidates(exe: Option<&Path>, data_home: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(bin) = exe.and_then(Path::parent) {
+        if let Some(prefix) = bin.parent() {
+            candidates.push(prefix.join("share/omatether/photon-sidecar"));
         }
+        candidates.push(bin.join("photon-sidecar"));
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vendor/photon-sidecar")
+    candidates.push(PathBuf::from("/usr/lib/omatether/photon-sidecar"));
+    candidates.push(data_home.join("omatether/photon-sidecar"));
+    candidates
 }
 
 /// $XDG_STATE_HOME or ~/.local/state, without pulling in a dirs crate for one
@@ -852,5 +885,36 @@ fn compact(value: &serde_json::Value) -> String {
         format!("{}…", text.chars().take(160).collect::<String>())
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sidecar_is_looked_for_beside_the_binary_first() {
+        let data = Path::new("/home/u/.local/share");
+        // Homebrew: the bin/ symlink resolved into the Cellar.
+        let brew = sidecar_candidates(
+            Some(Path::new("/opt/homebrew/Cellar/omatether/0.2.0/bin/omatether")),
+            data,
+        );
+        assert_eq!(
+            brew[0],
+            PathBuf::from("/opt/homebrew/Cellar/omatether/0.2.0/share/omatether/photon-sidecar")
+        );
+        // The release tarball, unpacked: the sidecar sits next to the binary.
+        let tarball = sidecar_candidates(Some(Path::new("/opt/omatether-0.2.0/omatether")), data);
+        assert!(tarball.contains(&PathBuf::from("/opt/omatether-0.2.0/photon-sidecar")));
+        // And the old places are all still there, in their old order.
+        let none = sidecar_candidates(None, data);
+        assert_eq!(
+            none,
+            vec![
+                PathBuf::from("/usr/lib/omatether/photon-sidecar"),
+                data.join("omatether/photon-sidecar"),
+            ]
+        );
     }
 }

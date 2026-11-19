@@ -888,11 +888,33 @@ fn in_tailnet(ip: IpAddr) -> bool {
     }
 }
 
+/// The Tailscale CLI. On Linux and with Homebrew's `tailscale` it is on
+/// `PATH`. The macOS apps (App Store and standalone) keep it inside the
+/// bundle, where Tailscale's own docs point an alias, and do not install it
+/// on `PATH` unless asked to — and a LaunchAgent's `PATH` would not see an
+/// alias anyway.
+fn tailscale() -> tokio::process::Command {
+    tokio::process::Command::new(tailscale_program(
+        crate::agent::on_path("tailscale"),
+        Path::new(MACOS_APP_CLI).is_file(),
+    ))
+}
+
+const MACOS_APP_CLI: &str = "/Applications/Tailscale.app/Contents/MacOS/Tailscale";
+
+fn tailscale_program(on_path: bool, app_cli: bool) -> &'static str {
+    if !on_path && app_cli {
+        MACOS_APP_CLI
+    } else {
+        "tailscale"
+    }
+}
+
 /// Listen on every Tailscale address this machine has.
 async fn bind(port: u16) -> Result<Vec<tokio::net::TcpListener>> {
     let mut addresses = Vec::new();
     for family in ["-4", "-6"] {
-        let output = tokio::process::Command::new("tailscale")
+        let output = tailscale()
             .args(["ip", family])
             .output()
             .await
@@ -926,7 +948,7 @@ async fn bind(port: u16) -> Result<Vec<tokio::net::TcpListener>> {
 
 /// Ask tailscaled who is at `ip`. Fails for anything not on the tailnet.
 async fn whois(ip: IpAddr) -> Result<Caller> {
-    let output = tokio::process::Command::new("tailscale")
+    let output = tailscale()
         .args(["whois", "--json", &ip.to_string()])
         .output()
         .await
@@ -1160,6 +1182,15 @@ fn mime_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_macos_app_cli_is_used_only_when_nothing_is_on_path() {
+        assert_eq!(tailscale_program(true, true), "tailscale");
+        assert_eq!(tailscale_program(true, false), "tailscale");
+        assert_eq!(tailscale_program(false, true), MACOS_APP_CLI);
+        // Neither: the spawn fails naming `tailscale`, which is the thing to install.
+        assert_eq!(tailscale_program(false, false), "tailscale");
+    }
 
     fn test_config() -> Config {
         Config {

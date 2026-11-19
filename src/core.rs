@@ -201,6 +201,8 @@ impl Core {
         state_dir: PathBuf,
     ) -> Self {
         let (agent_tx, agent_rx) = mpsc::channel(256);
+        // Pay for the lookup now, not inside the first /attach.
+        hostname();
         Self {
             store,
             spill_dir,
@@ -1924,10 +1926,35 @@ fn question_token() -> String {
         .collect()
 }
 
-fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|name| name.trim().to_string())
-        .unwrap_or_else(|_| "localhost".to_string())
+/// This machine's name, for the `ssh <host> …` lines the chat is given.
+///
+/// `/etc/hostname` where there is one; macOS has none, and there `uname -n`
+/// answers (`name.local`, which resolves on the LAN). Worked out once and
+/// kept: it is asked for on the core's task, where a process spawn per
+/// `/attach` is exactly the kind of wait that must not happen — so
+/// [`Core::new`] asks first, before any message is being handled.
+pub fn hostname() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let from_file = std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|name| name.trim().to_string());
+        let from_uname = || {
+            std::process::Command::new("uname")
+                .arg("-n")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|name| name.trim().to_string())
+        };
+        from_file
+            .filter(|name| !name.is_empty())
+            .or_else(from_uname)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "localhost".to_string())
+    })
+    .clone()
 }
 
 /// Where `/new` starts a thread, before checking that it is there.

@@ -1,0 +1,44 @@
+# Homebrew formula template. The release workflow fills in @VERSION@ and the
+# checksums and attaches the result to the GitHub release as omatether.rb;
+# copy that into a tap repository (github.com/<you>/homebrew-tap, Formula/)
+# and `brew install <you>/tap/omatether` installs it.
+class Omatether < Formula
+  desc "Bridge between chat channels and the coding agents installed on your machine"
+  homepage "https://github.com/wadewyuan/omatether"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/wadewyuan/omatether/releases/download/v@VERSION@/omatether-@VERSION@-aarch64-apple-darwin.tar.gz"
+      sha256 "@SHA256_AARCH64@"
+    end
+    on_intel do
+      url "https://github.com/wadewyuan/omatether/releases/download/v@VERSION@/omatether-@VERSION@-x86_64-apple-darwin.tar.gz"
+      sha256 "@SHA256_X86_64@"
+    end
+  end
+
+  def install
+    bin.install "omatether"
+    # Found at runtime as <prefix>/share/omatether/photon-sidecar, beside the
+    # binary's own prefix, so nothing needs setting.
+    (share/"omatether").install "photon-sidecar"
+  end
+
+  def caveats
+    <<~EOS
+      Run `omatether setup` once. It asks for your channel credentials, writes
+      ~/.config/omatether/env (mode 600) and installs a LaunchAgent that starts
+      at login. Logs: ~/Library/Logs/omatether.log
+
+      You also need an agent CLI (claude, codex, pi, opencode or copilot).
+      iMessage via Photon needs node (`brew install node`); the MCP channel
+      needs Tailscale. A Mac that is asleep cannot answer.
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/omatether --version")
+  end
+end

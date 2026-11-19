@@ -12,7 +12,13 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # macOS too: setup's launchd path and everything that differs from Linux
+    # (no /etc/hostname, a different temp dir) only compiles and runs there.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +36,7 @@ jobs:
       # The bundle has broken on its own before (shims for import.meta.resolve);
       # building it here catches that before a release does.
       - name: Bundle the Photon sidecar
+        if: matrix.os == 'ubuntu-latest'
         run: |
           cd vendor/photon-sidecar
           npm ci

@@ -1,8 +1,9 @@
 //! Interactive onboarding: from a fresh clone to a running service.
 //!
-//! `serve` reads its configuration from environment variables the systemd
-//! unit loads out of `~/.config/omatether/env`; this command is how that
-//! file comes to exist, and how the unit comes to run. Every step is
+//! `serve` reads its configuration from `~/.config/omatether/env` (see
+//! [`crate::config`]); this command is how that file comes to exist, and how
+//! the service comes to run — a systemd user unit on Linux, a LaunchAgent on
+//! macOS ([`crate::launchd`]). Every step is
 //! detection-first and safe to re-run — what is already configured is
 //! reported and kept, never asked for again, so a half-finished setup can
 //! simply be run a second time.
@@ -20,13 +21,14 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::{self, on_path};
+use crate::config;
 use crate::channel::photon_setup;
 use crate::channel::telegram_setup::{self, Wait};
 
 /// The whole flow, top to bottom. Steps that find their work already done
 /// say so and move on.
 pub async fn run() -> Result<()> {
-    let env_path = env_path();
+    let env_path = config::env_path();
     println!("omatether setup\n");
 
     check_dependencies();
@@ -49,7 +51,11 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    install_service(&mut prompter).await?;
+    if cfg!(target_os = "macos") {
+        crate::launchd::install(&mut prompter).await?;
+    } else {
+        install_service(&mut prompter).await?;
+    }
 
     println!("\nDone. Send it a message to try it:");
     if let Some(bot) = telegram_bot {
@@ -58,7 +64,7 @@ pub async fn run() -> Result<()> {
     if env.photon().is_some() {
         println!("  iMessage: your Photon line (`omatether photon-setup --phone …` shows it)");
     }
-    println!("`journalctl --user -fu omatether` watches it work.");
+    println!("`{}` watches it work.", log_command());
     Ok(())
 }
 
@@ -293,22 +299,11 @@ struct EnvFile {
 
 impl EnvFile {
     fn load(path: &Path) -> Result<Self> {
-        let mut values = BTreeMap::new();
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                for line in text.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    if let Some((key, value)) = line.split_once('=') {
-                        values.insert(key.trim().to_string(), value.trim().to_string());
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let values = match std::fs::read_to_string(path) {
+            Ok(text) => config::parse(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(e).context(format!("reading {}", path.display())),
-        }
+        };
         Ok(Self {
             path: path.to_path_buf(),
             values,
@@ -386,15 +381,17 @@ impl EnvFile {
     }
 }
 
-fn env_path() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("omatether/env")
-}
-
 // ---- the service ---------------------------------------------------------
+
+/// How to follow the service's log on this platform.
+pub(crate) fn log_command() -> String {
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        format!("tail -f {}", crate::launchd::log_path(&home).display())
+    } else {
+        "journalctl --user -fu omatether".to_string()
+    }
+}
 
 /// Where the package puts its unit, and the binary that unit runs.
 const PACKAGED_UNIT: &str = "/usr/lib/systemd/user/omatether.service";
@@ -404,7 +401,7 @@ const PACKAGED_EXE: &str = "/usr/bin/omatether";
 /// running. `systemctl start` returns as soon as a `Type=simple` unit has
 /// forked, so a `serve` that dies on a bad credential a second later would
 /// otherwise be reported as working.
-const SETTLE: std::time::Duration = std::time::Duration::from_secs(4);
+pub(crate) const SETTLE: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Get a unit in place that runs *this* binary, then start it and check it
 /// stayed up.
@@ -558,7 +555,7 @@ fn unit_exe(unit: &str) -> Option<PathBuf> {
     Some(PathBuf::from(first.replace("%h", &home)))
 }
 
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
@@ -615,7 +612,7 @@ fn render_unit(exe: &Path) -> String {
 
 /// stdin, one question at a time. Answers are trimmed; an empty answer is
 /// how every prompt says "skip" or takes its default.
-struct Prompter {
+pub(crate) struct Prompter {
     lines: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
 }
 
@@ -640,7 +637,7 @@ impl Prompter {
     }
 
     /// A yes/no with an explicit default, so Enter is always safe.
-    async fn confirm(&mut self, prompt: &str, default: bool) -> Result<bool> {
+    pub(crate) async fn confirm(&mut self, prompt: &str, default: bool) -> Result<bool> {
         let hint = if default { "[Y/n]" } else { "[y/N]" };
         let answer = self.ask(&format!("{prompt} {hint}")).await?;
         Ok(match answer.to_ascii_lowercase().as_str() {

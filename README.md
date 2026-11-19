@@ -8,7 +8,8 @@ in your working tree, and sends the answer back to whoever asked.
 The name comes from [Omarchy](https://omarchy.org), where it started, and it
 fits in there: it follows `omarchy default agent`, starts sessions where
 Omarchy's agents start, and can drive the extra agents Omarchy knows how to
-launch. None of that is required, and on any other Linux it is simply skipped.
+launch. None of that is required: on any other Linux, or on a Mac, it is
+simply skipped.
 
 This isn't a general chat assistant. What answers is *your* agent, with your
 `CLAUDE.md`, your MCP servers and your files.
@@ -31,9 +32,18 @@ yay -S omatether        # or build from source
 omatether setup
 ```
 
-Elsewhere, build it with `cargo install --path .` from a checkout and run
-`omatether setup`. It runs as a systemd user service, so for now it needs
-Linux.
+On macOS (new, and less travelled than Linux, so reports are welcome):
+
+```bash
+brew install wadewyuan/tap/omatether
+omatether setup
+```
+
+Anywhere else, build it with `cargo install --path .` from a checkout and run
+`omatether setup`. It runs as a systemd user service on Linux and a
+LaunchAgent on macOS. A Mac that is asleep can't answer, so if it's a laptop
+you want reachable, turn on *Prevent automatic sleeping when the display is
+off* (on power adapter) in System Settings → Battery → Options.
 
 You need at least one agent CLI on the machine (`claude`, `codex`, `pi`,
 `opencode` or `copilot`), plus `node` if you want iMessage and
@@ -46,8 +56,8 @@ installed. `/agent` switches it per thread.
 ## Setup
 
 `omatether setup` walks you through it. It checks each credential the moment
-you paste it, writes `~/.config/omatether/env` (mode 600), then starts the user
-service and confirms it stayed up. Running it again is safe: anything already
+you paste it, writes `~/.config/omatether/env` (mode 600), then starts the
+service (systemd on Linux, launchd on macOS) and confirms it stayed up. Running it again is safe: anything already
 configured is kept.
 
 **Telegram.** Create a **new** bot with [@BotFather](https://t.me/BotFather)
@@ -148,7 +158,9 @@ same commands work, and auto mode applies as it does everywhere.
 
 ### Turn it on
 
-Add to `~/.config/omatether/env`, then `systemctl --user restart omatether`:
+Add to `~/.config/omatether/env`, then restart the service
+(`systemctl --user restart omatether`, or on macOS
+`launchctl kickstart -k gui/$(id -u)/com.github.wadewyuan.omatether`):
 
 ```
 OMATETHER_MCP=on
@@ -257,10 +269,22 @@ systemctl --user status omatether
 journalctl --user -fu omatether
 ```
 
+On macOS:
+
+```bash
+launchctl print gui/$(id -u)/com.github.wadewyuan.omatether | grep state
+tail -f ~/Library/Logs/omatether.log
+```
+
+launchd doesn't rotate that log; truncate it if it ever gets large
+(`: > ~/Library/Logs/omatether.log`).
+
 It opens no ports unless you turn on MCP, and then only on the tailnet.
 Telegram is polled from this machine, and the iMessage helper listens on
 localhost only. Every MCP request is logged with the key and device it came
-from (`journalctl --user -u omatether | grep mcp`).
+from (`journalctl --user -u omatether | grep mcp`, or `grep mcp` the log
+file on macOS). On macOS the Tailscale app's own CLI is used if `tailscale`
+isn't on `PATH`.
 
 **Manual setup**, if you'd rather not use `omatether setup`: write
 `~/.config/omatether/env` with mode 600:
@@ -281,9 +305,11 @@ OMATETHER_MCP=on
 
 Any one channel is enough; leave out the ones you don't use.
 
-then `systemctl --user enable --now omatether`. A source build runs
-`omatether setup` the same way. It writes a unit for the binary you ran it
-from, and the iMessage helper needs `npm install` in `vendor/photon-sidecar`
+`serve` reads this file itself, so it works the same from a terminal, from
+systemd and from launchd; anything already set in the environment wins over
+it. Then `systemctl --user enable --now omatether`. A source build runs
+`omatether setup` the same way. It writes a unit (or LaunchAgent) for the
+binary you ran it from, and the iMessage helper needs `npm install` in `vendor/photon-sidecar`
 once (setup offers to run it).
 
 ## Uninstall
@@ -293,6 +319,15 @@ systemctl --user disable --now omatether
 rm -f ~/.config/systemd/user/omatether.service   # only exists for source builds
 rm -rf ~/.config/omatether ~/.local/state/omatether
 yay -R omatether-bin                             # or omatether
+```
+
+On macOS:
+
+```bash
+launchctl bootout gui/$(id -u)/com.github.wadewyuan.omatether
+rm -f ~/Library/LaunchAgents/com.github.wadewyuan.omatether.plist ~/Library/Logs/omatether.log
+rm -rf ~/.config/omatether ~/.local/state/omatether
+brew uninstall omatether
 ```
 
 Also revoke the bot with @BotFather if you won't use it again, and remove the

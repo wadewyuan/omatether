@@ -1,8 +1,16 @@
 name: release
 
-# Tags shaped v1.2.3 build the tarball AUR's omatether-bin and bare-metal
-# installs consume: the binary, the bundled Photon sidecar, and the packaged
-# systemd user unit, for x86_64 Linux (Omarchy's arch).
+# Tags shaped v1.2.3 build one tarball per platform and attach them, with a
+# Homebrew formula carrying their checksums, to a GitHub release:
+#
+# - x86_64 Linux (Omarchy's arch): the binary, the bundled Photon sidecar and
+#   the packaged systemd user unit. AUR's omatether-bin consumes this one, by
+#   this exact name — do not rename it.
+# - aarch64 and x86_64 macOS: the binary and the sidecar. `omatether setup`
+#   writes the LaunchAgent itself, so there is no service file to ship.
+#
+# Every tarball puts photon-sidecar/ beside the binary, which is one of the
+# places the binary looks (default_sidecar_dir).
 on:
   push:
     tags: ["v*"]
@@ -12,23 +20,43 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            unit: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            unit: false
+          # Cross-built on the Apple Silicon runner: Xcode's clang targets
+          # both architectures, so the C in sqlite and ring builds either way.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            unit: false
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
+      # Natively only: a cross-built test binary cannot run here.
       - name: Test
+        if: matrix.target != 'x86_64-apple-darwin'
         run: cargo test --locked
 
       - name: Build the binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       # ci rather than install: the lockfile is the whole point of a release.
       # The bundle is one file plus stub packages — see bundle.mjs for why.
@@ -39,19 +67,52 @@ jobs:
           npm run bundle
 
       - name: Assemble the tarball
+        shell: bash
         run: |
           V="${GITHUB_REF_NAME#v}"
-          STAGE="omatether-$V-x86_64-unknown-linux-gnu"
+          STAGE="omatether-$V-${{ matrix.target }}"
           mkdir -p "$STAGE/photon-sidecar"
-          cp target/release/omatether "$STAGE/"
-          cp contrib/omatether.service LICENSE README.md "$STAGE/"
+          cp target/${{ matrix.target }}/release/omatether "$STAGE/"
+          cp LICENSE README.md "$STAGE/"
+          if [ "${{ matrix.unit }}" = "true" ]; then
+            cp contrib/omatether.service "$STAGE/"
+          fi
           cp -r vendor/photon-sidecar/dist/. "$STAGE/photon-sidecar/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
-          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          # shasum ships with macOS; sha256sum does not. Same output format.
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            omatether-*.tar.gz
+            omatether-*.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Render the Homebrew formula
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          sum() { cut -d' ' -f1 "omatether-$V-$1.tar.gz.sha256"; }
+          sed -e "s/@VERSION@/$V/g" \
+              -e "s/@SHA256_AARCH64@/$(sum aarch64-apple-darwin)/" \
+              -e "s/@SHA256_X86_64@/$(sum x86_64-apple-darwin)/" \
+              contrib/homebrew/omatether.rb.in > omatether.rb
+          ! grep -n '@[A-Z0-9_]*@' omatether.rb
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            omatether-*-x86_64-unknown-linux-gnu.tar.gz
-            omatether-*-x86_64-unknown-linux-gnu.tar.gz.sha256
+            omatether-*.tar.gz
+            omatether-*.tar.gz.sha256
+            omatether.rb

@@ -11,7 +11,9 @@ Where something is unverified, it says so.
 
 Deployed as a systemd **user** service: `systemctl --user {status,restart} omatether`,
 `journalctl --user -fu omatether`. Config is `~/.config/omatether/env`
-(mode 600), read by the unit as `EnvironmentFile`. Both channels are live and
+(mode 600), read by the unit as `EnvironmentFile` *and* by the binary itself
+at startup (`src/config.rs`; the environment wins) — launchd has no
+`EnvironmentFile`, see "macOS". Both channels are live and
 working end to end. First-time setup on a fresh machine is `omatether setup`
 (`src/setup.rs` asks the questions; the Bot API and Spectrum calls behind
 them are `src/channel/{telegram,photon}_setup.rs`) — interactive, idempotent, validates credentials live,
@@ -335,6 +337,44 @@ and then `/new` keeps the thread where it was. `cargo test` is green with
 Omarchy off `PATH` as well as on it; note that Omarchy installs
 `omarchy-agent` into `/usr/bin` too, so take *both* off `PATH` (an `env -i`
 with a scratch bin dir) to check the off-Omarchy branch.
+
+## macOS
+
+Built for, type-checked and tested in CI, and **never run on a Mac by
+anyone yet**. Everything below that touches `launchctl` is unverified; the
+plist was checked with Python's `plistlib`, which reads the same format.
+
+**launchd has no `EnvironmentFile`, so `serve` reads the env file itself.**
+The alternative was putting credentials into the plist's
+`EnvironmentVariables`, in `~/Library/LaunchAgents`, which is not where a bot
+token belongs. `main` loads it before the tokio runtime is built, because
+`set_var` is only sound while nothing else is reading the environment. Values
+already in the environment win, so systemd's copy and a hand-exported test
+value both behave as before.
+
+**A loaded LaunchAgent does not re-read its plist.** `kickstart -k` restarts
+the process with the plist launchd already holds; a rewritten plist needs
+`bootout` then `bootstrap`, and `bootstrap` straight after `bootout` is known
+to fail with "Input/output error" while the old job is torn down, hence the
+retry. A job someone `launchctl disable`d refuses to bootstrap with an error
+that does not say why, hence the `enable` first.
+
+**The plist names the binary as invoked, not canonicalized**, unlike the
+systemd path: through Homebrew that is the `bin/` symlink, which survives
+`brew upgrade`; the Cellar path behind it is versioned and does not.
+
+**No `/etc/hostname` on macOS** — `core::hostname` falls back to `uname -n`
+(`name.local`), once, cached, and warmed in `Core::new` so the spawn never
+happens on the core's task. **The Tailscale CLI is inside the app bundle**
+(`/Applications/Tailscale.app/Contents/MacOS/Tailscale`) unless the user
+installed it onto `PATH`; `mcp::tailscale()` falls back to it.
+
+Type-checking for macOS from Linux needs no Mac: the only obstacle is the C
+in sqlite and ring, and `cargo check` never links, so a stub `clang` that
+writes empty objects is enough (`CC_aarch64_apple_darwin=<stub>
+AR_aarch64_apple_darwin=ar cargo check --target aarch64-apple-darwin`). It
+must be *named* `clang`, or cc-rs falls back to MSVC flags and writes with
+`-Fo`.
 
 ## Telegram
 
@@ -886,6 +926,14 @@ for with a failed build:
   was verified against the live service: real credentials, 401 without the
   token, stream held open with it. Re-run that smoke (real creds, scratch
   port) whenever the SDK version moves.
+
+The release builds three tarballs (x86_64 Linux, aarch64 and x86_64 macOS,
+the Intel one cross-built on the Apple Silicon runner) and renders
+`contrib/homebrew/omatether.rb.in` into `omatether.rb` with their checksums,
+attached to the release. It is copied into the tap repository by hand. Every
+tarball puts `photon-sidecar/` beside the binary, and the formula installs it
+to `share/omatether/`; `default_sidecar_dir` looks in both. The Linux
+tarball's name is what AUR's `PKGBUILD.bin` downloads — do not rename it.
 
 makepkg **caches downloaded sources by filename** — a same-named tarball
 from an earlier test build is reused silently. When a local test seems to
