@@ -22,7 +22,8 @@ use crate::event::{AgentEvent, Decision};
 
 #[async_trait]
 pub trait Agent: Send {
-    /// The agent's name, as `omarchy default agent` spells it.
+    /// The agent's name, as its CLI is called (and as `omarchy default
+    /// agent` spells it, on Omarchy).
     fn name(&self) -> &'static str;
 
     /// Whether tool calls are routed out for a decision.
@@ -95,15 +96,17 @@ pub enum Backend {
     /// The Agent Client Protocol over one long-lived process: streaming,
     /// gated, and a model that can be changed mid-conversation.
     Acp,
-    /// A detached tmux session. No streaming and no gating, but it works for
-    /// every agent Omarchy supports.
+    /// A detached tmux session, launched through Omarchy's `omarchy-agent`.
+    /// No streaming and no gating, and only where Omarchy is installed — see
+    /// [`available`].
     Tmux,
 }
 
-/// Every agent Omarchy knows about, and how omatether drives it.
+/// Every agent omatether knows how to drive, and how.
 ///
-/// The list mirrors `omarchy-default-agent` so that `/agent <name>` accepts
-/// whatever the desktop accepts.
+/// The list mirrors `omarchy-default-agent` so that on Omarchy `/agent <name>`
+/// accepts whatever the desktop accepts. Off Omarchy the [`Backend::Tmux`]
+/// rows are known but not [`available`]: their launcher is Omarchy's.
 pub const AGENTS: &[(&str, Backend)] = &[
     ("claude", Backend::Claude),
     ("codex", Backend::Codex),
@@ -114,6 +117,98 @@ pub const AGENTS: &[(&str, Backend)] = &[
     ("grok", Backend::Tmux),
     ("copilot", Backend::Acp),
 ];
+
+/// The launcher the detached tier execs. Omarchy's, not ours: it holds each
+/// agent's own "don't stop to ask" flags, and a second copy of those here
+/// would be the wrong thing to own.
+pub const OMARCHY_AGENT: &str = "omarchy-agent";
+
+/// Whether `name` is an executable file in a `$PATH` directory.
+pub fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// Whether this machine can run `name` at all, as far as omatether can tell
+/// before trying.
+///
+/// Only the detached tier is checked: its launcher is part of Omarchy, so on
+/// any other machine those agents would fail at every spawn. The others are
+/// left to fail at the spawn with their own "is it on PATH?" — they are
+/// installed one at a time and checking each here would hide which one is
+/// missing behind a shorter list. Checked per call, not once, so installing
+/// Omarchy's launcher needs no restart.
+pub fn available(name: &str) -> bool {
+    match backend_for(name) {
+        Some(Backend::Tmux) => on_path(OMARCHY_AGENT),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// The agents [`available`] on this machine, in [`AGENTS`] order.
+pub fn available_agents() -> Vec<&'static str> {
+    AGENTS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| available(name))
+        .collect()
+}
+
+/// Why `name` cannot be used here, worded for whoever asked for it, or
+/// `None` when it can.
+pub fn unavailable_reason(name: &str) -> Option<String> {
+    match backend_for(name) {
+        None => Some(format!(
+            "unknown agent '{name}' — try one of: {}",
+            available_agents().join(", ")
+        )),
+        Some(Backend::Tmux) if !on_path(OMARCHY_AGENT) => Some(format!(
+            "{name} launches through {OMARCHY_AGENT}, which is part of Omarchy and \
+             is not installed here — try one of: {}",
+            available_agents().join(", ")
+        )),
+        Some(_) => None,
+    }
+}
+
+/// The agent a thread starts on when nothing named one.
+///
+/// In order: `OMATETHER_AGENT`; on Omarchy, whatever `omarchy default agent`
+/// says, so the bridge and the keybinding agree about what "the agent" means;
+/// else the first of the streaming agents installed on this machine; else
+/// claude, whose spawn error says what is missing.
+pub fn default_agent() -> String {
+    if let Some(name) = std::env::var("OMATETHER_AGENT")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+    {
+        return name;
+    }
+    if let Some(name) = std::process::Command::new("omarchy-default-agent")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| available(name))
+    {
+        return name;
+    }
+    first_installed(on_path).unwrap_or("claude").to_string()
+}
+
+/// The first agent omatether drives itself whose CLI `installed` reports.
+/// Every one of them is a CLI of the agent's own name.
+fn first_installed(installed: impl Fn(&str) -> bool) -> Option<&'static str> {
+    AGENTS
+        .iter()
+        .filter(|(_, backend)| *backend != Backend::Tmux)
+        .map(|(name, _)| *name)
+        .find(|name| installed(name))
+}
 
 pub fn backend_for(name: &str) -> Option<Backend> {
     AGENTS
@@ -157,7 +252,7 @@ pub struct SpawnConfig {
 
 /// Whether this agent can be told which model to run at all.
 ///
-/// The detached tier cannot: it launches through `omarchy-agent`, which takes
+/// The detached tier cannot: it launches through Omarchy's `omarchy-agent`, which takes
 /// `--inline`, `--pick` and `--prompt`, rejects anything else, and holds each
 /// agent's own auto-approve spelling. Passing a model would mean either
 /// changing Omarchy or copying that table in here, and a stale copy of the
@@ -207,17 +302,12 @@ pub async fn list_models(agent: &str, cwd: &Path) -> Result<Vec<String>> {
 
 /// Start an agent, whichever backend drives it.
 pub async fn spawn(config: SpawnConfig) -> Result<(Box<dyn Agent>, mpsc::Receiver<AgentEvent>)> {
-    let backend = match backend_for(&config.agent) {
-        Some(backend) => backend,
-        None => {
-            let known: Vec<&str> = AGENTS.iter().map(|(name, _)| *name).collect();
-            bail!(
-                "unknown agent '{}' — try one of: {}",
-                config.agent,
-                known.join(", ")
-            );
-        }
-    };
+    // A thread may have been switched to a detached agent on a machine that
+    // has since lost Omarchy, or the database moved: say why, not "not found".
+    if let Some(reason) = unavailable_reason(&config.agent) {
+        bail!("{reason}");
+    }
+    let backend = backend_for(&config.agent).expect("checked just above");
 
     match backend {
         Backend::Claude => {
@@ -302,6 +392,45 @@ mod tests {
     #[test]
     fn unknown_agents_are_rejected() {
         assert!(backend_for("emacs").is_none());
+        assert!(!available("emacs"));
+        assert!(unavailable_reason("emacs").unwrap().contains("unknown agent"));
+    }
+
+    #[test]
+    fn the_detached_tier_is_offered_only_where_its_launcher_is() {
+        // Whatever this machine has, the answer has to agree with it: the
+        // tier is there exactly when omarchy-agent is, and nothing else is
+        // ever held back.
+        let omarchy = on_path(OMARCHY_AGENT);
+        for name in ["omp", "crush", "grok"] {
+            assert_eq!(available(name), omarchy, "{name}");
+            match unavailable_reason(name) {
+                Some(why) => {
+                    assert!(!omarchy);
+                    assert!(why.contains("Omarchy"), "say why, not 'unknown': {why}");
+                }
+                None => assert!(omarchy),
+            }
+        }
+        for name in ["claude", "codex", "pi", "opencode", "copilot"] {
+            assert!(available(name), "{name}");
+            assert!(unavailable_reason(name).is_none(), "{name}");
+        }
+        let listed = available_agents();
+        assert!(listed.contains(&"claude"));
+        assert_eq!(listed.contains(&"omp"), omarchy);
+    }
+
+    #[test]
+    fn the_fallback_default_is_an_installed_agent_we_drive_ourselves() {
+        assert_eq!(first_installed(|_| true), Some("claude"));
+        assert_eq!(first_installed(|name| name == "codex" || name == "pi"), Some("codex"));
+        assert_eq!(first_installed(|name| name == "copilot"), Some("copilot"));
+        // A detached agent's CLI being installed is not enough: without
+        // Omarchy's launcher it cannot be started, and with it the Omarchy
+        // default has already answered.
+        assert_eq!(first_installed(|name| name == "omp"), None);
+        assert_eq!(first_installed(|_| false), None);
     }
 
     #[test]

@@ -100,7 +100,8 @@ pub fn parse(text: &str) -> Command {
 pub const HELP: &str = "\
 omatether — your coding agent, over chat
 
-/new           start a fresh session in this thread, back in ~/Work
+/new           start a fresh session in this thread, back in ~/Work if
+               there is one
 /stop          interrupt the running turn
 /cd <path>     set the working directory (starts a fresh session)
 /agent <name>  switch agent (claude, codex, pi, ...)
@@ -135,7 +136,7 @@ Not every agent can be gated at all, even with /auto off:
                can ask you before commands, edits and deletes
   codex        approves its own tools inside a sandbox
   pi           runs and approves its own tools
-  everything else (omp, crush, grok)
+  omp, crush, grok (on Omarchy only)
                runs detached with its own auto-approve flags, unsandboxed,
                and nothing here can stop a tool call";
 

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::agent::{self, on_path};
 use crate::channel::photon_setup;
 use crate::channel::telegram_setup::{self, Wait};
 
@@ -69,19 +70,31 @@ pub async fn run() -> Result<()> {
 fn check_dependencies() {
     println!("Checking what this machine has:");
 
-    let agents = ["claude", "codex", "pi", "omarchy-agent"];
-    let found: Vec<&str> = agents.iter().copied().filter(|a| on_path(a)).collect();
+    let omarchy = on_path(agent::OMARCHY_AGENT);
+    let found: Vec<&str> = agent::AGENTS
+        .iter()
+        .filter(|(_, backend)| *backend != agent::Backend::Tmux)
+        .map(|(name, _)| *name)
+        .filter(|name| on_path(name))
+        .collect();
     if found.is_empty() {
         println!("  ✗ no agent CLI found — the bridge has nothing to drive.");
-        println!("    Install one, e.g. omarchy-pkg-add claude-code");
+        println!("    Install one of: claude, codex, pi, opencode, copilot");
+        if omarchy {
+            println!("    e.g. omarchy-pkg-add claude-code");
+        }
     } else {
         println!("  ✓ agents: {}", found.join(", "));
     }
 
-    if on_path("tmux") {
-        println!("  ✓ tmux (detached agents: omp, crush, grok)");
-    } else {
-        println!("  · tmux missing — the detached tier needs it: omarchy-pkg-add tmux");
+    // The detached tier is Omarchy's launcher run under tmux, so off Omarchy
+    // there is nothing to report and nothing to install for it.
+    if omarchy {
+        if on_path("tmux") {
+            println!("  ✓ tmux (detached agents through omarchy-agent: omp, crush, grok)");
+        } else {
+            println!("  · tmux missing — the detached agents need it: omarchy-pkg-add tmux");
+        }
     }
 
     if on_path("node") {
@@ -92,16 +105,6 @@ fn check_dependencies() {
     println!();
 }
 
-fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| {
-                let candidate = dir.join(name);
-                candidate.is_file()
-            })
-        })
-        .unwrap_or(false)
-}
 
 // ---- telegram ----------------------------------------------------------
 

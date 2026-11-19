@@ -163,7 +163,7 @@ pub struct Core {
     default_cwd: PathBuf,
     /// Where `/new` sends a thread, whatever it was doing before. Held rather
     /// than recomputed per call so a test can point it at a directory that
-    /// exists; see [`work_dir`] for why it is `~/Work`.
+    /// exists; see [`work_dir`] for why it defaults to `~/Work`.
     fresh_cwd: Option<PathBuf>,
     threads: HashMap<ThreadKey, Thread>,
     /// When each thread's "working" indicator was last sent, and by its
@@ -481,7 +481,8 @@ impl Core {
         // Forget the agent's handle rather than inventing one: the next turn
         // starts a conversation and the agent tells us what to call it.
         state.session_id = None;
-        // And start where an agent launched from Omarchy starts, rather than
+        // And start where an agent launched from Omarchy starts (or wherever
+        // OMATETHER_WORK_DIR says), rather than
         // wherever the last session happened to leave this thread. `/new` is
         // the "begin something else" command, and the directory the previous
         // task ran in is a worse guess at the next task's than the one place
@@ -639,14 +640,19 @@ impl Core {
     async fn on_agent(&mut self, key: &ThreadKey, name: &str) -> Result<()> {
         if name.is_empty() {
             let state = self.state(key)?;
-            let known: Vec<&str> = agent::AGENTS.iter().map(|(n, _)| *n).collect();
+            let known = agent::available_agents();
             let note = format!("Using {}. Available: {}", state.agent, known.join(", "));
             return self.say(key, &note);
         }
 
-        if agent::backend_for(name).is_none() {
-            let known: Vec<&str> = agent::AGENTS.iter().map(|(n, _)| *n).collect();
-            let note = format!("Unknown agent '{name}'. Try: {}", known.join(", "));
+        // Before the running session is touched: a switch that cannot happen
+        // must not cost the conversation it would have replaced.
+        if let Some(reason) = agent::unavailable_reason(name) {
+            let mut chars = reason.chars();
+            let note = match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => reason,
+            };
             return self.say(key, &note);
         }
 
@@ -1926,13 +1932,19 @@ fn hostname() -> String {
 
 /// Where `/new` starts a thread, before checking that it is there.
 ///
-/// The same place `omarchy-agent` steps into before launching an agent from
-/// the keybinding or the menu: agents refuse to remember trust for a home
-/// directory and re-ask on every session, so a launch starts one level down
-/// instead. Spelt the way Omarchy spells it, capital included, since the point
-/// is to land in the directory a terminal agent would have.
+/// `OMATETHER_WORK_DIR` when set (a leading `~/` is the home directory, since
+/// an env file does no expansion). Otherwise `~/Work`: the same place
+/// `omarchy-agent` steps into before launching an agent from the keybinding or
+/// the menu, because agents refuse to remember trust for a home directory and
+/// re-ask on every session. Spelt the way Omarchy spells it, capital included,
+/// so that on Omarchy a chat session lands where a terminal agent would. Off
+/// Omarchy there is usually no `~/Work`, and `/new` keeps the thread where it
+/// was — see [`Core::on_new`].
 fn work_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Work"))
+    match std::env::var("OMATETHER_WORK_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => Some(expand_home(dir.trim())),
+        _ => std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Work")),
+    }
 }
 
 /// What to call this thread's model in a message sent when no agent process
@@ -3306,6 +3318,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_that_cannot_run_here_does_not_cost_the_thread_its_agent() {
+        let dir = std::env::temp_dir().join(format!("sb-agent-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        let before = core.state(&key).unwrap().agent;
+
+        core.on_agent(&key, "emacs").await.unwrap();
+        settle().await;
+
+        assert_eq!(core.state(&key).unwrap().agent, before);
+        let sent = channel.sent.lock().unwrap().clone();
+        assert!(sent[0].starts_with("Unknown agent 'emacs'"), "{}", sent[0]);
+        assert!(sent[0].contains("claude"), "say what would work: {}", sent[0]);
+    }
+
+    #[tokio::test]
     async fn the_model_is_remembered_from_the_session_that_reported_it() {
         // It is wanted when no agent process exists to ask — /new answers
         // before anything has spawned — so it has to survive the session.
@@ -3521,7 +3550,11 @@ mod tests {
         let key = fake_key();
         let mut core = core_with(channel.clone(), &dir);
 
-        core.on_agent(&key, "crush").await.unwrap();
+        // Set directly rather than through /agent, which refuses the tier on
+        // a machine without Omarchy's launcher — this is about /model.
+        let mut state = core.state(&key).unwrap();
+        state.agent = "crush".into();
+        core.store.put(&state).unwrap();
         core.on_model(&key, ModelRequest::Set("gpt-5".into()))
             .await
             .unwrap();

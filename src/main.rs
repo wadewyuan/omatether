@@ -62,8 +62,9 @@ enum Mode {
         #[arg(long)]
         photon_sidecar: Option<PathBuf>,
 
-        /// Agent a thread uses until told otherwise. Defaults to whatever
-        /// `omarchy default agent` says, then to claude.
+        /// Agent a thread uses until told otherwise. Defaults to
+        /// $OMATETHER_AGENT, then `omarchy default agent` on Omarchy, then the
+        /// first supported agent installed.
         #[arg(long)]
         agent: Option<String>,
     },
@@ -90,7 +91,7 @@ enum Mode {
         #[arg(long, default_value = ".")]
         dir: PathBuf,
 
-        /// Which agent to drive. Defaults to `omarchy default agent`.
+        /// Which agent to drive. Defaults as `serve --agent` does.
         #[arg(long)]
         agent: Option<String>,
 
@@ -303,9 +304,9 @@ async fn serve(
         );
     }
 
-    let default_agent = agent.unwrap_or_else(omarchy_default_agent);
-    if agent::backend_for(&default_agent).is_none() {
-        bail!("unknown default agent '{default_agent}'");
+    let default_agent = agent.unwrap_or_else(agent::default_agent);
+    if let Some(reason) = agent::unavailable_reason(&default_agent) {
+        bail!("default agent: {reason}");
     }
 
     tracing::info!("default dir {}", dir.display());
@@ -315,19 +316,6 @@ async fn serve(
     Core::new(store, channels, dir, default_agent, spill_dir, state_dir)
         .run(inbound_rx)
         .await
-}
-
-/// Follow the desktop's choice, so the bridge and the keybinding agree about
-/// what "the agent" means.
-fn omarchy_default_agent() -> String {
-    std::process::Command::new("omarchy-default-agent")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|name| name.trim().to_string())
-        .filter(|name| agent::backend_for(name).is_some())
-        .unwrap_or_else(|| "claude".to_string())
 }
 
 /// Telegram is configured when a token is present; absent is not an error.
@@ -526,7 +514,7 @@ async fn repl(
     model: Option<String>,
     prompt: Option<String>,
 ) -> Result<()> {
-    let name = agent.unwrap_or_else(omarchy_default_agent);
+    let name = agent.unwrap_or_else(agent::default_agent);
     let dir = dir.canonicalize().unwrap_or(dir);
 
     let (mut session, mut events) = agent::spawn(agent::SpawnConfig {

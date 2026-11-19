@@ -1,10 +1,14 @@
 # omatether
 
 Your coding agent, over chat. Text it from your phone on Telegram or iMessage,
-or let another AI agent on your tailnet hand it work over MCP. It runs the
-agent installed on your machine (Claude Code, Codex, or whichever one
-`omarchy default agent` points at) in your working tree, and sends the answer
-back to whoever asked.
+or let another AI agent on your tailnet hand it work over MCP. It runs a coding
+agent installed on your machine (Claude Code, Codex, Pi, opencode or Copilot)
+in your working tree, and sends the answer back to whoever asked.
+
+The name comes from [Omarchy](https://omarchy.org), where it started, and it
+fits in there: it follows `omarchy default agent`, starts sessions where
+Omarchy's agents start, and can drive the extra agents Omarchy knows how to
+launch. None of that is required, and on any other Linux it is simply skipped.
 
 This isn't a general chat assistant. What answers is *your* agent, with your
 `CLAUDE.md`, your MCP servers and your files.
@@ -27,9 +31,17 @@ yay -S omatether        # or build from source
 omatether setup
 ```
 
-You need at least one agent CLI on the machine (`claude`, `codex`, `pi`, or
-any agent Omarchy can launch), plus `node` if you want iMessage and
+Elsewhere, build it with `cargo install --path .` from a checkout and run
+`omatether setup`. It runs as a systemd user service, so for now it needs
+Linux.
+
+You need at least one agent CLI on the machine (`claude`, `codex`, `pi`,
+`opencode` or `copilot`), plus `node` if you want iMessage and
 [Tailscale](https://tailscale.com) if you want MCP.
+
+The agent a new thread starts on is `OMATETHER_AGENT` if you set it, else
+`omarchy default agent` on Omarchy, else the first of those CLIs that is
+installed. `/agent` switches it per thread.
 
 ## Setup
 
@@ -64,7 +76,7 @@ message rather than being cut.
 
 | Command | Effect |
 |---|---|
-| `/new` | Fresh session, starting in `~/Work` |
+| `/new` | Fresh session, starting in `~/Work` (or `OMATETHER_WORK_DIR`) if it exists |
 | `/stop` | Interrupt the running turn |
 | `/cd <path>` | Change the working directory (starts a fresh session) |
 | `/agent <name>` | Switch agent: claude, codex, pi, opencode, copilot, omp, crush, grok |
@@ -105,7 +117,7 @@ Only Claude, opencode and Copilot can be asked at all:
 | `opencode`, `copilot` | yes | **yes** | yes |
 | `codex` | yes | no | yes |
 | `pi` | yes | no | yes |
-| omp, crush, grok | no | no | no |
+| omp, crush, grok (Omarchy only) | no | no | no |
 
 opencode and Copilot are driven over the
 [Agent Client Protocol](https://agentclientprotocol.com) (`opencode acp`,
@@ -121,9 +133,9 @@ run once on the machine first.
 > cannot stop them.** Switching to one is one `/agent` away for anyone on the
 > allowlist. `/agent` says so when you switch.
 
-The last three run in a tmux session through `omarchy-agent`. Their replies
-appear in that terminal rather than in the chat; `/attach` gives you the
-command to open it.
+The last three run in a tmux session through Omarchy's `omarchy-agent`, so
+they're only offered where Omarchy is installed. Their replies appear in that
+terminal rather than in the chat; `/attach` gives you the command to open it.
 
 ## Other agents on your tailnet (MCP)
 
@@ -262,6 +274,9 @@ OMATETHER_PHOTON_PROJECT_SECRET=...
 OMATETHER_PHOTON_ALLOWED_USERS=<your phone, e.g. +15551234567>
 
 OMATETHER_MCP=on
+
+# OMATETHER_AGENT=codex          # the agent new threads start on
+# OMATETHER_WORK_DIR=~/src       # where /new starts; default ~/Work
 ```
 
 Any one channel is enough; leave out the ones you don't use.

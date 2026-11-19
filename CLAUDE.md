@@ -308,12 +308,33 @@ The `new-session` path is fine as it is: tmux passes the prompt to
 `omarchy-agent` as argv with no shell in between, so `foo; rm -rf ~` stays a
 string. Verified, not assumed.
 
+**The tier exists only where Omarchy does.** omatether is not an Omarchy-only
+tool any more, and `omarchy-agent` is Omarchy's, so `agent::available` hides
+these three from `/agent`'s list and from the default-agent choice when it
+is not on `PATH`, and a spawn of one (a thread switched before Omarchy went
+away) fails saying so rather than "not found". Checked per call, like `~/Work`.
+Do not fix this by building their command lines here — see the next paragraph.
+The route off Omarchy for any of them is an ACP or JSON mode, which would move
+it up to a gated tier anyway.
+
 **No model can be passed through this tier.** `omarchy-agent` takes `--inline`,
 `--pick` and `--prompt`, exits on anything else, and holds each agent's own
 spelling of "don't stop to ask". Getting a model in would mean either changing
 Omarchy or building these command lines here — and a stale second copy of the
 flags that decide whether an agent pauses for permission is the wrong thing to
 own. `agent::takes_model` is false for the tier and `/model` says why.
+
+## Omarchy is optional
+
+The project started on Omarchy and keeps the name, but nothing requires it.
+Three things key off it, all by detection, never by a flag: the default agent
+(`OMATETHER_AGENT`, then `omarchy-default-agent`, then the first installed CLI
+of the agents we drive ourselves — `agent::default_agent`), the detached tier
+(below), and `/new`'s `~/Work`, which is simply absent on most other machines,
+and then `/new` keeps the thread where it was. `cargo test` is green with
+Omarchy off `PATH` as well as on it; note that Omarchy installs
+`omarchy-agent` into `/usr/bin` too, so take *both* off `PATH` (an `env -i`
+with a scratch bin dir) to check the off-Omarchy branch.
 
 ## Telegram
 
@@ -724,8 +745,8 @@ worst kind of bug to find.
   so things happen in the order they were sent. `/stop` also *drops* what is
   held: a message called off half a second before it would have started must
   not start anyway.
-- **`/new` starts in `~/Work`, not where the last session was.** It matches
-  `omarchy-agent`, which steps out of `$HOME` into `~/Work` before launching
+- **`/new` starts in `~/Work` (or `OMATETHER_WORK_DIR`), not where the last
+  session was.** It matches `omarchy-agent`, which steps out of `$HOME` into `~/Work` before launching
   because agents refuse to remember trust for a home directory. So a session
   begun from chat lands where one begun from the keybinding does. The
   directory's existence is checked per call, not at startup, and a machine
