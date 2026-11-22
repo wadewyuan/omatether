@@ -114,7 +114,7 @@ pub const AGENTS: &[(&str, Backend)] = &[
     ("omp", Backend::Tmux),
     ("opencode", Backend::Acp),
     ("crush", Backend::Tmux),
-    ("grok", Backend::Tmux),
+    ("grok", Backend::Acp),
     ("copilot", Backend::Acp),
 ];
 
@@ -274,15 +274,27 @@ pub fn gates(agent: &str) -> bool {
     )
 }
 
+/// Agents that can put a tool call to a person, in [`AGENTS`] order.
+///
+/// `/auto off` names them. A hardcoded subset would claim the gate for the
+/// wrong set the moment another profile arrives.
+pub fn gating_agents() -> Vec<&'static str> {
+    AGENTS
+        .iter()
+        .filter(|(name, _)| gates(name))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
 /// Ask the agent's CLI for its model catalog, without a session.
 ///
 /// Where [`Agent::models`] is what an agent volunteered on its own — Claude
 /// Code's handshake, which only exists while that session is up — this asks
-/// the CLI directly: `codex debug models`, `pi --list-models`. Both are local
-/// and cost no API call, which is what makes a list possible before the first
-/// turn or after a `/new`. Claude Code has no such command, so its answer is
-/// how to get one; the error is worded that way because it is shown to the
-/// person who asked.
+/// the CLI directly: `codex debug models`, `pi --list-models`, `opencode models`,
+/// `grok models`. Each is local and costs no API call, which is what makes a
+/// list possible before the first turn or after a `/new`. Claude Code and
+/// copilot have no such command, so their answer is how to get one; the error
+/// is worded that way because it is shown to the person who asked.
 pub async fn list_models(agent: &str, cwd: &Path) -> Result<Vec<String>> {
     match backend_for(agent) {
         Some(Backend::Codex) => crate::codex::list_models(cwd).await,
@@ -393,7 +405,9 @@ mod tests {
     fn unknown_agents_are_rejected() {
         assert!(backend_for("emacs").is_none());
         assert!(!available("emacs"));
-        assert!(unavailable_reason("emacs").unwrap().contains("unknown agent"));
+        assert!(unavailable_reason("emacs")
+            .unwrap()
+            .contains("unknown agent"));
     }
 
     #[test]
@@ -402,7 +416,7 @@ mod tests {
         // tier is there exactly when omarchy-agent is, and nothing else is
         // ever held back.
         let omarchy = on_path(OMARCHY_AGENT);
-        for name in ["omp", "crush", "grok"] {
+        for name in ["omp", "crush"] {
             assert_eq!(available(name), omarchy, "{name}");
             match unavailable_reason(name) {
                 Some(why) => {
@@ -412,7 +426,7 @@ mod tests {
                 None => assert!(omarchy),
             }
         }
-        for name in ["claude", "codex", "pi", "opencode", "copilot"] {
+        for name in ["claude", "codex", "pi", "opencode", "grok", "copilot"] {
             assert!(available(name), "{name}");
             assert!(unavailable_reason(name).is_none(), "{name}");
         }
@@ -424,8 +438,12 @@ mod tests {
     #[test]
     fn the_fallback_default_is_an_installed_agent_we_drive_ourselves() {
         assert_eq!(first_installed(|_| true), Some("claude"));
-        assert_eq!(first_installed(|name| name == "codex" || name == "pi"), Some("codex"));
+        assert_eq!(
+            first_installed(|name| name == "codex" || name == "pi"),
+            Some("codex")
+        );
         assert_eq!(first_installed(|name| name == "copilot"), Some("copilot"));
+        assert_eq!(first_installed(|name| name == "grok"), Some("grok"));
         // A detached agent's CLI being installed is not enough: without
         // Omarchy's launcher it cannot be started, and with it the Omarchy
         // default has already answered.
@@ -437,10 +455,10 @@ mod tests {
     fn only_the_agents_omatether_spawns_itself_can_be_told_a_model() {
         // The ones with a command line of our own making. The detached tier
         // runs through omarchy-agent, which has nowhere to put one.
-        for name in ["claude", "codex", "pi", "opencode", "copilot"] {
+        for name in ["claude", "codex", "pi", "opencode", "grok", "copilot"] {
             assert!(takes_model(name), "{name} takes a model");
         }
-        for name in ["omp", "crush", "grok"] {
+        for name in ["omp", "crush"] {
             assert!(!takes_model(name), "{name} has no way to be told one");
         }
         assert!(!takes_model("emacs"));
@@ -464,10 +482,12 @@ mod tests {
         assert_eq!(backend_for("claude"), Some(Backend::Claude));
         assert_eq!(backend_for("opencode"), Some(Backend::Acp));
         assert_eq!(backend_for("copilot"), Some(Backend::Acp));
-        for name in ["claude", "opencode", "copilot"] {
+        assert_eq!(backend_for("grok"), Some(Backend::Acp));
+        assert_eq!(gating_agents(), ["claude", "opencode", "grok", "copilot"]);
+        for name in gating_agents() {
             assert!(gates(name), "{name}");
         }
-        for name in ["codex", "pi", "omp", "emacs"] {
+        for name in ["codex", "pi", "omp", "crush", "emacs"] {
             assert!(!gates(name), "{name}");
         }
         // codex exec's only approval mode is automatic; pi -p runs its tools

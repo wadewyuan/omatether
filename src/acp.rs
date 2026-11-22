@@ -28,6 +28,9 @@
 //! Copilot 1.0.114 likewise, except `/cancel`; its differences (no
 //! `in_progress`, `load` rather than `resume`, an `allow_all` option, a brief
 //! that has to be laid out as a `.instructions.md`) are noted where handled.
+//! Grok 1.0.92 asks in ask mode with no flag (`grok agent --no-leader stdio`);
+//! its brief is `_meta.rules` on `session/new` only, and `/model` before a
+//! session reads `grok models`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -77,6 +80,14 @@ pub enum Profile {
     /// `.github/instructions/*.instructions.md` under a directory named by
     /// `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`.
     Copilot,
+    /// `grok agent --no-leader stdio`. Asks in ask mode, which is what a
+    /// session gets when no mode is set — `--always-approve` and
+    /// `_meta.yoloMode` / `autoMode` would answer every question before it
+    /// is asked, so none of them is passed. The brief is `_meta.rules` on
+    /// `session/new` only: it is appended to the system prompt, and a
+    /// top-level `grok --rules` does not reach this process. `--no-leader`
+    /// keeps a chat turn off a desktop leader that is already running.
+    Grok,
 }
 
 impl Profile {
@@ -84,6 +95,7 @@ impl Profile {
         match name {
             "opencode" => Some(Profile::Opencode),
             "copilot" => Some(Profile::Copilot),
+            "grok" => Some(Profile::Grok),
             _ => None,
         }
     }
@@ -92,6 +104,7 @@ impl Profile {
         match self {
             Profile::Opencode => "opencode",
             Profile::Copilot => "copilot",
+            Profile::Grok => "grok",
         }
     }
 
@@ -99,7 +112,15 @@ impl Profile {
         match self {
             Profile::Opencode => ("opencode", &["acp"]),
             Profile::Copilot => ("copilot", &["--acp"]),
+            // Ask mode is the unset default. Never add `--always-approve`.
+            Profile::Grok => ("grok", &["agent", "--no-leader", "stdio"]),
         }
+    }
+
+    /// A file `configure` points at. Grok's brief is not one: it rides on
+    /// `session/new` as `_meta.rules`.
+    fn brief_is_a_file(self) -> bool {
+        matches!(self, Profile::Opencode | Profile::Copilot)
     }
 
     /// Put the gate and the brief where this agent reads them.
@@ -124,6 +145,9 @@ impl Profile {
                     command.env("COPILOT_CUSTOM_INSTRUCTIONS_DIRS", dirs);
                 }
             }
+            // No env. `GROK_CONFIG` cannot carry rules or a permission mode,
+            // and nothing found in the environment turns ask mode off.
+            Profile::Grok => {}
         }
     }
 
@@ -136,13 +160,14 @@ impl Profile {
     /// repository instruction and obeyed (copilot 1.0.114, three runs of
     /// three). `applyTo: "**"` is what that format uses for "everywhere";
     /// copilot obeyed it without, but it costs nothing to say.
-    fn brief_layout(self, brief: &str) -> (&'static str, String) {
+    fn brief_layout(self, brief: &str) -> Option<(&'static str, String)> {
         match self {
-            Profile::Opencode => ("brief.md", brief.to_string()),
-            Profile::Copilot => (
+            Profile::Opencode => Some(("brief.md", brief.to_string())),
+            Profile::Copilot => Some((
                 ".github/instructions/omatether.instructions.md",
                 format!("---\napplyTo: \"**\"\n---\n{brief}"),
-            ),
+            )),
+            Profile::Grok => None,
         }
     }
 }
@@ -322,8 +347,10 @@ impl AcpSession {
         let (program, args) = profile.command();
 
         let brief_path = match &config.brief {
-            Some(brief) => Some(write_brief(profile, brief).context("writing the brief")?),
-            None => None,
+            Some(brief) if profile.brief_is_a_file() => {
+                Some(write_brief(profile, brief).context("writing the brief")?)
+            }
+            _ => None,
         };
 
         let mut command = Command::new(program);
@@ -397,8 +424,15 @@ impl AcpSession {
             .with_context(|| format!("{agent} did not start an ACP session"))?;
 
         let cwd = config.cwd.to_string_lossy().to_string();
+        // A file brief is already on the process. Grok's is `_meta.rules`,
+        // and only on the session that is being created.
+        let rules = if profile.brief_is_a_file() {
+            None
+        } else {
+            config.brief.as_deref().filter(|text| !text.is_empty())
+        };
         let (session_id, session, resumed) =
-            open_session(&shared, &init, &cwd, config.session_id.as_deref())
+            open_session(&shared, &init, &cwd, config.session_id.as_deref(), rules)
                 .await
                 .map_err(|e| anyhow!("{agent}: {e:#}{}", login_hint(&init, &e)))?;
 
@@ -517,6 +551,7 @@ async fn open_session(
     init: &Value,
     cwd: &str,
     resume: Option<&str>,
+    rules: Option<&str>,
 ) -> Result<(String, Value, std::result::Result<(), String>)> {
     let caps = init.get("agentCapabilities");
     let can_resume = caps
@@ -529,7 +564,10 @@ async fn open_session(
 
     let mut resumed = Ok(());
     if let Some(id) = resume {
-        let params = json!({"sessionId": id, "cwd": cwd, "mcpServers": []});
+        // No `_meta` here. Grok documents `rules` on `session/new` only, and
+        // a session created with them keeps them; an unknown field on resume
+        // can fail it and drop the conversation.
+        let params = resume_session_params(id, cwd);
         let attempt = if can_resume {
             shared
                 .request("session/resume", params, STARTUP_TIMEOUT)
@@ -554,7 +592,7 @@ async fn open_session(
     let reply = shared
         .request(
             "session/new",
-            json!({"cwd": cwd, "mcpServers": []}),
+            new_session_params(cwd, rules),
             STARTUP_TIMEOUT,
         )
         .await?;
@@ -564,6 +602,23 @@ async fn open_session(
         .context("session/new answered without a sessionId")?
         .to_string();
     Ok((id, reply, resumed))
+}
+
+/// `session/resume` and `session/load`. Deliberately no `_meta`.
+fn resume_session_params(id: &str, cwd: &str) -> Value {
+    json!({"sessionId": id, "cwd": cwd, "mcpServers": []})
+}
+
+/// `session/new`. `rules`, when set, is grok's `_meta.rules`: extra rules
+/// appended to the system prompt. Nothing else goes in `_meta` — `yoloMode`
+/// and `autoMode` would approve tools without asking, and
+/// `systemPromptOverride` would replace the prompt instead of appending.
+fn new_session_params(cwd: &str, rules: Option<&str>) -> Value {
+    let mut params = json!({"cwd": cwd, "mcpServers": []});
+    if let Some(rules) = rules {
+        params["_meta"] = json!({"rules": rules});
+    }
+    params
 }
 
 /// "Authentication required" is the whole of copilot's answer before a login,
@@ -683,7 +738,12 @@ fn write_brief(profile: Profile, brief: &str) -> Result<Brief> {
         .join("omatether/brief")
         .join(hex)
         .join(profile.name());
-    let (relative, text) = profile.brief_layout(brief);
+    let (relative, text) = profile.brief_layout(brief).ok_or_else(|| {
+        anyhow!(
+            "{} takes its brief on the session, not as a file",
+            profile.name()
+        )
+    })?;
     let path = root.join(relative);
     let dir = path.parent().expect("a layout names a file");
     std::fs::DirBuilder::new()
@@ -1242,8 +1302,9 @@ impl Agent for AcpSession {
     }
 }
 
-/// The models opencode will take, from `opencode models` — local, no session
-/// needed. Copilot has no such command, so its list comes with a session.
+/// The models opencode and grok will take, from `opencode models` and
+/// `grok models` — local, no session needed. Copilot has no such command, so
+/// its list comes with a session.
 pub async fn list_models(profile: Profile, cwd: &Path) -> Result<Vec<String>> {
     match profile {
         Profile::Opencode => {
@@ -1263,6 +1324,23 @@ pub async fn list_models(profile: Profile, cwd: &Path) -> Result<Vec<String>> {
             }
             Ok(parse_model_lines(&String::from_utf8_lossy(&output.stdout)))
         }
+        Profile::Grok => {
+            let mut command = Command::new("grok");
+            command.arg("models").current_dir(cwd).kill_on_drop(true);
+            let output = match tokio::time::timeout(Duration::from_secs(20), command.output()).await
+            {
+                Ok(output) => output.context("running `grok models`")?,
+                Err(_) => bail!("`grok models` did not answer within 20s"),
+            };
+            if !output.status.success() {
+                bail!(
+                    "`grok models` exited {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(parse_grok_models(&String::from_utf8_lossy(&output.stdout)))
+        }
         Profile::Copilot => bail!(
             "copilot's model list comes with a live session — send it a message \
              first, and /model will show it"
@@ -1277,6 +1355,27 @@ pub fn parse_model_lines(out: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|line| line.contains('/') && !line.contains(char::is_whitespace))
         .map(String::from)
+        .collect()
+}
+
+/// A model line from `grok models`: `* grok-4.7 (default)` or `- grok-4.6`.
+/// The login prose and a mise activation line are neither, so this does not
+/// assume the payload is line one. `(default)` is a marker, not part of the id.
+pub fn parse_grok_models(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("* ")
+                .or_else(|| line.strip_prefix("- "))?;
+            let name = rest.trim();
+            let name = name.strip_suffix(" (default)").unwrap_or(name);
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        })
         .collect()
 }
 
@@ -1569,11 +1668,16 @@ mod tests {
 
     #[test]
     fn copilot_gets_its_brief_where_it_applies_one() {
-        let (path, text) = Profile::Copilot.brief_layout("Be brief.");
+        let (path, text) = Profile::Copilot.brief_layout("Be brief.").unwrap();
         assert_eq!(path, ".github/instructions/omatether.instructions.md");
         assert!(text.starts_with("---\napplyTo: \"**\"\n---\n"));
         assert!(text.ends_with("Be brief."));
-        assert_eq!(Profile::Opencode.brief_layout("Be brief.").1, "Be brief.");
+        assert_eq!(
+            Profile::Opencode.brief_layout("Be brief.").unwrap().1,
+            "Be brief."
+        );
+        // Grok's brief is `_meta.rules`, not a file under the state dir.
+        assert!(Profile::Grok.brief_layout("Be brief.").is_none());
     }
 
     #[test]
@@ -1639,13 +1743,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grok_model_lines_keep_the_id_and_drop_the_prose() {
+        // Captured from `grok models` on grok 1.0.92, plus the mise line that
+        // lands on stdout ahead of it.
+        let out = "\
+mise WARN  activation noise
+You are logged in with grok.com.
+Default model: grok-4.7
+Available models:
+  * grok-4.7 (default)
+  - grok-4.7-build-fast
+  - grok-4.6
+  - grok-4.5
+";
+        assert_eq!(
+            parse_grok_models(out),
+            ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]
+        );
+    }
+
+    #[test]
+    fn grok_is_started_in_ask_mode_off_any_leader() {
+        let (program, args) = Profile::Grok.command();
+        assert_eq!(program, "grok");
+        assert_eq!(args, ["agent", "--no-leader", "stdio"]);
+        assert!(
+            args.iter()
+                .all(|arg| !arg.contains("approve") && !arg.contains("yolo")),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn grok_rules_ride_on_session_new_and_nowhere_else() {
+        let params = new_session_params("/w", Some("Be brief."));
+        assert_eq!(params["cwd"], "/w");
+        assert_eq!(params["mcpServers"], json!([]));
+        assert_eq!(params["_meta"]["rules"], "Be brief.");
+        assert!(params["_meta"].get("yoloMode").is_none());
+        assert!(params["_meta"].get("autoMode").is_none());
+        assert!(params["_meta"].get("systemPromptOverride").is_none());
+
+        assert!(new_session_params("/w", None).get("_meta").is_none());
+
+        let resume = resume_session_params("ses", "/w");
+        assert_eq!(resume["sessionId"], "ses");
+        assert!(resume.get("_meta").is_none());
+    }
+
     /// The brief, through this adapter's own spawn, against the real CLI.
     /// Spends a turn on each agent, so opt in:
     /// `cargo test -- --ignored live_brief`.
     #[tokio::test]
-    #[ignore = "runs opencode and copilot; spends a model turn on each"]
+    #[ignore = "runs opencode, copilot and grok; spends a model turn on each"]
     async fn live_brief_is_obeyed() {
-        for profile in [Profile::Opencode, Profile::Copilot] {
+        for profile in [Profile::Opencode, Profile::Copilot, Profile::Grok] {
             let (mut session, mut events) = AcpSession::spawn(Config {
                 profile,
                 cwd: std::env::temp_dir(),
@@ -1675,9 +1828,11 @@ mod tests {
     }
 
     #[test]
-    fn only_opencode_and_copilot_have_a_profile() {
+    fn each_acp_agent_has_a_profile() {
         assert_eq!(Profile::for_agent("opencode"), Some(Profile::Opencode));
         assert_eq!(Profile::for_agent("copilot"), Some(Profile::Copilot));
+        assert_eq!(Profile::for_agent("grok"), Some(Profile::Grok));
         assert_eq!(Profile::for_agent("crush"), None);
+        assert_eq!(Profile::for_agent("omp"), None);
     }
 }

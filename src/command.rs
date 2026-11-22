@@ -132,11 +132,11 @@ see each one in the reply as it happens. /auto off puts the gate \
 back for this thread — Allow/Deny before every command, edit and delete.
 
 Not every agent can be gated at all, even with /auto off:
-  claude, opencode, copilot
+  claude, opencode, grok, copilot
                can ask you before commands, edits and deletes
   codex        approves its own tools inside a sandbox
   pi           runs and approves its own tools
-  omp, crush, grok (on Omarchy only)
+  omp, crush (on Omarchy only)
                runs detached with its own auto-approve flags, unsandboxed,
                and nothing here can stop a tool call";
 
@@ -164,6 +164,30 @@ mod tests {
         assert_eq!(parse("/attach"), Command::Attach);
         assert_eq!(parse("/log"), Command::Log);
         assert_eq!(parse("/agent"), Command::Agent(String::new()));
+    }
+
+    #[test]
+    fn help_names_exactly_the_agents_that_can_ask() {
+        let names: Vec<&str> = HELP
+            .lines()
+            .take_while(|line| !line.contains("can ask you"))
+            .last()
+            .expect("the ask line has a list above it")
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect();
+        for name in crate::agent::gating_agents() {
+            assert!(names.contains(&name), "help omits {name}, which can ask");
+        }
+        for name in ["codex", "pi", "omp", "crush"] {
+            assert!(!names.contains(&name), "{name} cannot ask");
+        }
+        let detached = HELP
+            .lines()
+            .find(|line| line.contains("on Omarchy only"))
+            .expect("help names the detached tier");
+        assert!(detached.contains("omp") && detached.contains("crush"));
+        assert!(!detached.contains("grok"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Your coding agent, over chat. Text it from your phone on Telegram or iMessage,
 or let another AI agent on your tailnet hand it work over MCP. It runs a coding
-agent installed on your machine (Claude Code, Codex, Pi, opencode or Copilot)
+agent installed on your machine (Claude Code, Codex, Pi, opencode, Grok or Copilot)
 in your working tree, and sends the answer back to whoever asked.
 
 The name comes from [Omarchy](https://omarchy.org), where it started, and it
@@ -46,7 +46,7 @@ you want reachable, turn on *Prevent automatic sleeping when the display is
 off* (on power adapter) in System Settings → Battery → Options.
 
 You need at least one agent CLI on the machine (`claude`, `codex`, `pi`,
-`opencode` or `copilot`), plus `node` if you want iMessage and
+`opencode`, `grok` or `copilot`), plus `node` if you want iMessage and
 [Tailscale](https://tailscale.com) if you want MCP.
 
 The agent a new thread starts on is `OMATETHER_AGENT` if you set it, else
@@ -119,31 +119,33 @@ like review. Use `/auto off` in a thread to be asked before the agent runs a
 command, edits a file or deletes one. On Telegram you get Allow / Deny
 buttons; on iMessage you reply `/allow` or `/deny`.
 
-Only Claude, opencode and Copilot can be asked at all:
+Only Claude, opencode, Copilot and Grok can be asked at all:
 
 | Agent | Streams replies | Can ask before a tool call | Model choice |
 |---|---|---|---|
 | `claude` | yes | **yes** | yes |
-| `opencode`, `copilot` | yes | **yes** | yes |
+| `opencode`, `copilot`, `grok` | yes | **yes** | yes |
 | `codex` | yes | no | yes |
 | `pi` | yes | no | yes |
-| omp, crush, grok (Omarchy only) | no | no | no |
+| omp, crush (Omarchy only) | no | no | no |
 
-opencode and Copilot are driven over the
+opencode, Copilot and Grok are driven over the
 [Agent Client Protocol](https://agentclientprotocol.com) (`opencode acp`,
-`copilot --acp`). omatether turns opencode's asking on for every tool; a rule
-in opencode's own config that allows a tool still wins. Copilot asks the way it
-does in a terminal: commands it judges read-only, like `ls`, run without a
-question, and a command you told it to always allow stays allowed.
-`/deny <why>` refuses the call, but ACP has no way to pass the *why* along, and
+`copilot --acp`, `grok agent --no-leader stdio`). omatether turns opencode's
+asking on for every tool; a rule in opencode's own config that allows a tool
+still wins. Copilot asks the way it does in a terminal: commands it judges
+read-only, like `ls`, run without a question, and a command you told it to
+always allow stays allowed. Grok starts in ask mode, so a file write is a
+question. `/deny <why>` refuses the call, but ACP has no way to pass the *why*
+along, and
 opencode treats a refusal as the end of the turn. Copilot needs `copilot login`
-run once on the machine first.
+run once on the machine first; Grok needs to be logged in the same way.
 
-> **Codex, Pi and the last three run their tools as they decide, and omatether
+> **Codex, Pi, omp and crush run their tools as they decide, and omatether
 > cannot stop them.** Switching to one is one `/agent` away for anyone on the
 > allowlist. `/agent` says so when you switch.
 
-The last three run in a tmux session through Omarchy's `omarchy-agent`, so
+omp and crush run in a tmux session through Omarchy's `omarchy-agent`, so
 they're only offered where Omarchy is installed. Their replies appear in that
 terminal rather than in the chat; `/attach` gives you the command to open it.
 

@@ -21,9 +21,9 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::{self, on_path};
-use crate::config;
 use crate::channel::photon_setup;
 use crate::channel::telegram_setup::{self, Wait};
+use crate::config;
 
 /// The whole flow, top to bottom. Steps that find their work already done
 /// say so and move on.
@@ -85,7 +85,7 @@ fn check_dependencies() {
         .collect();
     if found.is_empty() {
         println!("  ✗ no agent CLI found — the bridge has nothing to drive.");
-        println!("    Install one of: claude, codex, pi, opencode, copilot");
+        println!("    Install one of: claude, codex, pi, opencode, grok, copilot");
         if omarchy {
             println!("    e.g. omarchy-pkg-add claude-code");
         }
@@ -97,7 +97,7 @@ fn check_dependencies() {
     // there is nothing to report and nothing to install for it.
     if omarchy {
         if on_path("tmux") {
-            println!("  ✓ tmux (detached agents through omarchy-agent: omp, crush, grok)");
+            println!("  ✓ tmux (detached agents through omarchy-agent: omp, crush)");
         } else {
             println!("  · tmux missing — the detached agents need it: omarchy-pkg-add tmux");
         }
@@ -110,7 +110,6 @@ fn check_dependencies() {
     }
     println!();
 }
-
 
 // ---- telegram ----------------------------------------------------------
 
@@ -386,7 +385,9 @@ impl EnvFile {
 /// How to follow the service's log on this platform.
 pub(crate) fn log_command() -> String {
     if cfg!(target_os = "macos") {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         format!("tail -f {}", crate::launchd::log_path(&home).display())
     } else {
         "journalctl --user -fu omatether".to_string()

@@ -144,8 +144,14 @@ mod tests {
 
         let taken = load_into_env(&path).unwrap();
 
-        assert_eq!(std::env::var("OMATETHER_TEST_CONFIG_SET").unwrap(), "from-env");
-        assert_eq!(std::env::var("OMATETHER_TEST_CONFIG_NEW").unwrap(), "from-file");
+        assert_eq!(
+            std::env::var("OMATETHER_TEST_CONFIG_SET").unwrap(),
+            "from-env"
+        );
+        assert_eq!(
+            std::env::var("OMATETHER_TEST_CONFIG_NEW").unwrap(),
+            "from-file"
+        );
         assert_eq!(taken, vec!["OMATETHER_TEST_CONFIG_NEW".to_string()]);
         assert!(load_into_env(&dir.join("absent")).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();

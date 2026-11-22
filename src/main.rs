@@ -897,7 +897,9 @@ mod tests {
         let data = Path::new("/home/u/.local/share");
         // Homebrew: the bin/ symlink resolved into the Cellar.
         let brew = sidecar_candidates(
-            Some(Path::new("/opt/homebrew/Cellar/omatether/0.2.0/bin/omatether")),
+            Some(Path::new(
+                "/opt/homebrew/Cellar/omatether/0.2.0/bin/omatether",
+            )),
             data,
         );
         assert_eq!(

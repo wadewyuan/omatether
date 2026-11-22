@@ -596,16 +596,17 @@ impl Core {
              asked first."
                 .to_string()
         } else {
-            format!(
-                "Auto mode off. {}",
-                if agent::gates(&state.agent) {
-                    "Commands, edits and deletes will wait for Allow or Deny."
-                } else {
+            let detail = if agent::gates(&state.agent) {
+                "Commands, edits and deletes will wait for Allow or Deny.".to_string()
+            } else {
+                format!(
                     "This agent approves its own tools, though — the gate \
-                     only applies to claude, opencode and copilot. /agent \
-                     claude to get it back."
-                }
-            )
+                     only applies to {}. /agent \
+                     claude to get it back.",
+                    agent::gating_agents().join(", ")
+                )
+            };
+            format!("Auto mode off. {detail}")
         };
         self.say(key, &note)
     }
@@ -859,7 +860,7 @@ impl Core {
             "Take over at a terminal:\n\n  ssh {host} -t tmux attach -t {session}\n\n\
              That session exists only for detached agents ({}). For {} the \
              conversation lives in the agent's own store — resume it with its session id: {}",
-            "omp, crush, grok",
+            "omp, crush",
             state.agent,
             state.session_id.as_deref().unwrap_or("(none yet)")
         );
@@ -3361,7 +3362,11 @@ mod tests {
         assert_eq!(core.state(&key).unwrap().agent, before);
         let sent = channel.sent.lock().unwrap().clone();
         assert!(sent[0].starts_with("Unknown agent 'emacs'"), "{}", sent[0]);
-        assert!(sent[0].contains("claude"), "say what would work: {}", sent[0]);
+        assert!(
+            sent[0].contains("claude"),
+            "say what would work: {}",
+            sent[0]
+        );
     }
 
     #[tokio::test]

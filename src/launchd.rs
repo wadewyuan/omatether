@@ -27,7 +27,8 @@ use crate::setup::{same_file, Prompter, SETTLE};
 pub const LABEL: &str = "com.github.wadewyuan.omatether";
 
 pub fn plist_path(home: &Path) -> PathBuf {
-    home.join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
+    home.join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist"))
 }
 
 pub fn log_path(home: &Path) -> PathBuf {
@@ -141,9 +142,7 @@ pub fn plist_exe(text: &str) -> Option<PathBuf> {
 /// What `launchctl print` says about the job's process: `Some(pid)` while it
 /// runs.
 pub fn running_pid(print: &str) -> Option<u32> {
-    let running = print
-        .lines()
-        .any(|line| line.trim() == "state = running");
+    let running = print.lines().any(|line| line.trim() == "state = running");
     if !running {
         return None;
     }
@@ -267,8 +266,7 @@ fn write_plist(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    if let Some(dir) = log_path(Path::new(&std::env::var_os("HOME").unwrap_or_default())).parent()
-    {
+    if let Some(dir) = log_path(Path::new(&std::env::var_os("HOME").unwrap_or_default())).parent() {
         std::fs::create_dir_all(dir).ok();
     }
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
@@ -355,7 +353,10 @@ mod tests {
         let text = "<dict><key>Label</key><string>x</string>\
                     <key>Program</key><string>/usr/local/bin/omatether</string>\
                     <key>ProgramArguments</key><array><string>omatether</string></array></dict>";
-        assert_eq!(plist_exe(text), Some(PathBuf::from("/usr/local/bin/omatether")));
+        assert_eq!(
+            plist_exe(text),
+            Some(PathBuf::from("/usr/local/bin/omatether"))
+        );
         assert_eq!(plist_exe("<dict></dict>"), None);
     }
 

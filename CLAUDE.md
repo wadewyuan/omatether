@@ -199,14 +199,14 @@ twice. Vocabulary is confirmed against both a live run and pi's own
 `docs/json.md` (pi 0.84.4) — note there is **no** `turn_aborted` frame, despite
 it being an obvious guess.
 
-## ACP adapter (opencode, copilot)
+## ACP adapter (opencode, copilot, grok)
 
 `src/acp.rs` is one generic Agent Client Protocol client — JSON-RPC 2.0, one
-object per line, over the stdio of one long-lived `opencode acp` or `copilot
---acp`. Everything ACP leaves to the agent (how to launch it, how to make it
-ask, where the brief goes) is in `Profile`, and nothing else in that file
-knows which agent it is talking to. A third ACP agent is a `Profile` arm and
-a row in `AGENTS`.
+object per line, over the stdio of one long-lived `opencode acp`, `copilot
+--acp`, or `grok agent --no-leader stdio`. Everything ACP leaves to the agent
+(how to launch it, how to make it ask, where the brief goes) is in `Profile`,
+and nothing else in that file knows which agent it is talking to. Another ACP
+agent is a `Profile` arm and a row in `AGENTS`.
 
 **ACP carries the question; whether one is ever sent is the agent's own
 config.** opencode's default config allows everything, so out of the box no
@@ -220,9 +220,21 @@ copilot**, so test its gate with something that writes (`touch b.txt`).
 `COPILOT_ALLOW_ALL` is scrubbed so an inherited one cannot turn that off, and
 copilot's session reply carries an `allow_all` config option: one reported
 `on` is set `off` before the session is used, and a session that refuses does
-not start. Beyond that, **there is no handshake that confirms the gate** — ACP
-has no "you will ask me" in `initialize` — so it is confirmed by a live turn,
-not per spawn. Re-check it whenever either CLI moves.
+not start. Grok asks by default: with no mode set, `grok agent` starts in ask
+mode. Do not pass `--always-approve`, and do not set `_meta.yoloMode` or
+`autoMode` — either one answers the questions itself, and a session that never
+asks looks exactly like one with nothing to ask. Client fs and terminal
+capabilities stay off, so grok runs its own tools and the gate sees them.
+`configOptions` has no `allow_all`, so the copilot turn-off does not fire.
+`--no-leader` keeps the process off a desktop leader socket. Verified on grok
+1.0.92: a write raised `session/request_permission` with `kind: "edit"` and
+options `allow_once`, `allow_always`, `reject_once`. Beyond that, **there is
+no handshake that confirms the gate** — ACP has no "you will ask me" in
+`initialize` — so it is confirmed by a live turn, not per spawn. Re-check it
+whenever any of these CLIs moves. `STARTUP_TIMEOUT` is 30s. A warm
+`session/new` on that grok finished inside it; a cold one took about 50s once.
+If spawn fails with "did not answer session/new within 30s", that is the
+number to revisit.
 
 **Reject ends opencode's turn; copilot's carries on.** Answering a permission
 request with the `reject_once` option makes opencode stop and reply to
@@ -263,11 +275,21 @@ so in the chat, rather than leaving the thread unable to start.
 (`model not found: opencode/nope`; copilot: `not one of this session's
 models`). The older `models` / `session/set_model` shape is also read; copilot
 sends both shapes, and lists `auto` twice, hence the dedupe. The copilot
-account on this machine is offered only `auto`. `/model default` sets back the value
+account on this machine is offered only `auto`. Grok sends both shapes; the
+catalog prefers `configOptions` id `model`, and `session/set_config_option`
+takes the id as a string (`value: "grok-4.6"`), not `{"value": …}` — that
+object is Invalid params (`SessionConfigOptionValue`). Before a session
+exists, `/model` runs `grok models` and reads the `* ` / `- ` lines
+(`grok-4.7 (default)` loses the suffix). An unknown id comes back Invalid
+params, data `unknown model id`. `/model default` sets back the value
 the session reported before anyone asked — ACP has no unset. opencode remembers
-the model per session, so a resumed one starts on what it last ran.
+the model per session, so a resumed one starts on what it last ran. Grok's
+resume (`session/resume` with `sessionId`, `cwd`, `mcpServers`, no `_meta`)
+succeeded on 1.0.92 and did not replay the transcript; the reply carried
+`models` and `configOptions` again.
 
-**The brief is a file.** ACP has no system-prompt field. It is written under
+**The brief is a file for opencode and copilot.** ACP has no system-prompt
+field. It is written under
 `$XDG_STATE_HOME/omatether/brief/<sha256 prefix>/<agent>/` (0700/0600), and
 handed to opencode as an `instructions` entry and to copilot through
 `COPILOT_CUSTOM_INSTRUCTIONS_DIRS`. **For copilot the layout is the whole
@@ -275,9 +297,20 @@ trick, and listing is not loading.** An `AGENTS.md` in a custom dir shows up in
 `copilot instruction list` — as a "nested" instruction — and is then not
 applied; this file once said it worked on the strength of that listing. What
 copilot obeys is `.github/instructions/*.instructions.md` there, listed as a
-repository instruction. `cargo test -- --ignored live_brief` spawns both agents
-through this adapter with a brief that demands a marker word and checks the
-reply carries it; run it when either CLI moves.
+repository instruction. `cargo test -- --ignored live_brief` spawns opencode,
+copilot and grok through this adapter with a brief that demands a marker word
+and checks the reply carries it; run it when any of those CLIs moves.
+
+**Grok's brief is `_meta.rules` on `session/new` only.** It appends to the
+system prompt; `systemPromptOverride` replaces the prompt, so it is not used.
+Top-level `grok --rules` is accepted by clap and does not reach `grok agent
+stdio` (`grok agent --rules` and `grok agent stdio --rules` are unexpected
+arguments). `GROK_CONFIG` cannot carry rules or a permission mode, and writing
+`~/.grok/rules` or a `.grok/rules/` in the working tree would change every grok
+on the machine, including the desktop one. The field is not sent on
+`session/resume` or `session/load`: a session created with the rules keeps
+them, and the docs do not say `rules` applies on resume. Verified on grok
+1.0.92: a new session whose rules demanded the marker replied `PINEAPPLE`.
 
 Verified against opencode 2.3.2 and copilot 1.0.114 through `omatether repl`:
 a turn, a tool call allowed and denied, `/model`, resume across two processes;
@@ -287,9 +320,19 @@ the reply cites "the phone chat instructions" (read back from its store,
 `~/.local/share/opencode/opencode.db`, table `session_message` — opencode
 2.3.2 has no `export`). **Unverified:** copilot from a real chat thread, and
 `/model` switching on copilot (an account with more than `auto` is needed to
-see one succeed).
+see one succeed). Grok's protocol (ask-mode write, `_meta.rules`,
+`session/set_config_option` with a string model id, resume without replay)
+was checked by speaking ACP to grok 1.0.92 directly, and a one-shot
+`omatether repl --agent grok` completed a turn on that version (ready as
+`grok-4.7`, the reply was the word asked for, and the repl reported the
+gate). Grok also emits a run of `_x.ai/*` notifications during setup; they
+are `AgentEvent::Unknown`, which the core only `tracing::debug`s, so a chat
+stays quiet while the repl prints each one. **Unverified:** grok from a real
+chat thread, and the brief through this adapter's spawn — the repl passes no
+brief, so `_meta.rules` on that path is what `cargo test -- --ignored
+live_brief` checks.
 
-## Detached tier (the other three agents)
+## Detached tier (omp and crush)
 
 `omarchy-agent --inline` execs the agent directly instead of opening a terminal
 window, so it runs under tmux with no compositor. That is the whole trick. No
@@ -312,12 +355,13 @@ string. Verified, not assumed.
 
 **The tier exists only where Omarchy does.** omatether is not an Omarchy-only
 tool any more, and `omarchy-agent` is Omarchy's, so `agent::available` hides
-these three from `/agent`'s list and from the default-agent choice when it
+these two from `/agent`'s list and from the default-agent choice when it
 is not on `PATH`, and a spawn of one (a thread switched before Omarchy went
 away) fails saying so rather than "not found". Checked per call, like `~/Work`.
 Do not fix this by building their command lines here — see the next paragraph.
-The route off Omarchy for any of them is an ACP or JSON mode, which would move
-it up to a gated tier anyway.
+Grok used to sit on this tier and now does not: it is the ACP profile
+`grok agent --no-leader stdio`. That is the route off Omarchy for omp or crush
+too, and the only one — a second copy of their flags is the wrong thing to own.
 
 **No model can be passed through this tier.** `omarchy-agent` takes `--inline`,
 `--pick` and `--prompt`, exits on anything else, and holds each agent's own
@@ -904,7 +948,8 @@ worst kind of bug to find.
   final message arrives" clause, because elsewhere the narration streams in
   and saying otherwise would change how the agent writes, for no reason. The
   repl passes `None` and the tmux tier ignores it (it is read at a
-  terminal). Verified: claude (sonnet) obeys it with a clean env, haiku
+  terminal). Grok gets it as `_meta.rules` on `session/new` (see the ACP
+  section). Verified: claude (sonnet) obeys it with a clean env, haiku
   obeyed a weaker wording less reliably; codex 0.154 accepts the key under
   `--strict-config`, which rejects an unknown one; pi 0.85 accepts the flag,
   but whether it obeys is **unverified**, because its provider refused with
