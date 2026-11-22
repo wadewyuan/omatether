@@ -17,7 +17,9 @@ Type=simple
 # did — and an agent's model catalog comes out of its handshake, so the bridge
 # offered a model line that had since been superseded and there was nothing on
 # screen to say why. The shims track the version you actually update.
-Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin
+# ~/.opencode/bin is where OpenCode's installer puts the binary; a shell
+# profile is not read here, so without it the service cannot see `opencode`.
+Environment=PATH=%h/.local/share/mise/shims:%h/.opencode/bin:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin
 
 # Channel credentials. At least one channel must be configured:
 #   OMATETHER_TELEGRAM_TOKEN, OMATETHER_TELEGRAM_ALLOWED_USERS

@@ -453,7 +453,18 @@ async fn install_service(prompter: &mut Prompter) -> Result<()> {
             let text = std::fs::read_to_string(&user_unit).unwrap_or_default();
             match unit_exe(&text) {
                 Some(found) if same_file(&found, &exe) => {
-                    println!("  ✓ the user service is installed and runs this binary");
+                    // A unit we wrote earlier has this binary and an older
+                    // PATH. Add the directory rather than keeping the file
+                    // as a hand edit, which is how a new agent's install
+                    // location would never reach a machine that already ran
+                    // setup. Anything else on the line stays.
+                    if let Some(updated) = rewrite_unit_path(&text, "%h/.opencode/bin") {
+                        std::fs::write(&user_unit, updated)
+                            .with_context(|| format!("writing {}", user_unit.display()))?;
+                        println!("  ✓ added ~/.opencode/bin to the service PATH");
+                    } else {
+                        println!("  ✓ the user service is installed and runs this binary");
+                    }
                 }
                 found => {
                     let found = found.map_or("nothing".into(), |p| p.display().to_string());
@@ -585,6 +596,63 @@ async fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
         .await
 }
 
+/// Put `dir` on a service `PATH` if it is not already there.
+///
+/// After the mise shims, and before `~/.local/bin` when there are no shims.
+/// The shims track the version that gets updated; `~/.local/bin` is where a
+/// leftover symlink once hid a newer binary. Returns nothing when `dir` is
+/// already present, so a re-run does not rewrite the file.
+pub(crate) fn insert_path_dir(path: &str, dir: &str) -> Option<String> {
+    let dir = dir.trim_end_matches('/');
+    let present = path
+        .split(':')
+        .any(|entry| entry.trim_end_matches('/') == dir);
+    if present {
+        return None;
+    }
+    let mut dirs: Vec<&str> = path.split(':').collect();
+    let at = if let Some(i) = dirs.iter().position(|entry| entry.ends_with("mise/shims")) {
+        i + 1
+    } else if let Some(i) = dirs
+        .iter()
+        .position(|entry| entry.trim_end_matches('/').ends_with("/.local/bin"))
+    {
+        i
+    } else {
+        0
+    };
+    dirs.insert(at, dir);
+    Some(dirs.join(":"))
+}
+
+/// The `Environment=PATH=` line, with `dir` added. Nothing when the line is
+/// absent or `dir` is already on it.
+pub(crate) fn rewrite_unit_path(text: &str, dir: &str) -> Option<String> {
+    let prefix = "Environment=PATH=";
+    let line_at = text.find(prefix)?;
+    let value_at = line_at + prefix.len();
+    let end = text[value_at..]
+        .find('\n')
+        .map(|i| value_at + i)
+        .unwrap_or(text.len());
+    let updated = insert_path_dir(text[value_at..end].trim(), dir)?;
+    Some(format!("{}{updated}{}", &text[..value_at], &text[end..]))
+}
+
+/// The plist's `PATH` string, with `dir` added. Nothing when the key is
+/// absent or `dir` is already on it. Only that string changes.
+pub(crate) fn rewrite_plist_path(text: &str, dir: &str) -> Option<String> {
+    let key = "<key>PATH</key>";
+    let key_at = text.find(key)?;
+    let after_key = key_at + key.len();
+    let rel_open = text[after_key..].find("<string>")?;
+    let open = after_key + rel_open + "<string>".len();
+    let rel_close = text[open..].find("</string>")?;
+    let close = open + rel_close;
+    let updated = insert_path_dir(text[open..close].trim(), dir)?;
+    Some(format!("{}{updated}{}", &text[..open], &text[close..]))
+}
+
 /// Keep in step with contrib/omatether.service — that one is the packaged
 /// form (binary at /usr/bin), this one names the binary that is running the
 /// setup.
@@ -597,7 +665,7 @@ fn render_unit(exe: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin\n\
+         Environment=PATH=%h/.local/share/mise/shims:%h/.opencode/bin:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin\n\
          EnvironmentFile=%h/.config/omatether/env\n\
          ExecStart={} serve --dir %h\n\
          Restart=on-failure\n\
@@ -773,9 +841,43 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("Environment=PATH="))
             .expect("the unit sets PATH explicitly");
+        let shims = path.find("mise/shims").unwrap();
+        let opencode = path.find(".opencode/bin").unwrap();
+        let local = path.find("/.local/bin").unwrap();
         assert!(
-            path.find("mise/shims").unwrap() < path.find("/.local/bin").unwrap(),
-            "the shims track the version that gets updated: {path}"
+            shims < opencode && opencode < local,
+            "the shims track the version that gets updated, and OpenCode's \
+             installer directory comes before a leftover in ~/.local/bin: {path}"
         );
+    }
+
+    #[test]
+    fn an_existing_path_gains_opencode_without_losing_a_hand_added_dir() {
+        let old = "%h/.local/share/mise/shims:%h/.local/bin:/usr/bin:/opt/extra";
+        let updated = insert_path_dir(old, "%h/.opencode/bin").unwrap();
+        assert_eq!(
+            updated,
+            "%h/.local/share/mise/shims:%h/.opencode/bin:%h/.local/bin:/usr/bin:/opt/extra"
+        );
+        assert!(insert_path_dir(&updated, "%h/.opencode/bin").is_none());
+        // A trailing slash is the same directory.
+        assert!(insert_path_dir(&updated, "%h/.opencode/bin/").is_none());
+    }
+
+    #[test]
+    fn rewriting_a_unit_or_plist_touches_only_the_path() {
+        let unit =
+            "[Service]\nEnvironment=PATH=%h/.local/bin:/usr/bin\nExecStart=/usr/bin/omatether\n";
+        let updated = rewrite_unit_path(unit, "%h/.opencode/bin").unwrap();
+        assert!(updated.contains("Environment=PATH=%h/.opencode/bin:%h/.local/bin:/usr/bin\n"));
+        assert!(updated.contains("ExecStart=/usr/bin/omatether\n"));
+        assert!(rewrite_unit_path(&updated, "%h/.opencode/bin").is_none());
+
+        let plist = "<key>PATH</key>\n\t\t<string>/Users/a/.local/bin:/usr/bin</string>\n\t<key>RunAtLoad</key>";
+        let updated = rewrite_plist_path(plist, "/Users/a/.opencode/bin").unwrap();
+        assert!(updated
+            .contains("<string>/Users/a/.opencode/bin:/Users/a/.local/bin:/usr/bin</string>"));
+        assert!(updated.contains("<key>RunAtLoad</key>"));
+        assert!(rewrite_plist_path(&updated, "/Users/a/.opencode/bin").is_none());
     }
 }

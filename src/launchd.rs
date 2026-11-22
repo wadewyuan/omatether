@@ -39,11 +39,13 @@ pub fn log_path(home: &Path) -> PathBuf {
 /// with `/usr/bin:/bin:/usr/sbin:/sbin` and sources no shell profile, so it
 /// would find none of the agents. mise's shims first, for the reason the unit
 /// gives (an agent's own installer leaves an older copy in `~/.local/bin`);
-/// then Homebrew on Apple Silicon and on Intel, where `brew` puts `node`,
-/// `tailscale` and npm-installed agents.
+/// then `~/.opencode/bin`, which is the only place OpenCode's installer
+/// writes its binary; then Homebrew on Apple Silicon and on Intel, where
+/// `brew` puts `node`, `tailscale` and npm-installed agents.
 fn path_env(home: &Path) -> String {
     [
         home.join(".local/share/mise/shims").display().to_string(),
+        home.join(".opencode/bin").display().to_string(),
         home.join(".local/bin").display().to_string(),
         "/opt/homebrew/bin".to_string(),
         "/usr/local/bin".to_string(),
@@ -180,7 +182,21 @@ pub async fn install(prompter: &mut Prompter) -> Result<()> {
         }
         Ok(text) => match plist_exe(&text) {
             Some(found) if same_file(&found, &exe) => {
-                println!("  ✓ the LaunchAgent runs this binary (edited by hand; kept as it is)");
+                // Same as the systemd path: a plist we wrote earlier already
+                // runs this binary, and its PATH is the one that is stale.
+                // Adding the directory keeps every other hand edit.
+                let dir = home.join(".opencode/bin");
+                if let Some(updated) =
+                    crate::setup::rewrite_plist_path(&text, &dir.display().to_string())
+                {
+                    write_plist(&plist, &updated)?;
+                    println!("  ✓ added {} to the service PATH", dir.display());
+                    rewrote = true;
+                } else {
+                    println!(
+                        "  ✓ the LaunchAgent runs this binary (edited by hand; kept as it is)"
+                    );
+                }
             }
             found => {
                 let found = found.map_or("nothing".into(), |p| p.display().to_string());
@@ -333,9 +349,13 @@ mod tests {
         // The PATH the agents are found on, in the order that matters.
         let path = path_env(home);
         let mise = path.find("mise/shims").unwrap();
+        let opencode = path.find("/Users/someone/.opencode/bin").unwrap();
         let local = path.find("/Users/someone/.local/bin").unwrap();
         let brew = path.find("/opt/homebrew/bin").unwrap();
-        assert!(mise < local && local < brew, "{path}");
+        assert!(
+            mise < opencode && opencode < local && local < brew,
+            "{path}"
+        );
         // Credentials never go in here; serve reads the env file itself.
         assert!(!text.contains("OMATETHER_"), "{text}");
     }

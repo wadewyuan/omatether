@@ -9,7 +9,9 @@
 //! It also cannot gate tools. `--approve-for-me` routes approvals through an
 //! automatic review inside a workspace-write sandbox; there is no callback for
 //! a human. [`Agent::gates_tools`] reports false so the core can say so rather
-//! than leaving someone waiting for a prompt that will never come.
+//! than leaving someone waiting for a prompt that will never come. The flag
+//! has to precede `exec`: on 0.169 `exec resume` accepts only `--config` and
+//! `--json`, and the flag after `resume` is an unexpected argument.
 //!
 //! Event vocabulary confirmed against codex-cli 0.152.1: `thread.started`,
 //! `turn.started`, `turn.completed`, `turn.failed`, `item.started`,
@@ -107,25 +109,13 @@ impl Agent for CodexSession {
         let resume = self.thread_id.lock().await.clone();
 
         let mut command = Command::new("codex");
-        command.arg("exec");
-        // `resume <id> <prompt>` continues the conversation; a bare `exec
-        // <prompt>` starts one.
-        if let Some(id) = &resume {
-            command.arg("resume").arg(id);
-        }
-        if let Some(model) = &self.model {
-            command.args(["-m", model]);
-        }
-        // Every turn is its own process, so every turn is told.
-        if let Some(brief) = &self.brief {
-            command.args(["-c", &developer_instructions(brief)]);
-        }
         command
-            .arg("--json")
-            // The only non-interactive approval mode there is.
-            .arg("--approve-for-me")
-            .arg("--")
-            .arg(text)
+            .args(exec_args(
+                resume.as_deref(),
+                self.model.as_deref(),
+                self.brief.as_deref(),
+                text,
+            ))
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -269,6 +259,43 @@ pub async fn list_models(cwd: &Path) -> Result<Vec<String>> {
     }
 
     parse_model_catalog(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Arguments for one `codex exec` turn.
+///
+/// `--approve-for-me` and `-m` go before `exec`. Codex copies those root
+/// flags into the exec session. `exec resume` does not take them: on 0.169
+/// its usage is `codex exec resume --config <key=value> --json <SESSION_ID>
+/// [PROMPT]`, and `--approve-for-me` after `resume` exits before a turn
+/// starts. `--config` and `--json` are the two flags that usage still allows
+/// there, so the brief and the JSON stream stay after `resume`.
+fn exec_args(
+    resume: Option<&str>,
+    model: Option<&str>,
+    brief: Option<&str>,
+    text: &str,
+) -> Vec<String> {
+    let mut args = vec!["--approve-for-me".to_string()];
+    if let Some(model) = model {
+        args.push("-m".into());
+        args.push(model.into());
+    }
+    args.push("exec".into());
+    // `resume <id> <prompt>` continues the conversation; a bare `exec
+    // <prompt>` starts one.
+    if let Some(id) = resume {
+        args.push("resume".into());
+        args.push(id.into());
+    }
+    // Every turn is its own process, so every turn is told.
+    if let Some(brief) = brief {
+        args.push("-c".into());
+        args.push(developer_instructions(brief));
+    }
+    args.push("--json".into());
+    args.push("--".into());
+    args.push(text.into());
+    args
 }
 
 /// The `-c` override that tells codex something on top of its own prompt.
@@ -439,6 +466,26 @@ async fn log_stderr(stderr: tokio::process::ChildStderr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approve_for_me_stays_in_front_of_resume() {
+        let args = exec_args(Some("thread-1"), Some("gpt"), Some("be brief"), "hi");
+        let at = |flag: &str| args.iter().position(|arg| arg == flag).unwrap();
+        assert!(at("--approve-for-me") < at("exec"));
+        assert!(at("-m") < at("exec"));
+        assert!(at("exec") < at("resume"));
+        assert_eq!(args[at("resume") + 1], "thread-1");
+        assert!(at("resume") < at("-c"));
+        assert!(at("-c") < at("--json"));
+        assert_eq!(args.last().map(String::as_str), Some("hi"));
+    }
+
+    #[test]
+    fn a_new_turn_has_no_resume() {
+        let args = exec_args(None, None, None, "hi");
+        assert!(!args.iter().any(|arg| arg == "resume"));
+        assert!(args.starts_with(&["--approve-for-me".into(), "exec".into()]));
+    }
 
     #[test]
     fn instructions_are_passed_as_a_quoted_toml_string() {
