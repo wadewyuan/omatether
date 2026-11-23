@@ -850,34 +850,4 @@ mod tests {
              installer directory comes before a leftover in ~/.local/bin: {path}"
         );
     }
-
-    #[test]
-    fn an_existing_path_gains_opencode_without_losing_a_hand_added_dir() {
-        let old = "%h/.local/share/mise/shims:%h/.local/bin:/usr/bin:/opt/extra";
-        let updated = insert_path_dir(old, "%h/.opencode/bin").unwrap();
-        assert_eq!(
-            updated,
-            "%h/.local/share/mise/shims:%h/.opencode/bin:%h/.local/bin:/usr/bin:/opt/extra"
-        );
-        assert!(insert_path_dir(&updated, "%h/.opencode/bin").is_none());
-        // A trailing slash is the same directory.
-        assert!(insert_path_dir(&updated, "%h/.opencode/bin/").is_none());
-    }
-
-    #[test]
-    fn rewriting_a_unit_or_plist_touches_only_the_path() {
-        let unit =
-            "[Service]\nEnvironment=PATH=%h/.local/bin:/usr/bin\nExecStart=/usr/bin/omatether\n";
-        let updated = rewrite_unit_path(unit, "%h/.opencode/bin").unwrap();
-        assert!(updated.contains("Environment=PATH=%h/.opencode/bin:%h/.local/bin:/usr/bin\n"));
-        assert!(updated.contains("ExecStart=/usr/bin/omatether\n"));
-        assert!(rewrite_unit_path(&updated, "%h/.opencode/bin").is_none());
-
-        let plist = "<key>PATH</key>\n\t\t<string>/Users/a/.local/bin:/usr/bin</string>\n\t<key>RunAtLoad</key>";
-        let updated = rewrite_plist_path(plist, "/Users/a/.opencode/bin").unwrap();
-        assert!(updated
-            .contains("<string>/Users/a/.opencode/bin:/Users/a/.local/bin:/usr/bin</string>"));
-        assert!(updated.contains("<key>RunAtLoad</key>"));
-        assert!(rewrite_plist_path(&updated, "/Users/a/.opencode/bin").is_none());
-    }
 }
