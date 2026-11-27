@@ -88,6 +88,8 @@ message rather than being cut.
 |---|---|
 | `/new` | Fresh session, starting in `~/Work` (or `OMATETHER_WORK_DIR`) if it exists |
 | `/stop` | Interrupt the running turn |
+| `/task` | The next message starts another task alongside this one |
+| `/tasks` | List tasks. Tap one in Telegram, or reply with its number |
 | `/cd <path>` | Change the working directory (starts a fresh session) |
 | `/agent <name>` | Switch agent: claude, codex, pi, opencode, copilot, omp, crush, grok |
 | `/model [name]` | List models, or switch without losing the conversation |
@@ -98,6 +100,14 @@ message rather than being cut.
 | `/auto [on\|off]` | Whether tool calls run without asking. **On by default** |
 | `/allow`, `/deny <why>` | Answer a permission question |
 | `/help` | This list |
+
+A chat can run more than one task. `/task`, then the next message, starts
+another and names it from that message; `/task` again cancels. The task you
+are in gets ordinary replies. `/tasks` lists them. `/new` still throws the
+current task's conversation away. Once there are two, every reply starts with
+its task's number and name, e.g. `[2] login timeout`. On iMessage, replying to
+a task's message (swipe it, or tap and hold, then Reply) sends your message to
+that task and switches to it.
 
 Anything else goes to the agent as typed, including its own slash commands,
 so `/review` works.

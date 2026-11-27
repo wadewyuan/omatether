@@ -46,6 +46,42 @@ pub struct Photon {
     /// Where the sidecar writes received files. Held so a path it reports can
     /// be checked against it — see [`Self::fetch_files`].
     inbox_dir: PathBuf,
+    /// Which task sent each recent message, so a swipe-reply can go back to it.
+    sent: std::sync::Mutex<SentIndex>,
+}
+
+/// How many sent messages a reply can still find its way back from.
+///
+/// Memory only. After a restart a reply to an older message goes to the task
+/// in focus, which is what every reply did before this existed. A day of
+/// heavy use is a few hundred messages; this is several days of it.
+const SENT_REMEMBERED: usize = 4096;
+
+/// Message id → the task that sent it, oldest dropped first.
+#[derive(Default)]
+struct SentIndex {
+    by_id: std::collections::HashMap<String, ThreadKey>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl SentIndex {
+    fn record(&mut self, id: &str, thread: &ThreadKey) {
+        if id.is_empty() {
+            return;
+        }
+        if self.by_id.insert(id.to_string(), thread.clone()).is_none() {
+            self.order.push_back(id.to_string());
+        }
+        while self.order.len() > SENT_REMEMBERED {
+            if let Some(old) = self.order.pop_front() {
+                self.by_id.remove(&old);
+            }
+        }
+    }
+
+    fn task_of(&self, id: &str) -> Option<ThreadKey> {
+        self.by_id.get(id).cloned()
+    }
 }
 
 pub struct Config {
@@ -127,6 +163,7 @@ impl Photon {
             _child: child,
             allowed_users: config.allowed_users,
             inbox_dir: config.inbox_dir,
+            sent: Default::default(),
         })
     }
 
@@ -184,6 +221,22 @@ impl Photon {
             let Some((mut inbound, wanted)) = parse_event(&self.allowed_users, &event, seen) else {
                 continue;
             };
+
+            // A swipe-reply to one of ours names the task that sent it. Only a
+            // task of this same chat: an id is not a credential, and a reply
+            // must never reach into someone else's conversation.
+            if let Some(target) = event.get("replyTo").and_then(Value::as_str) {
+                let task = self.sent.lock().expect("sent index").task_of(target);
+                match task {
+                    Some(task) if task.same_chat(&inbound.thread) => {
+                        inbound.replying_to = Some(task);
+                    }
+                    _ => tracing::debug!(
+                        thread = %inbound.thread,
+                        "reply to a message this run did not send"
+                    ),
+                }
+            }
 
             // Only now — past the allowlist — are the bytes asked for. The
             // sidecar announces a file without reading it, so a stranger's
@@ -338,11 +391,13 @@ impl Photon {
             );
         }
 
-        Ok(response
+        let id = response
             .get("messageId")
             .and_then(Value::as_str)
             .unwrap_or_default()
-            .to_string())
+            .to_string();
+        self.sent.lock().expect("sent index").record(&id, thread);
+        Ok(id)
     }
 }
 
@@ -358,6 +413,12 @@ impl Channel for Photon {
     }
 
     fn can_send_files(&self) -> bool {
+        true
+    }
+
+    /// A swipe-reply carries the id of the message it answers, and
+    /// [`SentIndex`] knows which task sent that one.
+    fn routes_replies(&self) -> bool {
         true
     }
 
@@ -392,11 +453,20 @@ impl Channel for Photon {
             );
         }
 
-        Ok(response
-            .get("messageId")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string())
+        let id_of = |field: &str| {
+            response
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (id, caption_id) = (id_of("messageId"), id_of("captionId"));
+        {
+            let mut sent = self.sent.lock().expect("sent index");
+            sent.record(&id, thread);
+            sent.record(&caption_id, thread);
+        }
+        Ok(id)
     }
 
     /// A turn is markdown, because the agents write markdown. iMessage has no
@@ -606,6 +676,7 @@ fn parse_event(
         channel: CHANNEL,
         chat_id: space_id.to_string(),
         topic_id: None,
+        task_id: None,
     };
 
     let text = event
@@ -637,6 +708,7 @@ fn parse_event(
         tracing::info!(thread = %thread, "message with nothing to act on");
         return Some((
             Inbound {
+                replying_to: None,
                 thread,
                 user_id: sender,
                 kind: InboundKind::Unsupported(
@@ -665,6 +737,7 @@ fn parse_event(
 
     Some((
         Inbound {
+            replying_to: None,
             thread,
             user_id: sender,
             kind: InboundKind::Text {
@@ -877,6 +950,33 @@ mod tests {
         assert!(port > 1024, "must be an unprivileged port, got {port}");
         // Bindable, which is the whole point of asking.
         std::net::TcpListener::bind(("127.0.0.1", port)).expect("port should be free");
+    }
+
+    #[test]
+    fn a_sent_message_remembers_its_task_and_old_ones_are_forgotten() {
+        let chat = ThreadKey {
+            channel: CHANNEL,
+            chat_id: "any;-;+15551234567".into(),
+            topic_id: None,
+            task_id: None,
+        };
+        let task = chat.with_task(Some("t1".into()));
+        let mut sent = SentIndex::default();
+        sent.record("", &task);
+        assert!(sent.by_id.is_empty(), "no id, nothing to find it by");
+
+        sent.record("guid-a", &task);
+        sent.record("guid-b", &chat);
+        assert_eq!(sent.task_of("guid-a"), Some(task.clone()));
+        assert_eq!(sent.task_of("guid-b"), Some(chat.clone()));
+        assert_eq!(sent.task_of("guid-unknown"), None);
+
+        for n in 0..SENT_REMEMBERED {
+            sent.record(&format!("filler-{n}"), &chat);
+        }
+        assert_eq!(sent.task_of("guid-a"), None, "the oldest goes first");
+        assert_eq!(sent.order.len(), SENT_REMEMBERED);
+        assert_eq!(sent.by_id.len(), SENT_REMEMBERED);
     }
 
     #[test]

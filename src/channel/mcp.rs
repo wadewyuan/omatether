@@ -515,6 +515,7 @@ impl Mcp {
         }
 
         let message = Inbound {
+            replying_to: None,
             thread: key.clone(),
             user_id: format!("key {} ({} on {})", caller.key, caller.login, caller.node),
             kind: InboundKind::Text {
@@ -1115,6 +1116,7 @@ fn thread_key(caller: &Caller, session: &str) -> ThreadKey {
         channel: NAME,
         chat_id: caller.key.clone(),
         topic_id: Some(session.to_string()),
+        task_id: None,
     }
 }
 

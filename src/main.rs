@@ -856,10 +856,13 @@ async fn handle_input(
         }
 
         // Thread concepts; the repl drives one session in one place.
+        // Tasks are several conversations in one chat, which the repl is not.
         command::Command::New
         | command::Command::Cd(_)
         | command::Command::Agent(_)
         | command::Command::Attach
+        | command::Command::Task
+        | command::Command::Tasks
         // The repl has no chat to send a file to.
         | command::Command::Send(_)
         // The repl prints every tool call as it happens; there is nothing

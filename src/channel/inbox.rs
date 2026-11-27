@@ -157,6 +157,7 @@ mod tests {
             channel: "telegram",
             chat_id: "5".into(),
             topic_id: None,
+            task_id: None,
         }
     }
 

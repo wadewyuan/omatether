@@ -18,7 +18,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::{inbox, markup, Attachment, Channel, Inbound, InboundKind, MessageId, ThreadKey};
+use super::{
+    inbox, markup, Attachment, Channel, Inbound, InboundKind, MessageId, TaskPick, ThreadKey,
+};
 
 pub const CHANNEL: &str = "telegram";
 
@@ -37,6 +39,10 @@ const POLL_TIMEOUT_SECS: u64 = 25;
 /// them.
 const CB_ALLOW: &str = "allow";
 const CB_DENY: &str = "deny";
+/// A tap on "New task". No colon: it names no question.
+const CB_NEW: &str = "new";
+/// `use:<task>`, or `use:` for the original conversation.
+const CB_USE: &str = "use";
 
 pub struct Telegram {
     http: reqwest::Client,
@@ -258,9 +264,11 @@ impl Telegram {
     /// letters, digits and underscores, so none carry the leading slash and
     /// none carry arguments.
     pub async fn set_commands(&self) -> Result<()> {
-        const COMMANDS: [(&str, &str); 13] = [
+        const COMMANDS: [(&str, &str); 15] = [
             ("new", "start a fresh session in this thread"),
             ("stop", "interrupt the running turn"),
+            ("task", "next message starts another task"),
+            ("tasks", "list tasks and switch"),
             ("cd", "set the working directory"),
             ("agent", "switch agent (claude, codex, pi, ...)"),
             ("model", "which model the agent runs"),
@@ -422,28 +430,56 @@ impl Telegram {
                 return None;
             }
 
-            // Anything without a question token is from a build that predates
-            // them. Dropping it is the safe direction: the alternative is
-            // applying it to whatever is pending now.
-            let (verb, question) = callback
-                .get("data")
-                .and_then(Value::as_str)?
-                .split_once(':')?;
-            let allow = match verb {
-                CB_ALLOW => true,
-                CB_DENY => false,
+            let data = callback.get("data").and_then(Value::as_str)?;
+            let ack = callback.get("id").and_then(Value::as_str)?.to_string();
+            let thread = thread_key(callback.get("message")?)?;
+
+            // "New task" carries no question, so it has no colon. Anything
+            // else without one is from a build that predates question tokens.
+            // Dropping that is the safe direction: the alternative is applying
+            // an old tap to whatever is pending now.
+            if data == CB_NEW {
+                return Some((
+                    Inbound {
+                        replying_to: None,
+                        thread,
+                        user_id,
+                        kind: InboundKind::Pick {
+                            pick: TaskPick::New,
+                            ack,
+                        },
+                    },
+                    Vec::new(),
+                ));
+            }
+
+            let (verb, rest) = data.split_once(':')?;
+            let kind = match verb {
+                CB_ALLOW => InboundKind::Decision {
+                    allow: true,
+                    ack,
+                    question: rest.to_string(),
+                },
+                CB_DENY => InboundKind::Decision {
+                    allow: false,
+                    ack,
+                    question: rest.to_string(),
+                },
+                // `use:` with nothing after it is the original conversation.
+                // A task id is `tN` and never contains a colon.
+                CB_USE => InboundKind::Pick {
+                    pick: TaskPick::Use((!rest.is_empty()).then(|| rest.to_string())),
+                    ack,
+                },
                 _ => return None,
             };
 
             return Some((
                 Inbound {
-                    thread: thread_key(callback.get("message")?)?,
+                    replying_to: None,
+                    thread,
                     user_id,
-                    kind: InboundKind::Decision {
-                        allow,
-                        ack: callback.get("id").and_then(Value::as_str)?.to_string(),
-                        question: question.to_string(),
-                    },
+                    kind,
                 },
                 Vec::new(),
             ));
@@ -484,6 +520,7 @@ impl Telegram {
             tracing::info!(thread = %thread, "message with nothing to act on");
             return Some((
                 Inbound {
+                    replying_to: None,
                     thread,
                     user_id,
                     kind: InboundKind::Unsupported(
@@ -498,6 +535,7 @@ impl Telegram {
 
         Some((
             Inbound {
+                replying_to: None,
                 thread,
                 user_id,
                 // Filled in by the caller once the bytes are down.
@@ -646,6 +684,33 @@ impl Channel for Telegram {
             Err(e) if e.to_string().contains("message is not modified") => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn offers_choices(&self) -> bool {
+        true
+    }
+
+    /// The list under a message: one button per row, plus whatever else the
+    /// core asked for. The text is rendered like any other note — a task name
+    /// taken from someone's message can contain `_` — and the buttons carry
+    /// the token that comes back as a tap.
+    async fn offer(
+        &self,
+        thread: &ThreadKey,
+        text: &str,
+        choices: &[(String, String)],
+    ) -> Result<MessageId> {
+        if choices.is_empty() {
+            return self.send(thread, text).await;
+        }
+        let mut body = self.target(thread);
+        body["reply_markup"] = json!({ "inline_keyboard": keyboard(choices) });
+        let result = self.call_rendered("sendMessage", body, &clip(text)).await?;
+        Ok(result
+            .get("message_id")
+            .and_then(Value::as_i64)
+            .map(|id| id.to_string())
+            .unwrap_or_default())
     }
 
     /// **Sent unformatted**, and deliberately not through [`Self::call_rendered`].
@@ -1006,7 +1071,28 @@ fn thread_key(message: &Value) -> Option<ThreadKey> {
         channel: CHANNEL,
         chat_id: chat_id.to_string(),
         topic_id,
+        task_id: None,
     })
+}
+
+/// One button per row. Telegram stops at 64 characters of label, and a label
+/// it rejects takes the whole message with it, so a long task name is cut
+/// here rather than at the API.
+fn keyboard(choices: &[(String, String)]) -> Value {
+    choices
+        .iter()
+        .map(|(label, data)| json!([{ "text": button_label(label), "callback_data": data }]))
+        .collect()
+}
+
+fn button_label(label: &str) -> String {
+    const MAX: usize = 64;
+    if label.chars().count() <= MAX {
+        return label.to_string();
+    }
+    let mut cut: String = label.chars().take(MAX - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// Insurance, not the way a long turn is handled. The core pages a turn into
@@ -1342,6 +1428,62 @@ mod tests {
     }
 
     #[test]
+    fn a_task_is_not_sent_as_a_forum_topic() {
+        // `message_thread_id` is a real topic. A task id in that field is a
+        // message Telegram cannot deliver.
+        let tg = telegram();
+        let task = ThreadKey {
+            channel: CHANNEL,
+            chat_id: "5".into(),
+            topic_id: None,
+            task_id: Some("t1".into()),
+        };
+        let body = tg.target(&task);
+        assert!(body.get("message_thread_id").is_none(), "{body}");
+        assert_eq!(body["chat_id"], "5");
+
+        let in_topic = ThreadKey {
+            topic_id: Some("77".into()),
+            task_id: Some("t2".into()),
+            ..task
+        };
+        let body = tg.target(&in_topic);
+        assert_eq!(body["message_thread_id"], 77);
+    }
+
+    #[test]
+    fn task_buttons_round_trip_as_picks() {
+        let rows = keyboard(&[
+            ("1. main — waiting".into(), "use:".into()),
+            ("2. login timeout — running".into(), "use:t1".into()),
+            ("New task".into(), "new".into()),
+        ]);
+        for row in rows.as_array().unwrap() {
+            let data = row[0]["callback_data"].as_str().unwrap();
+            assert!(data.len() <= 64, "{data}");
+            let update = json!({
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cb-1", "from": { "id": 42 }, "data": data,
+                    "message": { "chat": { "id": 5 } }
+                }
+            });
+            match parse(&telegram(), &update).unwrap().0.kind {
+                InboundKind::Pick { pick, ack } => {
+                    assert_eq!(ack, "cb-1");
+                    match data {
+                        "use:" => assert_eq!(pick, TaskPick::Use(None)),
+                        "use:t1" => assert_eq!(pick, TaskPick::Use(Some("t1".into()))),
+                        "new" => assert_eq!(pick, TaskPick::New),
+                        other => panic!("unexpected {other}"),
+                    }
+                }
+                other => panic!("expected a pick, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn a_tap_with_no_question_token_is_dropped() {
         // A button from a build that predates question tokens. Dropping it is
         // the safe direction — the alternative is applying someone's old tap to
@@ -1512,6 +1654,7 @@ mod tests {
             channel: CHANNEL,
             chat_id: "0".to_string(),
             topic_id: None,
+            task_id: None,
         };
         let error = live
             .send_file(&thread, &path, "a caption")
