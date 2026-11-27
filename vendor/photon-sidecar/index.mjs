@@ -6,9 +6,10 @@
 //
 //   GET  /inbound  -> NDJSON stream, one normalized inbound message per line
 //                     (`text` may be empty — a sticker, or an image whose words
-//                     are all in `files`)
+//                     are all in `files`; `replyTo` is the GUID of the message
+//                     a swipe-reply points at, or null)
 //   POST /send     -> { spaceId, text, format? } -> { ok, messageId }
-//   POST /send-file -> { spaceId, path, caption? } -> { ok, messageId }
+//   POST /send-file -> { spaceId, path, caption? } -> { ok, messageId, captionId }
 //   POST /typing   -> { spaceId, state? }          -> { ok }
 //   POST /fetch    -> { messageId }                -> { ok, files: [...] }
 //                     downloads that message's attachments to the inbox; asked
@@ -176,10 +177,43 @@ async function saveAttachment(spaceId, part) {
   };
 }
 
+/**
+ * The message a reply points at, as the bare GUID `/send` hands back for the
+ * messages we send — which is what omatether matches it against.
+ *
+ * A part of a multi-part message is addressed `p:<n>/<guid>`; the task that
+ * sent it is the same whichever part was swiped, so the part is dropped.
+ */
+function baseGuid(id) {
+  if (typeof id !== "string" || !id) return null;
+  return id.replace(/^p:\d+\//, "");
+}
+
+/**
+ * A swipe-reply arrives as `{type:"reply", content, target}` — the words are
+ * one level down. Reading `part.text` off the wrapper found nothing, so a
+ * reply used to reach omatether as an empty message and got "There is
+ * nothing in that I can pass on". Read out of `@spectrum-ts/imessage`'s
+ * inbound builder (`asProviderReply`), not guessed.
+ */
+function unwrapReply(content) {
+  if (content && !Array.isArray(content) && typeof content === "object" && content.type === "reply") {
+    return { content: content.content, replyTo: baseGuid(content.target?.id) };
+  }
+  return { content, replyTo: null };
+}
+
 /** What omatether is told about a message. Metadata only — see `pending`. */
 function normalize(space, message) {
   const spaceId = space?.id ?? message?.space?.id ?? null;
-  const content = parts(message?.content);
+  const { content: inner, replyTo } = unwrapReply(message?.content);
+  // A reply can wrap a group (words and a photo sent together). Flattened so
+  // both halves are read, the same as an unwrapped message's parts.
+  const content =
+    inner && typeof inner === "object" && !Array.isArray(inner) && inner.type === "group"
+      ? (inner.items ?? []).flatMap((item) => parts(item?.content ?? item))
+      : parts(inner);
+  if (replyTo) console.error(`photon-sidecar: message ${message?.id ?? "?"} replies to ${replyTo}`);
 
   const text = content
     .map((part) => (part?.type === "attachment" ? "" : (part?.text ?? "")))
@@ -193,6 +227,9 @@ function normalize(space, message) {
     spaceId,
     spaceType: space?.type ?? "dm",
     senderId: message?.sender?.id ?? space?.phone ?? null,
+    // The message this one was sent as a reply to, or null. omatether maps it
+    // back to the task that sent it.
+    replyTo,
     text: (text || "").trim(),
     files: attachments.map((part) => ({
       name: part?.name ?? "attachment",
@@ -352,8 +389,13 @@ const server = http.createServer(async (req, res) => {
       }
       const space = await resolveSpace(spaceId);
       const result = await space.send(spectrumAttachment(filePath));
-      if (caption) await sendAs(space, caption, "text");
-      return reply(res, 200, { ok: true, messageId: result?.id ?? null });
+      const captioned = caption ? await sendAs(space, caption, "text") : null;
+      // Both ids: a reply to either one is a reply to the task that sent them.
+      return reply(res, 200, {
+        ok: true,
+        messageId: result?.id ?? null,
+        captionId: captioned?.id ?? null,
+      });
     }
 
     // `state` defaults to "start" so an older caller keeps working, and

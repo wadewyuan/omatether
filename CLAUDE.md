@@ -599,6 +599,20 @@ it from a phone. The renderer also refuses text that renders to nothing at all
 falls back to plain text on that one error — it is raised before anything is
 sent, so the fallback cannot double-send.
 
+**A swipe-reply is `{type:"reply", content, target}`, and it used to lose its
+words.** The sidecar read `part.text` off the wrapper, found nothing, and the
+reply reached the core as an empty message. It is unwrapped now (read out of
+`@spectrum-ts/imessage`'s inbound builder, 12.7.0), and `target.id` goes to
+Rust as `replyTo`, with any `p:<n>/` part prefix dropped. That id is the same
+GUID `/send` returns, so `SentIndex` in `photon.rs` maps it back to the task
+that sent it, and the core focuses that task (`Core::follow_reply`). It is
+memory only, so after a restart a reply to an older message goes to the task
+in focus. **Unverified:** a real swipe-reply from a phone. The sidecar logs
+`message … replies to <guid>` for each one; that GUID should match a
+`messageId` that `/send` returned. If iMessage reports the thread's *root*
+instead (`threadOriginatorGuid` is the SDK's fallback), a reply inside a
+thread that the person started will find nothing and goes to the focused task.
+
 **A textless message was dropped twice over.** The sidecar only broadcast events
 with a non-empty `text`, and `parse_event` dropped them again, so a voice note
 or a bare image vanished with nothing in the chat and nothing in the log — the

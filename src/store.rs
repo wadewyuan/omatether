@@ -50,6 +50,10 @@ pub struct ThreadState {
     /// because it looks like review. `/auto off` puts the gate back, per
     /// thread, and `/status` always says which world this thread is in.
     pub auto: bool,
+    /// The name shown for this task, taken from the first line of its first
+    /// message. The original conversation has none and is called "main" once
+    /// a chat has more than one.
+    pub title: Option<String>,
 }
 
 pub struct Store {
@@ -143,7 +147,12 @@ impl Store {
                  agent      TEXT NOT NULL DEFAULT 'claude',
                  auto       INTEGER NOT NULL DEFAULT 1,
                  model      TEXT,
-                 requested_model TEXT
+                 requested_model TEXT,
+                 title      TEXT
+             );
+             CREATE TABLE focus (
+                 chat    TEXT PRIMARY KEY,
+                 task_id TEXT NOT NULL
              );",
         )?;
         Ok(Self { conn })
@@ -172,6 +181,7 @@ impl Store {
             // has never run /model means by not having run it.
             requested_model: None,
             auto: true,
+            title: None,
         };
         self.put(&state)?;
         Ok(state)
@@ -181,7 +191,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT session_id, cwd, agent, auto, model, requested_model
+                "SELECT session_id, cwd, agent, auto, model, requested_model, title
                  FROM threads WHERE key = ?1",
                 [key],
                 |row| {
@@ -194,6 +204,7 @@ impl Store {
                         auto: auto != 0,
                         model: row.get(4)?,
                         requested_model: row.get(5)?,
+                        title: row.get(6)?,
                     })
                 },
             )
@@ -210,8 +221,8 @@ impl Store {
 
         self.conn.execute(
             "INSERT INTO threads
-                 (key, session_id, cwd, updated_at, agent, auto, model, requested_model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 (key, session_id, cwd, updated_at, agent, auto, model, requested_model, title)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(key) DO UPDATE SET
                  session_id = excluded.session_id,
                  cwd        = excluded.cwd,
@@ -219,7 +230,8 @@ impl Store {
                  agent      = excluded.agent,
                  auto       = excluded.auto,
                  model      = excluded.model,
-                 requested_model = excluded.requested_model",
+                 requested_model = excluded.requested_model,
+                 title      = excluded.title",
             rusqlite::params![
                 state.key,
                 state.session_id,
@@ -228,10 +240,58 @@ impl Store {
                 state.agent,
                 state.auto as i64,
                 state.model,
-                state.requested_model
+                state.requested_model,
+                state.title
             ],
         )?;
         Ok(())
+    }
+
+    /// Which task this chat is in. Absent means the original conversation.
+    pub fn focus(&self, chat: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT task_id FROM focus WHERE chat = ?1", [chat], |row| {
+                row.get(0)
+            })
+            .optional()
+            .context("reading which task a chat is in")
+    }
+
+    /// Remember which task this chat is in. `None` returns it to the original
+    /// conversation.
+    pub fn set_focus(&self, chat: &str, task_id: Option<&str>) -> Result<()> {
+        match task_id {
+            Some(id) => {
+                self.conn.execute(
+                    "INSERT INTO focus (chat, task_id) VALUES (?1, ?2)
+                     ON CONFLICT(chat) DO UPDATE SET task_id = excluded.task_id",
+                    [chat, id],
+                )?;
+            }
+            None => {
+                self.conn
+                    .execute("DELETE FROM focus WHERE chat = ?1", [chat])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Thread keys that belong to one chat: the chat itself, and its tasks.
+    ///
+    /// Matched exactly or on a `#` suffix. A prefix would treat `telegram:1`
+    /// as the owner of `telegram:12`.
+    pub fn thread_keys(&self, chat: &str) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare("SELECT key FROM threads")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        let prefix = format!("{chat}#");
+        let mut keys = Vec::new();
+        for row in rows {
+            let key: String = row?;
+            if key == chat || key.starts_with(&prefix) {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
     }
 }
 
@@ -270,6 +330,20 @@ fn migrate(conn: &Connection) -> Result<()> {
     conn.execute("ALTER TABLE threads ADD COLUMN requested_model TEXT", [])
         .ok();
 
+    // A task's display name. Nullable with no default: a thread that predates
+    // tasks has no name of its own, and the chat calls that one "main".
+    conn.execute("ALTER TABLE threads ADD COLUMN title TEXT", [])
+        .ok();
+
+    // Which task a chat is reading. One row per chat, absent for the original
+    // conversation. Created rather than altered: nothing older has it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS focus (
+             chat    TEXT PRIMARY KEY,
+             task_id TEXT NOT NULL
+         );",
+    )?;
+
     // `session_id` began as NOT NULL, back when omatether chose the id
     // itself. Codex assigns its own on the first turn, so a thread now starts
     // without one — and SQLite cannot drop a NOT NULL in place, which means a
@@ -287,12 +361,13 @@ fn migrate(conn: &Connection) -> Result<()> {
                  agent      TEXT NOT NULL DEFAULT 'claude',
                  auto       INTEGER NOT NULL DEFAULT 1,
                  model      TEXT,
-                 requested_model TEXT
+                 requested_model TEXT,
+                 title      TEXT
              );
              INSERT INTO threads_migrated
-                 (key, session_id, cwd, updated_at, agent, auto, model, requested_model)
+                 (key, session_id, cwd, updated_at, agent, auto, model, requested_model, title)
                  SELECT key, NULLIF(session_id, ''), cwd, updated_at, agent, auto,
-                        model, requested_model FROM threads;
+                        model, requested_model, title FROM threads;
              DROP TABLE threads;
              ALTER TABLE threads_migrated RENAME TO threads;
              COMMIT;",
@@ -444,6 +519,7 @@ mod tests {
             existing.requested_model, None,
             "and never asked, which is what leaves the agent to choose"
         );
+        assert_eq!(existing.title, None, "an old thread has no task name");
 
         // And a new thread, which has no id until its agent assigns one, no
         // longer trips a NOT NULL constraint.
@@ -479,6 +555,40 @@ mod tests {
         let existing = store.get("telegram:7").unwrap().unwrap();
         assert_eq!(existing.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(existing.requested_model, None);
+        assert_eq!(existing.title, None);
+    }
+
+    #[test]
+    fn a_task_title_and_which_task_is_in_use_round_trip() {
+        let store = Store::in_memory().unwrap();
+        let mut state = store
+            .get_or_create("telegram:5", "/home/wy/Work", "claude")
+            .unwrap();
+        state.title = Some("login timeout".into());
+        store.put(&state).unwrap();
+
+        let read = store.get("telegram:5").unwrap().unwrap();
+        assert_eq!(read.title.as_deref(), Some("login timeout"));
+
+        assert_eq!(store.focus("telegram:5").unwrap(), None);
+        store.set_focus("telegram:5", Some("t1")).unwrap();
+        assert_eq!(store.focus("telegram:5").unwrap().as_deref(), Some("t1"));
+        store.set_focus("telegram:5", None).unwrap();
+        assert_eq!(store.focus("telegram:5").unwrap(), None);
+
+        store
+            .get_or_create("telegram:5#t1", "/home/wy/Work", "claude")
+            .unwrap();
+        store
+            .get_or_create("telegram:50", "/home/wy/Work", "claude")
+            .unwrap();
+        let mut keys = store.thread_keys("telegram:5").unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["telegram:5".to_string(), "telegram:5#t1".to_string()],
+            "the chat next door is not one of this chat's tasks"
+        );
     }
 
     #[test]

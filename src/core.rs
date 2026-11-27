@@ -1,10 +1,12 @@
 //! The router: chat threads on one side, agent sessions on the other.
 //!
 //! One thread maps to one agent session, and one turn runs at a time within it.
+//! A chat can hold several threads. The one a plain reply goes to is the task
+//! in focus; `/task` and `/tasks` are how a phone starts another and switches.
 //! Everything vendor-specific stays behind the two seams — this module talks
 //! only in [`Inbound`] and [`AgentEvent`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +16,9 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use crate::agent::{self, Agent};
-use crate::channel::{inbox, Attachment, Audience, Channel, Inbound, InboundKind, ThreadKey};
+use crate::channel::{
+    inbox, Attachment, Audience, Channel, Inbound, InboundKind, TaskPick, ThreadKey,
+};
 use crate::command::{self, Command, ModelRequest};
 use crate::event::{AgentEvent, Decision};
 use crate::outbox::{OutJob, Outbox};
@@ -187,6 +191,20 @@ pub struct Core {
     /// The progress last handed to each thread's channel, so an unchanged
     /// turn is not re-sent every tick. See [`Channel::progress`].
     progress_sent: HashMap<ThreadKey, String>,
+    /// Chats whose next plain message starts a new task, keyed by the
+    /// platform thread's display. Memory only: a restart drops it, and
+    /// `/task` arms it again.
+    armed: HashSet<String>,
+    /// An open `/tasks` list, in the order it was shown. `None` is the
+    /// original conversation. A reply that is not one of these numbers closes
+    /// it. Memory only, same as [`Core::armed`].
+    picks: HashMap<String, Vec<(u32, Option<String>)>>,
+    /// Whether a chat has more than one task. Remembered so a flush, which
+    /// happens on a timer, does not read sqlite to find out.
+    labeled: HashMap<String, bool>,
+    /// Task titles, for the same reason: a label on every page must not be a
+    /// query on every page.
+    titles: HashMap<ThreadKey, String>,
     agent_tx: mpsc::Sender<(ThreadKey, AgentEvent)>,
     agent_rx: mpsc::Receiver<(ThreadKey, AgentEvent)>,
 }
@@ -218,6 +236,10 @@ impl Core {
             held: HashMap::new(),
             transcripts: HashMap::new(),
             progress_sent: HashMap::new(),
+            armed: HashSet::new(),
+            picks: HashMap::new(),
+            labeled: HashMap::new(),
+            titles: HashMap::new(),
             agent_tx,
             agent_rx,
         }
@@ -277,19 +299,32 @@ impl Core {
     /// One inbound, start to finish, and the idle that ends it if it started
     /// nothing that runs on.
     async fn handle_inbound(&mut self, message: Inbound) {
-        let key = message.thread.clone();
+        let platform = message.thread.platform();
         // A new request starts a new stretch of work. Without this a command
         // answered on the spot, on a thread already announced idle, would
         // never be announced again, and its caller would wait forever.
-        self.idle.remove(&key);
-        if let Err(e) = self.on_inbound(message).await {
-            tracing::error!("handling inbound: {e:#}");
+        //
+        // The request lands on whichever task is in focus, or on a new one,
+        // which is not known until it has been handled. Forget idle for the
+        // whole chat first. Only the task it actually landed on is announced:
+        // announcing a sibling would tell a caller who was not part of this
+        // request that something happened.
+        for key in self.chat_thread_keys(&platform) {
+            self.idle.remove(&key);
         }
-        // Whatever happened, including an error.
-        self.announce_idle(&key);
+        self.idle.remove(&platform);
+
+        let acted = match self.on_inbound(message).await {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!("handling inbound: {e:#}");
+                self.focused_key(&platform).unwrap_or(platform)
+            }
+        };
+        self.announce_idle(&acted);
     }
 
-    async fn on_inbound(&mut self, message: Inbound) -> Result<()> {
+    async fn on_inbound(&mut self, message: Inbound) -> Result<ThreadKey> {
         // The audit line for a service that can run shell commands on request.
         tracing::info!(
             thread = %message.thread,
@@ -297,51 +332,108 @@ impl Core {
             "inbound"
         );
 
+        // Channels never set a task. The chat, and which task inside it is in
+        // focus, is decided here.
+        let platform = message.thread.platform();
+
+        // A reply to one of a task's messages is the person pointing at that
+        // task, which is quicker than `/tasks` and a number, and the only
+        // switch that needs nothing typed. It becomes the focus, so the next
+        // plain message goes there too, as it would after a switch from the
+        // list. Said nowhere: the answer comes back under that task's label.
+        //
+        // Words only. A tap already names what it answers, and a pending
+        // `/task` is called off — replying to an old message is a clear sign
+        // the next one was not meant to start something new.
+        if let (Some(target), InboundKind::Text { .. }) = (&message.replying_to, &message.kind) {
+            self.follow_reply(&platform, target)?;
+        }
+
         match message.kind {
             InboundKind::Decision {
                 allow,
                 ack,
                 question,
-            } => {
-                self.on_decision(&message.thread, allow, &ack, &question)
-                    .await
+            } => self.on_decision(&platform, allow, &ack, &question).await,
+            InboundKind::Pick { pick, ack } => self.on_pick(&platform, pick, &ack).await,
+            InboundKind::Unsupported(note) => {
+                let key = self.focused_key(&platform)?;
+                self.say(&key, &note)?;
+                Ok(key)
             }
-            InboundKind::Unsupported(note) => self.say(&message.thread, &note),
-
-            InboundKind::Text { text, files } => {
-                let command = command::parse(&text);
-
-                // A file sent with a *command* is not a prompt — a photo
-                // captioned `/status` is still `/status` — so files reach the
-                // agent on the `Prompt` arm alone. Logged rather than silent,
-                // because a file that went nowhere without a word said is the
-                // failure this whole path exists to stop.
-                if !files.is_empty() && !matches!(command, Command::Prompt(_)) {
-                    tracing::info!(
-                        thread = %message.thread,
-                        "{} file(s) sent with a command, not passed on",
-                        files.len()
-                    );
-                }
-
-                if let Command::Prompt(text) = command {
-                    self.hold(&message.thread, text, files);
-                    return Ok(());
-                }
-
-                // A command about what is happening *now* must not wait behind
-                // a message that is still collecting itself, and must not
-                // release it either: `/stop` ends the running turn, and
-                // `/allow` answers the question on screen. Everything else runs
-                // in the order it was sent, which means after whatever was
-                // already waiting.
-                if !answers_the_moment(&command) {
-                    self.release(&message.thread).await?;
-                }
-
-                self.on_command(&message.thread, command).await
-            }
+            InboundKind::Text { text, files } => self.on_text(&platform, text, files).await,
         }
+    }
+
+    /// Words, and where they go: the task in focus, a new task, or a number
+    /// picking one from the list just shown.
+    async fn on_text(
+        &mut self,
+        platform: &ThreadKey,
+        text: String,
+        files: Vec<Attachment>,
+    ) -> Result<ThreadKey> {
+        let command = command::parse(&text);
+        let chat = platform.to_string();
+
+        // A file sent with a *command* is not a prompt — a photo captioned
+        // `/status` is still `/status` — so files reach the agent on the
+        // `Prompt` arm alone. Logged rather than silent, because a file that
+        // went nowhere without a word said is the failure this whole path
+        // exists to stop.
+        if !files.is_empty() && !matches!(command, Command::Prompt(_)) {
+            tracing::info!(
+                thread = %platform,
+                "{} file(s) sent with a command, not passed on",
+                files.len()
+            );
+        }
+
+        if let Command::Prompt(body) = command {
+            if let Some(listed) = self.picks.get(&chat).cloned() {
+                if let Some(n) = bare_index(&body) {
+                    self.picks.remove(&chat);
+                    if let Some((_, task_id)) =
+                        listed.iter().find(|(shown, _)| *shown as usize == n)
+                    {
+                        return self.focus_task(platform, task_id.clone());
+                    }
+                    let key = self.focused_key(platform)?;
+                    self.say(&key, &format!("There is no {n}."))?;
+                    return Ok(key);
+                }
+                // Any other reply closes the list and is handled as itself.
+                // A number is only a switch for as long as the list is the
+                // last thing this chat was asked.
+                self.picks.remove(&chat);
+            }
+
+            let key = if self.armed.contains(&chat) && message_has_content(&body, &files) {
+                self.begin_task(platform, &body, &files)?
+            } else {
+                self.focused_key(platform)?
+            };
+            // Held, not sent. The other half of one send — a caption behind
+            // its photo — joins this same key, which is why a new task is
+            // focused before the window closes and why a second plain message
+            // does not become a second task.
+            self.hold(&key, body, files);
+            return Ok(key);
+        }
+
+        self.picks.remove(&chat);
+
+        let key = self.focused_key(platform)?;
+        // A command about what is happening *now* must not wait behind a
+        // message that is still collecting itself, and must not release it
+        // either: `/stop` ends the running turn, and `/allow` answers the
+        // question on screen. Everything else runs in the order it was sent,
+        // which means after whatever was already waiting.
+        if !answers_the_moment(&command) {
+            self.release(&key).await?;
+        }
+        self.on_command(&key, command).await?;
+        Ok(key)
     }
 
     /// Add a message to what this thread is collecting, and move the deadline.
@@ -417,6 +509,8 @@ impl Core {
             Command::Help => self.say(key, command::HELP),
             Command::New => self.on_new(key).await,
             Command::Stop => self.on_stop(key).await,
+            Command::Task => self.on_task(key),
+            Command::Tasks => self.on_tasks(key),
             Command::Status => self.on_status(key).await,
             Command::Cd(path) => self.on_cd(key, &path).await,
             Command::Agent(name) => self.on_agent(key, &name).await,
@@ -435,15 +529,30 @@ impl Core {
 
     async fn on_prompt(&mut self, key: &ThreadKey, text: &str) -> Result<()> {
         self.ensure_thread(key).await?;
-        let thread = self.threads.get_mut(key).expect("just ensured");
-
-        // One turn at a time. Rejecting is more predictable from a phone than
-        // queueing, and far simpler than interleaving.
-        if let Err(e) = thread.session.prompt(text).await {
-            let note = format!("Busy — {e}. Send /stop to interrupt.");
+        // One turn at a time, per task. Rejecting is more predictable from a
+        // phone than queueing, and far simpler than interleaving. Another
+        // task is `/task`, not a second message — a second message is how a
+        // photo and its caption would become two tasks.
+        let accepted = self
+            .threads
+            .get_mut(key)
+            .expect("just ensured")
+            .session
+            .prompt(text)
+            .await;
+        if let Err(e) = accepted {
+            let note =
+                format!("Busy — {e}. Send /stop to interrupt it, or /task to start another.");
+            let buttons = self
+                .channel(key)
+                .is_some_and(|channel| channel.offers_choices());
+            if buttons {
+                return self.offer(key, &note, vec![("New task".into(), "new".into())]);
+            }
             return self.say(key, &note);
         }
 
+        let thread = self.threads.get_mut(key).expect("just ensured");
         thread.renderer.reset();
         thread.turn_running = true;
         self.progress_sent.remove(key);
@@ -556,7 +665,71 @@ impl Core {
         if let Some(tool) = awaiting {
             note.push_str(&format!("\nwaiting  decision on {tool}"));
         }
+        if self.chat_is_labeled(key) {
+            note.push_str(&format!(
+                "\ntask     [{}] {}",
+                task_number(key),
+                self.task_title(key)
+            ));
+        }
         self.say(key, &note)
+    }
+
+    /// Arm the next message as a new task, or cancel that if it is already armed.
+    fn on_task(&mut self, key: &ThreadKey) -> Result<()> {
+        let platform = key.platform();
+        let chat = platform.to_string();
+        if self.armed.remove(&chat) {
+            return self.say(
+                key,
+                "Cancelled. The next message stays in this conversation.",
+            );
+        }
+        self.arm(&platform)
+    }
+
+    /// The numbered list. On a channel with buttons each row is one, and so is
+    /// "New task". On one without, the reply is the number.
+    fn on_tasks(&mut self, key: &ThreadKey) -> Result<()> {
+        let platform = key.platform();
+        let chat = platform.to_string();
+        let tasks = self.tasks_of(&platform)?;
+        let focus = self.focused_key(&platform)?;
+
+        let mut lines = Vec::with_capacity(tasks.len());
+        let mut ids = Vec::with_capacity(tasks.len());
+        let mut choices = Vec::with_capacity(tasks.len() + 1);
+        for task in &tasks {
+            let number = task_number(task);
+            let title = self.task_title(task);
+            let here = if task == &focus { " · this one" } else { "" };
+            let line = format!("{number}. {title} — {}{here}", self.task_phase(task));
+            ids.push((number, task.task_id.clone()));
+            let data = match &task.task_id {
+                Some(id) => format!("use:{id}"),
+                None => "use:".to_string(),
+            };
+            choices.push((line.clone(), data));
+            lines.push(line);
+        }
+        self.picks.insert(chat, ids);
+
+        let mut text = lines.join("\n");
+        text.push_str("\n\nReply with a number to switch");
+        if self
+            .channel(&focus)
+            .is_some_and(|channel| channel.routes_replies())
+        {
+            text.push_str(", or reply to any message from a task to go back to it");
+        }
+        text.push_str(". /task, then your next message, starts another.");
+        if self
+            .channel(&focus)
+            .is_some_and(|channel| channel.offers_choices())
+        {
+            choices.push(("New task".into(), "new".into()));
+        }
+        self.offer(&focus, &text, choices)
     }
 
     /// Read or change this thread's approval mode.
@@ -872,22 +1045,32 @@ impl Core {
     /// for as long as the message exists.
     async fn on_decision(
         &mut self,
-        key: &ThreadKey,
+        platform: &ThreadKey,
         allow: bool,
         ack: &str,
         question: &str,
-    ) -> Result<()> {
+    ) -> Result<ThreadKey> {
+        // The tap arrives on the chat, not on the task: Telegram has one
+        // callback stream per message, and the message is not a topic. The
+        // question token says which task asked it.
+        let target = self
+            .threads
+            .iter()
+            .find(|(key, thread)| {
+                key.same_chat(platform)
+                    && thread
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.question == question)
+            })
+            .map(|(key, _)| key.clone());
+
         // Check before consuming anything: a tap that does not name the
         // question we are waiting on must leave that question waiting.
-        let answers_the_open_question = self
-            .threads
-            .get(key)
-            .and_then(|thread| thread.pending.as_ref())
-            .is_some_and(|pending| pending.question == question);
-
-        if !answers_the_open_question {
+        let Some(target) = target else {
+            let key = self.focused_key(platform)?;
             self.queue(
-                key,
+                &key,
                 OutJob::Ack {
                     ack: ack.to_string(),
                     note: "That question has moved on".to_string(),
@@ -896,19 +1079,52 @@ impl Core {
             // Say which way it went, because from the chat it looks like the
             // tap did nothing: the buttons are still there under a question
             // that is no longer the one being asked.
-            return self.say(
-                key,
+            self.say(
+                &key,
                 "That was a button from an earlier question — it was not \
                  applied. Scroll down for the current one, if there is one.",
-            );
-        }
+            )?;
+            return Ok(key);
+        };
 
         let decision = if allow {
             Decision::allow()
         } else {
             Decision::deny("denied from chat")
         };
-        self.decide(key, decision, Some(ack)).await
+        self.decide(&target, decision, Some(ack)).await?;
+        Ok(target)
+    }
+
+    /// A tap on the task list, or on "New task".
+    async fn on_pick(
+        &mut self,
+        platform: &ThreadKey,
+        pick: TaskPick,
+        ack: &str,
+    ) -> Result<ThreadKey> {
+        // Ack first, on the conversation that is open now. The spinner stops
+        // even if the switch has nothing to say, and the token is the
+        // channel's, not the task's.
+        let note = match &pick {
+            TaskPick::New => "Send the next message",
+            TaskPick::Use(_) => "Switched",
+        };
+        let current = self.focused_key(platform)?;
+        self.queue(
+            &current,
+            OutJob::Ack {
+                ack: ack.to_string(),
+                note: note.to_string(),
+            },
+        );
+        match pick {
+            TaskPick::New => {
+                self.arm(platform)?;
+                Ok(current)
+            }
+            TaskPick::Use(id) => self.focus_task(platform, id),
+        }
     }
 
     /// Answer the thread's outstanding permission question.
@@ -1196,9 +1412,49 @@ impl Core {
 
     /// Queue one piece of outbound work, if the thread's channel still exists.
     fn queue(&mut self, key: &ThreadKey, job: OutJob) -> bool {
+        let job = self.label(key, job);
         match self.outbox(key) {
             Some(outbox) => outbox.queue(job),
             None => false,
+        }
+    }
+
+    /// When a chat has more than one task, say which one a message belongs to.
+    ///
+    /// Both tasks post into the same chat — a task is not a Telegram topic —
+    /// so the name is the only thing that keeps their replies apart. A chat
+    /// with one task is unlabeled, which is what every chat was before tasks.
+    fn label(&mut self, key: &ThreadKey, job: OutJob) -> OutJob {
+        let bare = match &job {
+            OutJob::Turn(text) | OutJob::Seal(text) | OutJob::Say(text) => text.clone(),
+            OutJob::Ask { text, .. } | OutJob::Offer { text, .. } => text.clone(),
+            OutJob::Settle { verdict, .. } => verdict.clone(),
+            _ => return job,
+        };
+        if !self.chat_is_labeled(key) {
+            return job;
+        }
+        let titled = prefix_title(&self.task_heading(key), &bare);
+        if titled == bare {
+            return job;
+        }
+        match job {
+            OutJob::Turn(_) => OutJob::Turn(titled),
+            OutJob::Seal(_) => OutJob::Seal(titled),
+            OutJob::Say(_) => OutJob::Say(titled),
+            OutJob::Ask { question, .. } => OutJob::Ask {
+                text: titled,
+                question,
+            },
+            OutJob::Offer { choices, .. } => OutJob::Offer {
+                text: titled,
+                choices,
+            },
+            OutJob::Settle { ack, .. } => OutJob::Settle {
+                verdict: titled,
+                ack,
+            },
+            other => other,
         }
     }
 
@@ -1290,10 +1546,28 @@ impl Core {
     ///
     /// Forgotten before it is queued: an indicator nobody can turn off is a
     /// worse outcome than one turned off twice.
+    ///
+    /// iMessage has one indicator per space, shared by every task in the chat.
+    /// Taking it down because this task finished would clear the dots on a
+    /// sibling that is still running. Telegram's expires on its own and
+    /// ignores the off, so the extra care is free there.
     fn stop_typing(&mut self, key: &ThreadKey) {
-        if self.typing.remove(key).is_some() {
-            self.queue(key, OutJob::Typing { on: false });
+        if self.typing.remove(key).is_none() {
+            return;
         }
+        if self.chat_still_working(key) {
+            return;
+        }
+        self.queue(key, OutJob::Typing { on: false });
+    }
+
+    /// Some other task in this chat still has an honest reason to show dots.
+    fn chat_still_working(&self, key: &ThreadKey) -> bool {
+        let mut others: Vec<ThreadKey> = self.threads.keys().cloned().collect();
+        others.extend(self.held.keys().cloned());
+        others
+            .into_iter()
+            .any(|other| other != *key && other.same_chat(key) && self.is_working(&other))
     }
 
     /// Every thread showing an indicator, plus every thread that might need
@@ -1693,6 +1967,198 @@ impl Core {
         Ok(())
     }
 
+    /// A note with choices under it, where the channel has buttons.
+    fn offer(&mut self, key: &ThreadKey, text: &str, choices: Vec<(String, String)>) -> Result<()> {
+        self.queue(
+            key,
+            OutJob::Offer {
+                text: text.to_string(),
+                choices,
+            },
+        );
+        Ok(())
+    }
+
+    /// The task a plain reply goes to. Absent in the store means the original
+    /// conversation, which is also what a chat has before anyone starts a second.
+    fn focused_key(&self, platform: &ThreadKey) -> Result<ThreadKey> {
+        match self.store.focus(&platform.to_string())? {
+            Some(id) if !id.is_empty() => Ok(platform.with_task(Some(id))),
+            _ => Ok(platform.clone()),
+        }
+    }
+
+    fn arm(&mut self, platform: &ThreadKey) -> Result<()> {
+        let chat = platform.to_string();
+        self.armed.insert(chat.clone());
+        self.picks.remove(&chat);
+        let key = self.focused_key(platform)?;
+        self.say(
+            &key,
+            "Send the next message and it starts a new task. /task again cancels.",
+        )
+    }
+
+    /// Focus the task a reply points at, if it is one of this chat's.
+    fn follow_reply(&mut self, platform: &ThreadKey, target: &ThreadKey) -> Result<()> {
+        if !target.same_chat(platform) {
+            return Ok(());
+        }
+        if target.task_id.is_some() && self.store.get(&target.to_string())?.is_none() {
+            return Ok(());
+        }
+        let chat = platform.to_string();
+        self.armed.remove(&chat);
+        if self.focused_key(platform)? != *target {
+            tracing::info!(thread = %target, "reply switched task");
+            self.store.set_focus(&chat, target.task_id.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Point the chat at this task. `None` is the original conversation.
+    fn focus_task(&mut self, platform: &ThreadKey, task_id: Option<String>) -> Result<ThreadKey> {
+        let key = platform.with_task(task_id.clone());
+        if task_id.is_some() && self.store.get(&key.to_string())?.is_none() {
+            let current = self.focused_key(platform)?;
+            self.say(&current, "That task is gone. Send /tasks again.")?;
+            return Ok(current);
+        }
+        self.store
+            .set_focus(&platform.to_string(), task_id.as_deref())?;
+        let title = self.task_title(&key);
+        let number = task_number(&key);
+        self.say(&key, &format!("Now on [{number}] {title}."))?;
+        Ok(key)
+    }
+
+    /// Open a task, copy the conversation it was started from, and focus it.
+    ///
+    /// The copy is the directory, the agent, the model that was asked for and
+    /// whether tool calls ask first. Not the session: this is a new
+    /// conversation, and the agent assigns its own id on the first turn.
+    fn begin_task(
+        &mut self,
+        platform: &ThreadKey,
+        text: &str,
+        files: &[Attachment],
+    ) -> Result<ThreadKey> {
+        let parent = self.state(&self.focused_key(platform)?)?;
+        let id = self.next_task_id(platform)?;
+        let key = platform.with_task(Some(id.clone()));
+        let title = task_title_from(text, files);
+        self.store.put(&crate::store::ThreadState {
+            key: key.to_string(),
+            session_id: None,
+            cwd: parent.cwd,
+            agent: parent.agent,
+            model: None,
+            requested_model: parent.requested_model,
+            auto: parent.auto,
+            title: Some(title.clone()),
+        })?;
+        self.store.set_focus(&platform.to_string(), Some(&id))?;
+        self.titles.insert(key.clone(), title.clone());
+        self.labeled.insert(platform.to_string(), true);
+        self.armed.remove(&platform.to_string());
+        tracing::info!(thread = %key, %title, "new task");
+        Ok(key)
+    }
+
+    fn next_task_id(&self, platform: &ThreadKey) -> Result<String> {
+        let chat = platform.to_string();
+        let prefix = format!("{chat}#t");
+        let max = self
+            .store
+            .thread_keys(&chat)?
+            .iter()
+            .filter_map(|key| key.strip_prefix(&prefix))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        Ok(format!("t{}", max + 1))
+    }
+
+    fn tasks_of(&self, platform: &ThreadKey) -> Result<Vec<ThreadKey>> {
+        let mut keys = self.chat_thread_keys(platform);
+        if !keys.iter().any(|key| key.task_id.is_none()) {
+            keys.push(platform.clone());
+        }
+        keys.sort_by_key(task_ord);
+        Ok(keys)
+    }
+
+    fn chat_thread_keys(&self, platform: &ThreadKey) -> Vec<ThreadKey> {
+        self.store
+            .thread_keys(&platform.to_string())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|stored| key_from_stored(platform, &stored))
+            .collect()
+    }
+
+    fn chat_is_labeled(&mut self, key: &ThreadKey) -> bool {
+        let chat = key.platform().to_string();
+        if let Some(known) = self.labeled.get(&chat) {
+            return *known;
+        }
+        let many = self
+            .store
+            .thread_keys(&chat)
+            .map(|keys| keys.len() > 1)
+            .unwrap_or(false);
+        self.labeled.insert(chat, many);
+        many
+    }
+
+    /// The first line of a labeled message: the task's number, the same one
+    /// `/tasks` lists it under, and its name.
+    ///
+    /// The number is what makes two tasks' replies tell apart at a glance in a
+    /// chat where they interleave, and it is what you type to switch. A task
+    /// you are not in also says how to get back to it, where replying works —
+    /// otherwise its question or answer reads as though a plain message would
+    /// reach it, and a plain message goes to the task in focus.
+    fn task_heading(&mut self, key: &ThreadKey) -> String {
+        let mut heading = format!("[{}] {}", task_number(key), self.task_title(key));
+        let routes = self
+            .channel(key)
+            .is_some_and(|channel| channel.routes_replies());
+        if routes && self.focused_key(&key.platform()).ok().as_ref() != Some(key) {
+            heading.push_str(" · reply to this to continue it");
+        }
+        heading
+    }
+
+    fn task_title(&mut self, key: &ThreadKey) -> String {
+        if let Some(title) = self.titles.get(key) {
+            return title.clone();
+        }
+        let title = self
+            .store
+            .get(&key.to_string())
+            .ok()
+            .flatten()
+            .and_then(|state| state.title)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| match &key.task_id {
+                Some(id) => id.clone(),
+                None => "main".to_string(),
+            });
+        self.titles.insert(key.clone(), title.clone());
+        title
+    }
+
+    fn task_phase(&self, key: &ThreadKey) -> &'static str {
+        if self.held.contains_key(key) {
+            return "running";
+        }
+        match self.threads.get(key) {
+            Some(thread) if thread.turn_running && thread.pending.is_none() => "running",
+            _ => "waiting",
+        }
+    }
+
     // ---- sessions ------------------------------------------------------
 
     async fn ensure_thread(&mut self, key: &ThreadKey) -> Result<()> {
@@ -1754,6 +2220,82 @@ impl Core {
 /// turn in the order they were sent.
 fn answers_the_moment(command: &Command) -> bool {
     matches!(command, Command::Stop | Command::Allow | Command::Deny(_))
+}
+
+/// A reply of just a number, which is how a list is picked on a channel with
+/// no buttons. `None` is anything else, including a number with words around
+/// it — that one is a prompt, and it closes the list.
+fn bare_index(text: &str) -> Option<usize> {
+    let text = text.trim();
+    if text.is_empty() || text.len() > 4 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn message_has_content(text: &str, files: &[Attachment]) -> bool {
+    !text.trim().is_empty() || files.iter().any(|file| file.saved.is_ok())
+}
+
+/// The name of a task, from the first line of the message that started it.
+/// Short enough to sit on a button and at the top of a reply.
+fn task_title_from(text: &str, files: &[Attachment]) -> String {
+    const MAX: usize = 42;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let source = if !collapsed.is_empty() {
+        collapsed
+    } else {
+        files
+            .iter()
+            .map(|file| file.name.trim())
+            .find(|name| !name.is_empty())
+            .unwrap_or("new task")
+            .to_string()
+    };
+    if source.chars().count() <= MAX {
+        return source;
+    }
+    let mut cut: String = source.chars().take(MAX - 1).collect();
+    cut.push('…');
+    cut
+}
+
+fn prefix_title(title: &str, text: &str) -> String {
+    let head = format!("{title}\n");
+    if text.starts_with(&head) {
+        text.to_string()
+    } else {
+        format!("{head}{text}")
+    }
+}
+
+/// What a task is called in a label and in `/tasks`: main is 1, `t1` is 2.
+///
+/// Read off the id rather than off the list, so a label costs no query. The
+/// two agree because ids are handed out in order and a task is never deleted.
+fn task_number(key: &ThreadKey) -> u32 {
+    task_ord(key).saturating_add(1)
+}
+
+fn task_ord(key: &ThreadKey) -> u32 {
+    match &key.task_id {
+        None => 0,
+        Some(id) => id
+            .strip_prefix('t')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(u32::MAX),
+    }
+}
+
+fn key_from_stored(platform: &ThreadKey, stored: &str) -> ThreadKey {
+    let chat = platform.to_string();
+    match stored.strip_prefix(&format!("{chat}#")) {
+        Some(id) if !id.is_empty() => platform.with_task(Some(id.to_string())),
+        _ => platform.clone(),
+    }
 }
 
 /// The prompt one message becomes: what they typed, then where their files are.
@@ -2109,6 +2651,7 @@ mod tests {
 
         for _ in 0..2 {
             core.handle_inbound(Inbound {
+                replying_to: None,
                 thread: key.clone(),
                 user_id: "t".into(),
                 kind: InboundKind::Text {
@@ -2441,6 +2984,7 @@ mod tests {
             channel: "telegram",
             chat_id: "5".into(),
             topic_id: None,
+            task_id: None,
         }
     }
 
@@ -2577,8 +3121,12 @@ mod tests {
         typing: std::sync::Mutex<Vec<bool>>,
         /// Every file handed over, as (path, caption).
         files: std::sync::Mutex<Vec<(String, String)>>,
+        /// Choices handed to [`Channel::offer`], one list per message.
+        choices: std::sync::Mutex<Vec<Vec<(String, String)>>>,
         can_edit: bool,
         can_send_files: bool,
+        offers_choices: bool,
+        routes_replies: bool,
     }
 
     impl CountingChannel {
@@ -2589,8 +3137,26 @@ mod tests {
                 messages: std::sync::Mutex::new(Vec::new()),
                 typing: std::sync::Mutex::new(Vec::new()),
                 files: std::sync::Mutex::new(Vec::new()),
+                choices: std::sync::Mutex::new(Vec::new()),
                 can_edit: true,
                 can_send_files: true,
+                offers_choices: false,
+                routes_replies: false,
+            })
+        }
+
+        /// Telegram's shape, including the buttons under a list.
+        fn choosing() -> Arc<Self> {
+            Arc::new(Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                messages: std::sync::Mutex::new(Vec::new()),
+                typing: std::sync::Mutex::new(Vec::new()),
+                files: std::sync::Mutex::new(Vec::new()),
+                choices: std::sync::Mutex::new(Vec::new()),
+                can_edit: true,
+                can_send_files: true,
+                offers_choices: true,
+                routes_replies: false,
             })
         }
 
@@ -2601,9 +3167,32 @@ mod tests {
                 messages: std::sync::Mutex::new(Vec::new()),
                 typing: std::sync::Mutex::new(Vec::new()),
                 files: std::sync::Mutex::new(Vec::new()),
+                choices: std::sync::Mutex::new(Vec::new()),
                 can_edit: false,
                 can_send_files: false,
+                offers_choices: false,
+                routes_replies: false,
             })
+        }
+
+        /// iMessage's shape, with a reply finding its way to the task that
+        /// sent the message it answers.
+        fn replying() -> Arc<Self> {
+            Arc::new(Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                messages: std::sync::Mutex::new(Vec::new()),
+                typing: std::sync::Mutex::new(Vec::new()),
+                files: std::sync::Mutex::new(Vec::new()),
+                choices: std::sync::Mutex::new(Vec::new()),
+                can_edit: false,
+                can_send_files: false,
+                offers_choices: false,
+                routes_replies: true,
+            })
+        }
+
+        fn choices(&self) -> Vec<Vec<(String, String)>> {
+            self.choices.lock().unwrap().clone()
         }
 
         fn typing(&self) -> Vec<bool> {
@@ -2626,6 +3215,21 @@ mod tests {
         }
         fn can_edit(&self) -> bool {
             self.can_edit
+        }
+        fn offers_choices(&self) -> bool {
+            self.offers_choices
+        }
+        fn routes_replies(&self) -> bool {
+            self.routes_replies
+        }
+        async fn offer(
+            &self,
+            thread: &ThreadKey,
+            text: &str,
+            choices: &[(String, String)],
+        ) -> Result<String> {
+            self.choices.lock().unwrap().push(choices.to_vec());
+            self.send(thread, text).await
         }
         async fn typing(&self, _t: &ThreadKey, on: bool) -> Result<()> {
             self.typing.lock().unwrap().push(on);
@@ -2678,6 +3282,8 @@ mod tests {
         /// Every prompt it was given, which is the only place the composed
         /// text of a turn can be read back.
         prompts: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Refuse `prompt` the way a session with a turn in flight does.
+        refuse_prompt: bool,
     }
 
     impl StubAgent {
@@ -2689,6 +3295,16 @@ mod tests {
                 offers: Vec::new(),
                 told: Arc::new(std::sync::Mutex::new(None)),
                 prompts: Arc::new(std::sync::Mutex::new(Vec::new())),
+                refuse_prompt: false,
+            }
+        }
+
+        /// A turn in flight that will not take another prompt.
+        fn busy_turn() -> Self {
+            Self {
+                busy: true,
+                refuse_prompt: true,
+                ..Self::idle()
             }
         }
 
@@ -2740,6 +3356,9 @@ mod tests {
             self.busy
         }
         async fn prompt(&mut self, text: &str) -> Result<()> {
+            if self.refuse_prompt {
+                anyhow::bail!("a turn is already running — cancel it first");
+            }
             self.prompts.lock().unwrap().push(text.to_string());
             Ok(())
         }
@@ -2775,6 +3394,7 @@ mod tests {
             channel: "fake",
             chat_id: "1".into(),
             topic_id: None,
+            task_id: None,
         };
 
         let mut core = Core::new(
@@ -2838,6 +3458,7 @@ mod tests {
             channel: "fake",
             chat_id: "1".into(),
             topic_id: None,
+            task_id: None,
         };
 
         let mut core = Core::new(
@@ -2910,6 +3531,7 @@ mod tests {
             channel: "fake",
             chat_id: "1".into(),
             topic_id: None,
+            task_id: None,
         }
     }
 
@@ -3713,6 +4335,7 @@ mod tests {
     /// A message as a channel hands it over.
     fn said(key: &ThreadKey, text: &str, files: Vec<Attachment>) -> Inbound {
         Inbound {
+            replying_to: None,
             thread: key.clone(),
             user_id: "42".into(),
             kind: InboundKind::Text {
@@ -3964,5 +4587,537 @@ mod tests {
         assert_eq!(expand_home("~/src/x"), PathBuf::from("/home/test/src/x"));
         assert_eq!(expand_home("/abs/path"), PathBuf::from("/abs/path"));
         assert_eq!(expand_home("a/~/b"), PathBuf::from("a/~/b"));
+    }
+
+    /// A session that is mid-turn and will not take another prompt.
+    fn running(core: &mut Core, key: &ThreadKey) {
+        core.threads.insert(
+            key.clone(),
+            Thread {
+                session: Box::new(StubAgent::busy_turn()),
+                renderer: TurnRenderer::new(),
+                pending: None,
+                auto: true,
+                turn_running: true,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_message_while_a_turn_runs_stays_busy() {
+        // The rule that keeps a photo and its caption from becoming two tasks.
+        // Another task is a command, not another plain message.
+        let dir = std::env::temp_dir().join(format!("sb-busy-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        running(&mut core, &key);
+
+        core.on_inbound(said(&key, "do the other thing", vec![]))
+            .await
+            .unwrap();
+        core.release(&key).await.unwrap();
+        settle().await;
+
+        assert!(
+            core.store.thread_keys(&key.to_string()).unwrap().len() <= 1,
+            "a plain message does not start a task"
+        );
+        let messages = channel.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("Busy") && m.contains("/task")),
+            "{messages:?}"
+        );
+        assert!(channel.choices().is_empty(), "iMessage has no buttons");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_busy_telegram_chat_offers_a_new_task_button() {
+        let dir = std::env::temp_dir().join(format!("sb-busy-btn-{}", std::process::id()));
+        let channel = CountingChannel::choosing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        running(&mut core, &key);
+
+        core.on_inbound(said(&key, "do the other thing", vec![]))
+            .await
+            .unwrap();
+        core.release(&key).await.unwrap();
+        settle().await;
+
+        assert!(
+            channel
+                .choices()
+                .iter()
+                .flatten()
+                .any(|(label, data)| label == "New task" && data == "new"),
+            "{:?}",
+            channel.choices()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn task_then_a_message_runs_beside_the_one_that_is_busy() {
+        let dir = std::env::temp_dir().join(format!("sb-task-{}", std::process::id()));
+        let channel = CountingChannel::choosing();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        running(&mut core, &key);
+
+        core.on_inbound(said(&key, "/task", vec![])).await.unwrap();
+        settle().await;
+        assert!(
+            channel.messages().iter().any(|m| m.contains("new task")),
+            "{:?}",
+            channel.messages()
+        );
+
+        core.on_inbound(said(&key, "fix the login timeout", vec![]))
+            .await
+            .unwrap();
+        let task = key.with_task(Some("t1".into()));
+        assert!(
+            core.held.contains_key(&task),
+            "the new message is held on the new task, not the busy one"
+        );
+        assert!(!core.held.contains_key(&key));
+
+        let prompts = stub_session(&mut core, &task);
+        core.release(&task).await.unwrap();
+        settle().await;
+
+        let started = prompts.lock().unwrap().clone();
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert!(started[0].contains("fix the login timeout"));
+        assert_eq!(
+            core.store.focus(&key.to_string()).unwrap().as_deref(),
+            Some("t1")
+        );
+        assert_eq!(
+            core.store
+                .get(&task.to_string())
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("fix the login timeout")
+        );
+        assert!(
+            core.threads[&key].turn_running,
+            "the first task was not interrupted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_photo_and_its_caption_while_armed_are_one_task() {
+        // Armed or not, one send is one message. The first half focuses the
+        // new task; the caption, which arrives on the chat, joins it.
+        let dir = std::env::temp_dir().join(format!("sb-task-photo-{}", std::process::id()));
+        let key = fake_key();
+        let mut core = core_with(CountingChannel::write_only(), &dir);
+        running(&mut core, &key);
+
+        core.on_inbound(said(&key, "/task", vec![])).await.unwrap();
+        core.on_inbound(said(
+            &key,
+            "",
+            vec![saved("board.heic", "image/heic", 20, "/in/board.heic")],
+        ))
+        .await
+        .unwrap();
+        core.on_inbound(said(&key, "what is on this board?", vec![]))
+            .await
+            .unwrap();
+
+        let task = key.with_task(Some("t1".into()));
+        assert_eq!(core.held.len(), 1);
+        let held = &core.held[&task];
+        assert_eq!(held.parts, vec!["what is on this board?".to_string()]);
+        assert_eq!(held.files.len(), 1);
+        assert_eq!(
+            core.store
+                .get(&task.to_string())
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("board.heic"),
+            "a photo with no words is named from the file"
+        );
+        let tasks = core
+            .store
+            .thread_keys(&key.to_string())
+            .unwrap()
+            .into_iter()
+            .filter(|stored| stored.contains('#'))
+            .count();
+        assert_eq!(tasks, 1, "the caption did not start a second task");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn tasks_lists_and_a_number_switches_without_becoming_a_prompt() {
+        let dir = std::env::temp_dir().join(format!("sb-tasks-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        core.on_inbound(said(&key, "/task", vec![])).await.unwrap();
+        core.on_inbound(said(&key, "login timeout", vec![]))
+            .await
+            .unwrap();
+        let first = key.with_task(Some("t1".into()));
+        let first_prompts = stub_session(&mut core, &first);
+
+        core.on_inbound(said(&key, "/task", vec![])).await.unwrap();
+        core.on_inbound(said(&key, "readme", vec![])).await.unwrap();
+        let second = key.with_task(Some("t2".into()));
+        let second_prompts = stub_session(&mut core, &second);
+
+        core.on_inbound(said(&key, "/tasks", vec![])).await.unwrap();
+        settle().await;
+
+        let list = channel.messages().join("\n");
+        assert!(list.contains("1. main — waiting"), "{list}");
+        assert!(list.contains("2. login timeout — running"), "{list}");
+        assert!(list.contains("3. readme — running · this one"), "{list}");
+
+        core.on_inbound(said(&key, "2", vec![])).await.unwrap();
+        settle().await;
+        assert_eq!(
+            core.store.focus(&key.to_string()).unwrap().as_deref(),
+            Some("t1"),
+            "2 is the login task, not a prompt"
+        );
+        assert!(
+            !second_prompts.lock().unwrap().iter().any(|p| p == "2"),
+            "the number was not sent to the agent: {:?}",
+            second_prompts.lock().unwrap()
+        );
+        assert!(channel
+            .messages()
+            .iter()
+            .any(|m| m.contains("Now on [2] login timeout")));
+
+        // The list is closed. The next words go to the task just chosen.
+        core.on_inbound(said(&key, "look at the timeout", vec![]))
+            .await
+            .unwrap();
+        assert!(core.held.contains_key(&first), "now in the login task");
+        assert!(!core.held.contains_key(&second));
+        assert!(
+            core.picks.is_empty(),
+            "the numbers stop working after one use"
+        );
+
+        // And a reply that is not a number, while a list is open, is a prompt.
+        core.on_inbound(said(&key, "/tasks", vec![])).await.unwrap();
+        core.on_inbound(said(&key, "not a number", vec![]))
+            .await
+            .unwrap();
+        assert!(
+            core.held[&first].parts.iter().any(|p| p == "not a number"),
+            "closed the list and stayed on the task in focus"
+        );
+        let _ = first_prompts;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_label_appears_only_once_a_chat_has_two_tasks() {
+        let dir = std::env::temp_dir().join(format!("sb-label-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+
+        finish_turn(
+            &mut core,
+            &key,
+            vec![AgentEvent::Text {
+                text: "plain answer".into(),
+            }],
+        )
+        .await;
+        assert_eq!(channel.messages(), vec!["plain answer".to_string()]);
+
+        let task = key.with_task(Some("t1".into()));
+        core.state(&key).unwrap();
+        let mut state = core.state(&task).unwrap();
+        state.title = Some("login timeout".into());
+        core.store.put(&state).unwrap();
+        // The first turn looked, found one task, and remembered that. A second
+        // task created underneath has to be noticed; `begin_task` does this
+        // itself, and this test inserts the row the way a restarted process
+        // would find it.
+        core.labeled.remove(&key.to_string());
+
+        finish_turn(
+            &mut core,
+            &task,
+            vec![AgentEvent::Text {
+                text: "second answer".into(),
+            }],
+        )
+        .await;
+        assert!(
+            channel
+                .messages()
+                .iter()
+                .any(|m| m.starts_with("[2] login timeout\nsecond answer")),
+            "{:?}",
+            channel.messages()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn typing_stays_up_while_another_task_in_the_chat_is_working() {
+        // iMessage has one indicator for the whole space. The task that
+        // finished must not be the one that turns it off.
+        let dir = std::env::temp_dir().join(format!("sb-dots-{}", std::process::id()));
+        let channel = CountingChannel::write_only();
+        let key = fake_key();
+        let task = key.with_task(Some("t1".into()));
+        let mut core = core_with(channel.clone(), &dir);
+        for thread in [&key, &task] {
+            core.threads.insert(
+                thread.clone(),
+                Thread {
+                    session: Box::new(StubAgent::busy()),
+                    renderer: TurnRenderer::new(),
+                    pending: None,
+                    auto: true,
+                    turn_running: true,
+                },
+            );
+        }
+
+        core.refresh_typing(&key);
+        core.refresh_typing(&task);
+        settle().await;
+        assert_eq!(channel.typing(), vec![true, true]);
+
+        core.threads.get_mut(&key).unwrap().turn_running = false;
+        core.refresh_typing(&key);
+        settle().await;
+        assert_eq!(
+            channel.typing(),
+            vec![true, true],
+            "the other task is still running"
+        );
+
+        core.threads.get_mut(&task).unwrap().turn_running = false;
+        core.refresh_typing(&task);
+        settle().await;
+        assert_eq!(channel.typing(), vec![true, true, false]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_permission_tap_finds_the_task_that_asked() {
+        // The callback arrives on the chat. The question token is what says
+        // which task it belongs to, and a stale one must not answer the other.
+        let dir = std::env::temp_dir().join(format!("sb-tap-{}", std::process::id()));
+        let channel = CountingChannel::choosing();
+        let key = fake_key();
+        let task = key.with_task(Some("t1".into()));
+        let mut core = core_with(channel.clone(), &dir);
+        core.threads.insert(
+            task.clone(),
+            Thread {
+                session: Box::new(StubAgent::idle()),
+                renderer: TurnRenderer::new(),
+                pending: Some(PendingPermission {
+                    request_id: "r1".into(),
+                    tool: "Bash".into(),
+                    question: "q1".into(),
+                }),
+                auto: false,
+                turn_running: true,
+            },
+        );
+
+        core.handle_inbound(Inbound {
+            replying_to: None,
+            thread: key.clone(),
+            user_id: "42".into(),
+            kind: InboundKind::Decision {
+                allow: true,
+                ack: "cb".into(),
+                question: "nope".into(),
+            },
+        })
+        .await;
+        assert!(
+            core.threads[&task].pending.is_some(),
+            "a tap from another question leaves this one waiting"
+        );
+
+        core.handle_inbound(Inbound {
+            replying_to: None,
+            thread: key,
+            user_id: "42".into(),
+            kind: InboundKind::Decision {
+                allow: true,
+                ack: "cb".into(),
+                question: "q1".into(),
+            },
+        })
+        .await;
+        assert!(core.threads[&task].pending.is_none());
+        settle().await;
+        assert!(
+            channel
+                .messages()
+                .iter()
+                .any(|m| m.contains("Allowed Bash")),
+            "{:?}",
+            channel.messages()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A chat with a second task, titled, with focus left on main.
+    fn two_tasks(core: &mut Core, key: &ThreadKey) -> ThreadKey {
+        let task = key.with_task(Some("t1".into()));
+        core.state(key).unwrap();
+        let mut state = core.state(&task).unwrap();
+        state.title = Some("login timeout".into());
+        core.store.put(&state).unwrap();
+        core.labeled.remove(&key.to_string());
+        task
+    }
+
+    #[tokio::test]
+    async fn a_reply_answers_the_task_that_asked_and_moves_focus_there() {
+        // On iMessage `/allow` is typed, and a plain one goes to the task in
+        // focus. A question from the other task is answered by replying to it.
+        let dir = std::env::temp_dir().join(format!("sb-reply-{}", std::process::id()));
+        let channel = CountingChannel::replying();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        let task = two_tasks(&mut core, &key);
+        core.threads.insert(
+            task.clone(),
+            Thread {
+                session: Box::new(StubAgent::idle()),
+                renderer: TurnRenderer::new(),
+                pending: Some(PendingPermission {
+                    request_id: "r1".into(),
+                    tool: "Bash".into(),
+                    question: "q1".into(),
+                }),
+                auto: false,
+                turn_running: true,
+            },
+        );
+
+        // A reply pointing into another chat is not followed.
+        let elsewhere = ThreadKey {
+            chat_id: "someone-else".into(),
+            ..task.clone()
+        };
+        let mut stray = said(&key, "/allow", Vec::new());
+        stray.replying_to = Some(elsewhere);
+        core.handle_inbound(stray).await;
+        assert!(core.threads[&task].pending.is_some());
+        assert_eq!(core.focused_key(&key).unwrap(), key);
+
+        let mut reply = said(&key, "/allow", Vec::new());
+        reply.replying_to = Some(task.clone());
+        core.handle_inbound(reply).await;
+        assert!(
+            core.threads[&task].pending.is_none(),
+            "the reply answered the task that asked"
+        );
+        assert_eq!(
+            core.focused_key(&key).unwrap(),
+            task,
+            "and the next plain message goes there too"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_reply_calls_off_a_pending_new_task() {
+        let dir = std::env::temp_dir().join(format!("sb-reply-arm-{}", std::process::id()));
+        let channel = CountingChannel::replying();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        let task = two_tasks(&mut core, &key);
+        core.store.set_focus(&key.to_string(), Some("t1")).unwrap();
+
+        core.handle_inbound(said(&key, "/task", Vec::new())).await;
+        assert!(core.armed.contains(&key.to_string()));
+
+        let mut reply = said(&key, "/status", Vec::new());
+        reply.replying_to = Some(key.clone());
+        core.handle_inbound(reply).await;
+        assert!(!core.armed.contains(&key.to_string()));
+        assert_eq!(core.focused_key(&key).unwrap(), key, "back on main");
+        assert!(core
+            .store
+            .get(&task.with_task(Some("t2".into())).to_string())
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_task_you_are_not_in_says_how_to_get_back_to_it() {
+        let dir = std::env::temp_dir().join(format!("sb-hint-{}", std::process::id()));
+        let channel = CountingChannel::replying();
+        let key = fake_key();
+        let mut core = core_with(channel.clone(), &dir);
+        let task = two_tasks(&mut core, &key);
+
+        core.say(&task, "done over here").unwrap();
+        core.say(&key, "and here").unwrap();
+        settle().await;
+        let messages = channel.messages();
+        assert!(
+            messages.contains(
+                &"[2] login timeout · reply to this to continue it\ndone over here".to_string()
+            ),
+            "{messages:?}"
+        );
+        assert!(
+            messages.contains(&"[1] main\nand here".to_string()),
+            "the task in focus needs no directions: {messages:?}"
+        );
+
+        // A channel where replying does nothing is not told to reply.
+        let plain = CountingChannel::write_only();
+        let dir2 = std::env::temp_dir().join(format!("sb-hint2-{}", std::process::id()));
+        let mut core = core_with(plain.clone(), &dir2);
+        let task = two_tasks(&mut core, &key);
+        core.say(&task, "done over here").unwrap();
+        settle().await;
+        assert_eq!(
+            plain.messages(),
+            vec!["[2] login timeout\ndone over here".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn a_long_first_line_is_cut_for_the_title() {
+        let title = task_title_from(&format!("fix {}", "x".repeat(80)), &[]);
+        assert_eq!(title.chars().count(), 42);
+        assert!(title.ends_with('…'));
+        assert_eq!(
+            task_title_from("  fix   the\nlogin  ", &[]),
+            "fix the login"
+        );
+        assert_eq!(
+            task_title_from("", &[saved("shot.png", "image/png", 1, "/in/shot.png")]),
+            "shot.png"
+        );
     }
 }

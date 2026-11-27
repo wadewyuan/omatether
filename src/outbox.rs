@@ -61,6 +61,16 @@ pub enum OutJob {
     /// A standalone note, outside any turn.
     Say(String),
 
+    /// A note with choices under it, where the channel has buttons.
+    ///
+    /// One job, like [`OutJob::Ask`]: the text and the choices have to land
+    /// together, or a tap has nothing to answer. Each choice is a label and
+    /// the token that comes back as [`crate::channel::InboundKind::Pick`].
+    Offer {
+        text: String,
+        choices: Vec<(String, String)>,
+    },
+
     /// Hand a file this machine produced to the chat.
     ///
     /// A job like every other send, for the same reason: an upload is the slowest
@@ -153,6 +163,14 @@ async fn run(key: ThreadKey, channel: Arc<dyn Channel>, mut jobs: mpsc::Receiver
 
             OutJob::Say(text) => {
                 report(&key, "send", retrying(|| channel.send(&key, &text)).await);
+            }
+
+            OutJob::Offer { text, choices } => {
+                report(
+                    &key,
+                    "offer",
+                    retrying(|| channel.offer(&key, &text, &choices)).await,
+                );
             }
 
             OutJob::SendFile { path, caption } => {
@@ -434,6 +452,7 @@ mod tests {
             channel: "fake",
             chat_id: chat.to_string(),
             topic_id: None,
+            task_id: None,
         }
     }
 

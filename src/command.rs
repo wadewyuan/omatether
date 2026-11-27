@@ -13,6 +13,11 @@ pub enum Command {
     New,
     /// Interrupt the running turn.
     Stop,
+    /// The next plain message starts another task in this chat, or cancels
+    /// that if one is already waiting to start.
+    Task,
+    /// List this chat's tasks, so the next reply can switch to one by number.
+    Tasks,
     /// Set the working directory for this thread.
     Cd(String),
     /// Switch which agent this thread talks to.
@@ -64,6 +69,8 @@ pub fn parse(text: &str) -> Command {
     match head {
         "/new" => Command::New,
         "/stop" | "/cancel" => Command::Stop,
+        "/task" => Command::Task,
+        "/tasks" => Command::Tasks,
         "/status" => Command::Status,
         "/allow" | "/yes" => Command::Allow,
         "/deny" | "/no" => Command::Deny(if rest.is_empty() {
@@ -103,6 +110,9 @@ omatether — your coding agent, over chat
 /new           start a fresh session in this thread, back in ~/Work if
                there is one
 /stop          interrupt the running turn
+/task          the next message starts another task alongside this one
+               (/task again cancels)
+/tasks         list tasks; reply with the number to switch
 /cd <path>     set the working directory (starts a fresh session)
 /agent <name>  switch agent (claude, codex, pi, ...)
 /model [name]  which model the agent runs (/model default to undo)
@@ -150,6 +160,11 @@ mod tests {
         assert_eq!(parse("  /stop  "), Command::Stop);
         assert_eq!(parse("/status"), Command::Status);
         assert_eq!(parse("/cd ~/src/foo"), Command::Cd("~/src/foo".into()));
+        assert_eq!(parse("/task"), Command::Task);
+        assert_eq!(parse("/tasks"), Command::Tasks);
+        // A name typed here is not a task id. The next message is the task,
+        // and omatether names it.
+        assert_eq!(parse("/task fix the login"), Command::Task);
     }
 
     #[test]

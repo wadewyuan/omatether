@@ -48,19 +48,61 @@ pub type MessageId = String;
 
 /// Identifies one conversation. A Telegram forum topic is a distinct thread
 /// from the group it lives in, which is what makes topic-per-project work.
+///
+/// A chat can hold several conversations at once. [`ThreadKey::task_id`] is
+/// the second one, and the ones after it. Channels leave it empty: a Telegram
+/// topic id is sent back as `message_thread_id`, and a made-up one is not a
+/// topic, so a task must not be stored there. The core is what fills it in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThreadKey {
     pub channel: &'static str,
     pub chat_id: String,
     pub topic_id: Option<String>,
+    /// Which conversation inside this chat. `None` is the original one.
+    pub task_id: Option<String>,
+}
+
+impl ThreadKey {
+    /// This chat, with no task selected. What a channel constructs, and the
+    /// key focus and `/tasks` are stored under.
+    pub fn platform(&self) -> Self {
+        Self {
+            task_id: None,
+            ..self.clone()
+        }
+    }
+
+    /// The same chat, on this task. `None` is the original conversation.
+    pub fn with_task(&self, task_id: Option<String>) -> Self {
+        Self {
+            task_id,
+            ..self.platform()
+        }
+    }
+
+    /// Same channel, chat and topic. Tasks of one chat are siblings; a forum
+    /// topic is a different chat from the group it lives in.
+    pub fn same_chat(&self, other: &Self) -> bool {
+        self.channel == other.channel
+            && self.chat_id == other.chat_id
+            && self.topic_id == other.topic_id
+    }
 }
 
 impl std::fmt::Display for ThreadKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No task keeps the spelling every stored thread already has. A task
+        // is a suffix, so `telegram:1` does not prefix-match `telegram:12`,
+        // and `#` is not a character a forum topic id or an MCP session name
+        // can contain.
         match &self.topic_id {
-            Some(topic) => write!(f, "{}:{}:{}", self.channel, self.chat_id, topic),
-            None => write!(f, "{}:{}", self.channel, self.chat_id),
+            Some(topic) => write!(f, "{}:{}:{}", self.channel, self.chat_id, topic)?,
+            None => write!(f, "{}:{}", self.channel, self.chat_id)?,
         }
+        if let Some(task) = &self.task_id {
+            write!(f, "#{task}")?;
+        }
+        Ok(())
     }
 }
 
@@ -70,6 +112,13 @@ pub struct Inbound {
     pub thread: ThreadKey,
     pub user_id: String,
     pub kind: InboundKind,
+    /// The task this message answers, when it was sent as a reply to one of
+    /// ours and the channel remembers which task that one came from.
+    ///
+    /// The one place a channel names a task. It is not where the message is
+    /// *from* — `thread` still says that, with no task — but what the person
+    /// pointed at. The core decides whether to follow it.
+    pub replying_to: Option<ThreadKey>,
 }
 
 /// A file someone sent, already on disk.
@@ -123,6 +172,22 @@ pub enum InboundKind {
     /// a dropped message and a broken bridge look identical: you sent
     /// something and nothing came back. The text is what to tell the sender.
     Unsupported(String),
+    /// A tap on a task list: start one, or switch to one. `ack` is what the
+    /// channel needs to stop the client's spinner, as with a permission tap.
+    Pick { pick: TaskPick, ack: String },
+}
+
+/// What a task-list tap asked for.
+///
+/// A number typed in reply to `/tasks` is the same choice on a channel that
+/// has no buttons. The id is the short one omatether assigned (`t1`), never
+/// something the person had to invent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskPick {
+    /// The next plain message starts a new task.
+    New,
+    /// Switch to this task. `None` is the original conversation.
+    Use(Option<String>),
 }
 
 #[async_trait]
@@ -165,6 +230,39 @@ pub trait Channel: Send + Sync {
 
     /// Post a new message and return its id.
     async fn send(&self, thread: &ThreadKey, text: &str) -> Result<MessageId>;
+
+    /// Whether this channel can put tappable choices under a message.
+    ///
+    /// Telegram can. iMessage cannot, so the same list goes out as numbered
+    /// lines and the reply is the number. Asked rather than assumed from
+    /// `can_edit`: a button is a different capability from rewriting a message.
+    fn offers_choices(&self) -> bool {
+        false
+    }
+
+    /// Whether replying to one of this channel's messages reaches the task
+    /// that sent it ([`Inbound::replying_to`]).
+    ///
+    /// Where it does, a reply from a task you are not in says so, because a
+    /// reply is how you get back to it. Where it does not, that would be
+    /// advice that does nothing.
+    fn routes_replies(&self) -> bool {
+        false
+    }
+
+    /// Post a message with choices under it.
+    ///
+    /// Each choice is a label and the token that comes back in
+    /// [`InboundKind::Pick`]. A channel with no buttons sends the text alone;
+    /// the text already says how to answer.
+    async fn offer(
+        &self,
+        thread: &ThreadKey,
+        text: &str,
+        _choices: &[(String, String)],
+    ) -> Result<MessageId> {
+        self.send(thread, text).await
+    }
 
     /// Replace the text of a message this channel sent. Only called when
     /// [`Channel::can_edit`] is true.
@@ -241,4 +339,48 @@ pub enum Audience {
     Person,
     /// Another AI agent, calling over MCP.
     Agent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(topic: Option<&str>) -> ThreadKey {
+        ThreadKey {
+            channel: "telegram",
+            chat_id: "5".into(),
+            topic_id: topic.map(str::to_string),
+            task_id: None,
+        }
+    }
+
+    #[test]
+    fn a_task_is_a_suffix_and_the_original_key_does_not_change() {
+        // Stored threads already use this spelling. Adding tasks must not
+        // rename them, or every chat would look new after an upgrade.
+        assert_eq!(key(None).to_string(), "telegram:5");
+        assert_eq!(key(Some("77")).to_string(), "telegram:5:77");
+
+        let task = key(None).with_task(Some("t1".into()));
+        assert_eq!(task.to_string(), "telegram:5#t1");
+        assert_eq!(
+            key(Some("77")).with_task(Some("t2".into())).to_string(),
+            "telegram:5:77#t2"
+        );
+
+        // `telegram:1` must not be a prefix of another chat's key, and a task
+        // of one chat must not read as a task of the chat next door.
+        assert!(!task.to_string().starts_with("telegram:5:"));
+        assert!(!format!("telegram:50#t1").starts_with("telegram:5#"));
+    }
+
+    #[test]
+    fn platform_and_same_chat_ignore_the_task_and_only_the_task() {
+        let topic = key(Some("77"));
+        let task = topic.with_task(Some("t1".into()));
+        assert_eq!(task.platform(), topic);
+        assert!(task.same_chat(&topic));
+        assert!(!task.same_chat(&key(None)));
+        assert_eq!(task.with_task(None), topic);
+    }
 }
