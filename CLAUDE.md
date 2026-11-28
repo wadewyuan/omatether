@@ -607,11 +607,12 @@ Rust as `replyTo`, with any `p:<n>/` part prefix dropped. That id is the same
 GUID `/send` returns, so `SentIndex` in `photon.rs` maps it back to the task
 that sent it, and the core focuses that task (`Core::follow_reply`). It is
 memory only, so after a restart a reply to an older message goes to the task
-in focus. **Unverified:** a real swipe-reply from a phone. The sidecar logs
-`message … replies to <guid>` for each one; that GUID should match a
-`messageId` that `/send` returned. If iMessage reports the thread's *root*
-instead (`threadOriginatorGuid` is the SDK's fallback), a reply inside a
-thread that the person started will find nothing and goes to the focused task.
+in focus. Verified 2026-11-28: a real swipe-reply from a phone reached the
+task that sent the message. The sidecar logs `message … replies to <guid>` for
+each one; that GUID should match a `messageId` that `/send` returned. Still
+untested: if iMessage reports the thread's *root* instead
+(`threadOriginatorGuid` is the SDK's fallback), a reply inside a thread that
+the person started will find nothing and goes to the focused task.
 
 **A textless message was dropped twice over.** The sidecar only broadcast events
 with a non-empty `text`, and `parse_event` dropped them again, so a voice note
